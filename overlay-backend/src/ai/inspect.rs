@@ -1,6 +1,4 @@
-use super::control::{
-    apply_reasoning_effort, http_client, resolve_managed_mlx_endpoint, transport_failure_kind,
-};
+use super::control::{http_client, resolve_managed_mlx_endpoint, transport_failure_kind};
 use super::provider;
 use super::stream::codex_failure_message;
 use super::types::{AiEndpoint, AiProtocol, ChatMessage, ContentPart, MessageContent};
@@ -14,6 +12,7 @@ pub async fn test_connection(base_url: String, bearer: String, model: String) ->
         bearer,
         model,
         reasoning_effort: None,
+        service_tier: None,
         is_local: false,
     })
     .await
@@ -34,11 +33,21 @@ pub async fn test_connection_messages(
     endpoint: AiEndpoint,
     messages: Vec<ChatMessage>,
 ) -> Result<String> {
-    if endpoint.protocol == AiProtocol::CodexSubscription {
+    if matches!(
+        endpoint.protocol,
+        AiProtocol::CodexSubscription | AiProtocol::CodexDirect
+    ) {
         let selected_model = endpoint.model.clone();
-        let snapshot = tokio::task::spawn_blocking(crate::codex_subscription::provider_snapshot)
-            .await
-            .map_err(|_| anyhow!("Codex account unavailable"))?;
+        let direct = endpoint.protocol == AiProtocol::CodexDirect;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            if direct {
+                crate::codex_direct::provider_snapshot()
+            } else {
+                crate::codex_subscription::provider_snapshot()
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("Codex account unavailable"))?;
         let signed_in = matches!(
             snapshot.account,
             crate::codex_subscription::AccountState::SignedIn { .. }
@@ -66,18 +75,26 @@ pub async fn test_connection_messages(
             }) {
                 return Err(anyhow!("Selected Codex model does not accept images"));
             }
-            let effort = endpoint.reasoning_effort.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::codex_subscription::run_turn(
-                    &selected_model,
-                    effort.as_deref(),
-                    &messages,
-                    |_| true,
-                )
-                .map_err(|failure| anyhow!(codex_failure_message(failure)))
-            })
-            .await
-            .map_err(|_| anyhow!("Codex vision unavailable"))??;
+            if direct {
+                crate::codex_direct::complete_turn(&endpoint, &messages)
+                    .await
+                    .map_err(|_| anyhow!("Codex vision unavailable"))?;
+            } else {
+                let effort = endpoint.reasoning_effort.clone();
+                let service_tier = endpoint.service_tier.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::codex_subscription::run_turn(
+                        &selected_model,
+                        effort.as_deref(),
+                        service_tier.as_deref(),
+                        &messages,
+                        |_| true,
+                    )
+                    .map_err(|failure| anyhow!(codex_failure_message(failure)))
+                })
+                .await
+                .map_err(|_| anyhow!("Codex vision unavailable"))??;
+            }
             return Ok("Codex vision ready".into());
         }
         return Err(anyhow!("Codex account unavailable"));
@@ -93,7 +110,7 @@ pub async fn test_connection_messages(
         endpoint.base_url.trim_end_matches('/'),
         provider::endpoint_path(endpoint.protocol)
     );
-    let mut body = provider::request_body(
+    let body = provider::request_body(
         endpoint.protocol,
         &endpoint.model,
         &messages,
@@ -101,22 +118,17 @@ pub async fn test_connection_messages(
         false,
         false,
     )?;
-    // The check sends what answers send, so a server that rejects the
-    // reasoning level fails here and not on the first real question.
-    apply_reasoning_effort(&mut body, endpoint.protocol, &endpoint.base_url);
     let request = client
         .post(&url)
         .timeout(std::time::Duration::from_secs(10));
-    let resp = match provider::authorize(request, endpoint.protocol, &endpoint.bearer)
-        .json(&body)
-        .send()
+    let resp = match crate::network::send(provider::authorize(request, endpoint.protocol, &endpoint.bearer).json(&body))
         .await
     {
         Ok(r) => r,
-        Err(error) => {
+        Err(_error) => {
             log::warn!(
                 "AI provider test transport error ({})",
-                transport_failure_kind(&error)
+                "network route failure"
             );
             return Err(anyhow!("connection failed"));
         }
@@ -141,16 +153,27 @@ pub async fn list_models(base_url: &str, bearer: &str) -> Result<Vec<String>> {
         bearer: bearer.to_string(),
         model: String::new(),
         reasoning_effort: None,
+        service_tier: None,
         is_local: false,
     })
     .await
 }
 
 pub async fn list_models_endpoint(endpoint: &AiEndpoint) -> Result<Vec<String>> {
-    if endpoint.protocol == AiProtocol::CodexSubscription {
-        let snapshot = tokio::task::spawn_blocking(crate::codex_subscription::provider_snapshot)
-            .await
-            .map_err(|_| anyhow!("Codex model catalog unavailable"))?;
+    if matches!(
+        endpoint.protocol,
+        AiProtocol::CodexSubscription | AiProtocol::CodexDirect
+    ) {
+        let direct = endpoint.protocol == AiProtocol::CodexDirect;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            if direct {
+                crate::codex_direct::provider_snapshot()
+            } else {
+                crate::codex_subscription::provider_snapshot()
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("Codex model catalog unavailable"))?;
         return Ok(snapshot.models.into_iter().map(|model| model.id).collect());
     }
     if !endpoint.protocol.supports_model_listing() {
@@ -167,12 +190,12 @@ pub async fn list_models_endpoint(endpoint: &AiEndpoint) -> Result<Vec<String>> 
     if !endpoint.bearer.is_empty() {
         req = provider::authorize(req, endpoint.protocol, &endpoint.bearer);
     }
-    let resp = match req.send().await {
+    let resp = match crate::network::send(req).await {
         Ok(response) => response,
-        Err(error) => {
+        Err(_error) => {
             log::warn!(
                 "AI model-list transport error ({})",
-                transport_failure_kind(&error)
+                "network route failure"
             );
             return Err(anyhow!("connection failed"));
         }

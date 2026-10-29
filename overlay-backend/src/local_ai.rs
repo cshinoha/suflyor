@@ -29,14 +29,10 @@ use serde::Deserialize;
 mod hardware_profile;
 mod model_choice;
 mod model_state;
-mod running;
-mod strata;
 
 pub use hardware_profile::*;
 pub use model_choice::*;
 pub use model_state::*;
-pub use running::*;
-pub use strata::*;
 
 // ---- pinned model coordinates (HuggingFace) + exact sizes (integrity) -------
 // RAM-safe fallback: Gemma 4 12B QAT. It is always installed so a machine that
@@ -106,10 +102,6 @@ pub(super) const GIGAAM_MODEL_URL: &str =
 pub(super) const GIGAAM_MODEL_SIZE: u64 = 224_893_347;
 pub(super) const GIGAAM_SHA256: &str =
     "2e3fcb7a7b66030336fd10c2fcfb033bd1dc7e1bf238fe5cfd83b1d0cfc9d28e";
-pub(super) const GIGAAM_CUDA_URL: &str = "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_ctc.onnx";
-pub(super) const GIGAAM_CUDA_SIZE: u64 = 885_950_079;
-pub(super) const GIGAAM_CUDA_SHA256: &str =
-    "377701bd33568f4733feec2db5b2dc12544fd09a5a5dfa69ccf55d161f84027a";
 pub(super) const GIGAAM_VOCAB_URL: &str =
     "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/v3_e2e_ctc_vocab.txt";
 /// GigaAM-v3 vocab (2 KB, FIXED for this model) — BUNDLED via include_bytes so the
@@ -167,8 +159,6 @@ pub struct InstallOptions {
     pub root: PathBuf,
     /// Force the CPU llama.cpp build even if an NVIDIA GPU is present.
     pub force_cpu: bool,
-    /// Download and verify assets without stopping or starting any servers.
-    pub download_only: bool,
     pub skip_llama: bool,
     pub skip_whisper: bool,
     pub skip_gigaam: bool,
@@ -180,7 +170,6 @@ impl Default for InstallOptions {
         Self {
             root: default_root(),
             force_cpu: false,
-            download_only: false,
             skip_llama: false,
             skip_whisper: false,
             skip_gigaam: false,
@@ -211,10 +200,11 @@ pub enum Progress {
 #[derive(Debug)]
 pub struct LocalAiResult {
     pub ai_local_model: String,
-    /// `true` when the owner-approved 26B primary was selected (downloaded in
-    /// download-only mode, started otherwise); `false` for the 12B fallback.
+    /// `true` when the owner-approved 26B primary actually started; `false`
+    /// when the installed/serving model is the 12B fallback.
     pub ai_local_quality: bool,
-    /// Whether the selected model has its matching projector available.
+    /// Whether the model that actually started also has its matching projector
+    /// attached. The 26B primary is text-only in this candidate.
     pub ai_local_vision: bool,
     pub hardware_profile: HardwareModelProfile,
     pub stt_gigaam_dir: String,
@@ -243,7 +233,6 @@ impl Drop for InstallServerCleanup {
     }
 }
 
-#[cfg(windows)]
 fn system_memory_telemetry(pid: Option<u32>) -> Option<String> {
     let process = pid.map_or_else(
         || "$p=$null;".to_string(),
@@ -271,64 +260,6 @@ fn system_memory_telemetry(pid: Option<u32>) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-#[cfg(target_os = "linux")]
-fn system_memory_telemetry(pid: Option<u32>) -> Option<String> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut mem_avail_kb: Option<u64> = None;
-    let mut swap_total_kb: Option<u64> = None;
-    let mut swap_free_kb: Option<u64> = None;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            mem_avail_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
-        } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
-            swap_total_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
-        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
-            swap_free_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
-        }
-    }
-    let free_ram_mib = mem_avail_kb.map(|k| k / 1024).unwrap_or(0);
-    let swap_used_mib = match (swap_total_kb, swap_free_kb) {
-        (Some(total), Some(free)) => total.saturating_sub(free) / 1024,
-        _ => 0,
-    };
-    let (ws_mib, priv_mib) = if let Some(pid) = pid {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok();
-        let mut rss_kb: i64 = -1;
-        let mut data_kb: i64 = -1;
-        if let Some(st) = status {
-            for line in st.lines() {
-                if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    rss_kb = rest
-                        .split_whitespace()
-                        .next()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(-1);
-                } else if let Some(rest) = line.strip_prefix("VmData:") {
-                    data_kb = rest
-                        .split_whitespace()
-                        .next()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(-1);
-                }
-            }
-        }
-        (
-            if rss_kb >= 0 { rss_kb / 1024 } else { -1 },
-            if data_kb >= 0 { data_kb / 1024 } else { -1 },
-        )
-    } else {
-        (-1, -1)
-    };
-    Some(format!(
-        "free_ram_mib={free_ram_mib} pagefile_used_mib={swap_used_mib} working_set_mib={ws_mib} private_mib={priv_mib}"
-    ))
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn system_memory_telemetry(_pid: Option<u32>) -> Option<String> {
-    None
 }
 
 fn log_memory_telemetry(stage: &str, pid: Option<u32>, exited: bool) {
@@ -400,19 +331,6 @@ fn vram_is_at_baseline(baseline_mib: u64, after_mib: Option<u64>) -> bool {
     after_mib.is_some_and(|after| after <= baseline_mib.saturating_add(64))
 }
 
-/// Keep saved routes intact: local vision can inherit the text-local endpoint,
-/// even while answers use the cloud. Model availability is read from disk; an
-/// explicit Use action records the chosen model only after it starts. Whisper
-/// is untouched, and GigaAM moves only when the saved folder has no model.
-pub fn apply_download_result(cfg: &mut crate::config::Config, res: &LocalAiResult) {
-    let saved_gigaam = Path::new(cfg.stt_gigaam_dir.trim());
-    let saved_has_model = !cfg.stt_gigaam_dir.trim().is_empty()
-        && file_len(&saved_gigaam.join("model.int8.onnx")) > 0;
-    if !res.stt_gigaam_dir.is_empty() && !saved_has_model {
-        cfg.stt_gigaam_dir = res.stt_gigaam_dir.clone();
-    }
-}
-
 /// Write the installer's resulting endpoints/models into a `Config`, switching
 /// it to the local stack. Secrets are untouched. The actual installed selection
 /// wins over stale preferences, and the bundled single-model server never
@@ -447,7 +365,7 @@ pub fn install(
     cancel: &AtomicBool,
     on: &dyn Fn(Progress),
 ) -> Result<LocalAiResult> {
-    if !opts.download_only && !opts.skip_llama && crate::deep_lock::deep_lock_active() {
+    if !opts.skip_llama && crate::deep_lock::deep_lock_active() {
         bail!(crate::deep_lock::BLOCKED_ERROR);
     }
     preflight().context("environment preflight failed")?;
@@ -458,7 +376,6 @@ pub fn install(
     let llama_dir = opts.root.join("llama.cpp");
     let whisper_dir = opts.root.join("whisper.cpp");
     let gigaam_dir = opts.root.join("gigaam-v3");
-    let gigaam_cuda = cfg!(all(target_os = "linux", feature = "cuda")) && !opts.force_cpu;
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let hardware_profile = detected_hardware_model_profile(opts.force_cpu);
     let mut prefer_quality = hardware_profile.uses_primary_26b();
@@ -500,12 +417,6 @@ pub fn install(
         if !opts.skip_gigaam && file_len(&gigaam_dir.join("model.int8.onnx")) < GIGAAM_MODEL_SIZE {
             need += GIGAAM_MODEL_SIZE;
         }
-        if !opts.skip_gigaam
-            && gigaam_cuda
-            && file_len(&gigaam_dir.join("model.onnx")) < GIGAAM_CUDA_SIZE
-        {
-            need += GIGAAM_CUDA_SIZE;
-        }
         ensure_disk_space(&opts.root, need, on)?;
     }
 
@@ -521,7 +432,7 @@ pub fn install(
         on(Progress::Step("Installing llama.cpp".to_string()));
         std::fs::create_dir_all(&llama_dir)?;
         if find_exe(&llama_dir, "llama-server.exe").is_none() {
-            let rel = github_llama_release(gpu)?;
+            let rel = github_release(LLAMA_REPO)?;
             let pick = pick_llama(&rel.assets, gpu)?;
             cuda_version = pick.version.clone();
             let blabel = format!("llama.cpp {}", pick.version.as_deref().unwrap_or("CPU"));
@@ -623,11 +534,7 @@ pub fn install(
         if find_exe(&whisper_dir, "whisper-server.exe").is_none()
             && find_exe(&whisper_dir, "server.exe").is_none()
         {
-            let force_cpu_whisper = gpu != GpuKind::Nvidia;
-            let assets = github_build_release(WHISPER_REPO, |assets| {
-                pick_whisper(assets, force_cpu_whisper).is_ok()
-            })?
-            .assets;
+            let assets = github_assets(WHISPER_REPO)?;
             // whisper.cpp ships CPU + cuBLAS(NVIDIA) builds only — no Vulkan; so GPU
             // whisper stays NVIDIA-only, AMD/Intel use the CPU whisper build (Баг2).
             let (url, size) = pick_whisper(&assets, gpu != GpuKind::Nvidia)?;
@@ -681,20 +588,6 @@ pub fn install(
                 )?;
             }
             verify_sha256(&giga_dest, GIGAAM_SHA256, "GigaAM model")?;
-            if gigaam_cuda {
-                let fp32 = gigaam_dir.join("model.onnx");
-                if !reuse_if_available(&fp32, GIGAAM_CUDA_SIZE, GIGAAM_CUDA_SHA256, &[]) {
-                    curl_resumable(
-                        GIGAAM_CUDA_URL,
-                        &fp32,
-                        GIGAAM_CUDA_SIZE,
-                        "GigaAM CUDA",
-                        cancel,
-                        on,
-                    )?;
-                }
-                verify_sha256(&fp32, GIGAAM_CUDA_SHA256, "GigaAM CUDA model")?;
-            }
             // vocab.txt — write the BUNDLED copy (no flaky HF download for this
             // 2 KB file). Fall back to the network only if the embedded write fails.
             let vocab_dest = gigaam_dir.join("vocab.txt");
@@ -718,15 +611,13 @@ pub fn install(
 
     // ---- launch servers ----------------------------------------------------
     let mut servers = InstallServerCleanup::default();
-    if !opts.download_only && !opts.skip_llama {
+    if !opts.skip_llama {
         // The lock may have been recorded while a long model download was in
         // progress. Recheck at the actual launch boundary.
         if crate::deep_lock::deep_lock_active() {
             bail!(crate::deep_lock::BLOCKED_ERROR);
         }
         on(Progress::Step("Starting llama-server :8080".to_string()));
-        // The install makes llama.cpp the local engine; Strata would hold the GPU.
-        stop_strata();
         let exe = find_exe(&llama_dir, "llama-server.exe")
             .context("llama-server.exe not found after install")?;
         // Free :8080 of OUR stale/projector-less server so the fresh --mmproj
@@ -776,7 +667,7 @@ pub fn install(
         let child = launch_hidden(&exe, &arg_refs)?;
         servers.children.push(child);
     }
-    if !opts.download_only && !opts.skip_whisper {
+    if !opts.skip_whisper {
         on(Progress::Step("Starting whisper-server :8081".to_string()));
         let exe = find_exe(&whisper_dir, "whisper-server.exe")
             .or_else(|| find_exe(&whisper_dir, "server.exe"))
@@ -807,7 +698,7 @@ pub fn install(
     // ---- wait for llama readiness + verify GPU offload --------------------
     let mut on_gpu = false;
     let mut effective_gpu = gpu;
-    if !opts.download_only && !opts.skip_llama {
+    if !opts.skip_llama {
         on(Progress::Step("Waiting for the model to load".to_string()));
         // The user-facing message (shown as the tile's {e}) must be actionable RU;
         // the inner detail only reaches the log via {e:#}.
@@ -963,7 +854,7 @@ pub fn install(
             GpuKind::None => on(Progress::Gpu("CPU".to_string())),
         }
     }
-    if !opts.download_only && !opts.skip_whisper {
+    if !opts.skip_whisper {
         // P0.2: whisper had no strict readiness check after launch.
         on(Progress::Step("Waiting for whisper-server".to_string()));
         wait_ready(&format!("{WHISPER_BASE_URL}/models"), 60)
@@ -1086,15 +977,7 @@ fn launched_llama_owns_listener(child: &mut Child) -> bool {
         .any(|pid| *pid == child_pid)
 }
 
-#[cfg(target_os = "linux")]
-fn launched_llama_owns_listener(child: &mut Child) -> bool {
-    if !launched_llama_alive(child) {
-        return false;
-    }
-    linux_pid_owns_listener_port(child.id(), LLAMA_PORT)
-}
-
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(not(windows))]
 fn launched_llama_owns_listener(child: &mut Child) -> bool {
     launched_llama_alive(child)
 }
@@ -1183,7 +1066,6 @@ where
     I: IntoIterator<Item = Child>,
 {
     terminate_servers(servers);
-    stop_strata();
     let _ = stop_listener_on_port(LLAMA_PORT, root);
     let _ = stop_listener_on_port(WHISPER_PORT, root);
 }
@@ -1385,179 +1267,8 @@ fn stop_listener_on_port(port: &str, root: &Path) -> bool {
     free_of_strangers
 }
 
-#[cfg(target_os = "linux")]
-fn stop_listener_on_port(port: &str, root: &Path) -> bool {
-    linux_stop_listener_on_port(port, root)
-}
-
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(not(windows))]
 fn stop_listener_on_port(_port: &str, _root: &Path) -> bool {
-    true
-}
-
-#[cfg(target_os = "linux")]
-fn linux_listener_inodes_for_port(port: &str) -> std::collections::HashSet<String> {
-    let mut inodes = std::collections::HashSet::new();
-    let Ok(port_num) = port.parse::<u16>() else {
-        return inodes;
-    };
-    let hex_port = format!("{port_num:04X}");
-    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for line in content.lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() >= 10 {
-                let local_addr = cols[1];
-                let state = cols[3];
-                if state == "0A" {
-                    if let Some(p) = local_addr.split(':').nth(1) {
-                        if p.eq_ignore_ascii_case(&hex_port) {
-                            let inode = cols[9];
-                            if inode != "0" {
-                                inodes.insert(inode.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    inodes
-}
-
-#[cfg(target_os = "linux")]
-fn linux_pid_owns_listener_port(pid: u32, port: &str) -> bool {
-    let inodes = linux_listener_inodes_for_port(port);
-    if inodes.is_empty() {
-        return false;
-    }
-    let fd_dir = format!("/proc/{pid}/fd");
-    let Ok(entries) = std::fs::read_dir(&fd_dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        if let Ok(target) = std::fs::read_link(entry.path()) {
-            let target_str = target.to_string_lossy();
-            if let Some(rest) = target_str.strip_prefix("socket:[") {
-                if let Some(inode) = rest.strip_suffix(']') {
-                    if inodes.contains(inode) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn linux_stop_listener_on_port(port: &str, root: &Path) -> bool {
-    let target_inodes = linux_listener_inodes_for_port(port);
-    if target_inodes.is_empty() {
-        return true;
-    }
-
-    let my_pid = std::process::id();
-    let Ok(proc_entries) = std::fs::read_dir("/proc") else {
-        log::warn!("port {port}: cannot read /proc; cannot safely reclaim listener");
-        return false;
-    };
-
-    let mut matched_inodes = std::collections::HashSet::new();
-    let mut listener_pids: Vec<u32> = Vec::new();
-
-    for entry in proc_entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        if pid == my_pid || pid == 0 {
-            continue;
-        }
-        let fd_dir = format!("/proc/{pid}/fd");
-        let Ok(fd_entries) = std::fs::read_dir(&fd_dir) else {
-            continue;
-        };
-        for fd in fd_entries.flatten() {
-            let Ok(link) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            let link_s = link.to_string_lossy();
-            if let Some(rest) = link_s.strip_prefix("socket:[") {
-                if let Some(inode) = rest.strip_suffix(']') {
-                    if target_inodes.contains(inode) {
-                        matched_inodes.insert(inode.to_string());
-                        if !listener_pids.contains(&pid) {
-                            listener_pids.push(pid);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if matched_inodes.len() < target_inodes.len() {
-        log::warn!(
-            "port {port}: some listener sockets could not be mapped to accessible PIDs — leaving alone"
-        );
-        return false;
-    }
-
-    let root_canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-
-    let mut pids_to_kill: Vec<u32> = Vec::new();
-    for pid in listener_pids {
-        let exe_link = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-        let Some(exe_path) = exe_link else {
-            log::warn!("port {port}: PID {pid} exe cannot be read — leaving it alive");
-            return false;
-        };
-        let exe_str = exe_path.to_string_lossy();
-        let cleaned = exe_str.strip_suffix(" (deleted)").unwrap_or(&exe_str);
-        let cleaned_path = Path::new(cleaned);
-        let exe_canonical =
-            std::fs::canonicalize(cleaned_path).unwrap_or_else(|_| cleaned_path.to_path_buf());
-
-        if exe_canonical.starts_with(&root_canonical) {
-            pids_to_kill.push(pid);
-        } else {
-            log::warn!(
-                "port {port}: PID {pid} (exe {}) is not under our install dir — leaving it alive",
-                exe_canonical.display()
-            );
-            return false;
-        }
-    }
-
-    for pid in pids_to_kill {
-        let pid_i32 = pid as libc::pid_t;
-        log_memory_telemetry("before-stop", Some(pid), false);
-        unsafe {
-            libc::kill(pid_i32, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut exited = false;
-        while Instant::now() < deadline {
-            let alive = unsafe { libc::kill(pid_i32, 0) == 0 };
-            if !alive {
-                exited = true;
-                break;
-            }
-            if Instant::now() > deadline - Duration::from_millis(3500) {
-                unsafe {
-                    libc::kill(pid_i32, libc::SIGKILL);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        log_memory_telemetry("stopped", Some(pid), exited);
-        if !exited {
-            log::warn!("port {port}: managed listener PID {pid} did not exit");
-            return false;
-        }
-    }
-
     true
 }
 
@@ -1882,13 +1593,8 @@ pub fn mark_engine_update_checked(root: &Path) {
     let _ = std::fs::write(stamp, now_unix().to_string());
 }
 
-/// Stat-only: the managed llama.cpp server binary is on disk.
-#[must_use]
-pub fn llama_engine_installed(root: &Path) -> bool {
-    find_exe(&root.join("llama.cpp"), "llama-server.exe").is_some()
-}
-
-/// Installed llama.cpp build number, or None for an unstamped engine.
+/// The installed llama.cpp build number, for display ("движок bNNNN"). `None`
+/// when unstamped (an engine installed before stamping existed).
 #[must_use]
 pub fn installed_engine_build(root: &Path) -> Option<u32> {
     installed_llama_build(&root.join("llama.cpp"))
@@ -1925,8 +1631,7 @@ pub fn update_llama_engine(
     let installed = installed_llama_build(&llama_dir);
 
     on(Progress::Step("Checking for a newer llama.cpp".into()));
-    let gpu = detect_gpu();
-    let rel = github_llama_release(gpu)?;
+    let rel = github_release(LLAMA_REPO)?;
     let latest =
         parse_build_tag(&rel.tag_name).context("latest llama.cpp release has no build tag")?;
     if installed.is_some_and(|cur| cur >= latest) {
@@ -1938,6 +1643,7 @@ pub fn update_llama_engine(
     // binaries until the new ones are proven good). The staging dir is a SIBLING
     // of `llama.cpp` (NOT inside it) so `find_exe(&llama_dir, …)` — which recurses
     // — can never pick up the half-downloaded staged binary and launch it on :8080.
+    let gpu = detect_gpu();
     let pick = pick_llama(&rel.assets, gpu)?;
     let staging = root.join(".llama-staging-update");
     let _ = std::fs::remove_dir_all(&staging);
@@ -2094,19 +1800,6 @@ fn swap_engine_binaries(staging: &Path, live: &Path, backup: &Path) -> Result<()
     // Only the engine binaries — copying a stray non-binary (e.g. a license txt)
     // over the live dir is pointless and risks shadowing a model/stamp. The
     // llama.cpp + cudart zips ship exactly these.
-    #[cfg(windows)]
-    let is_engine_file = |p: &Path| {
-        p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("exe") || e.eq_ignore_ascii_case("dll"))
-    };
-    #[cfg(target_os = "linux")]
-    let is_engine_file = |p: &Path| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| is_known_executable_basename(name) || is_so_library(name))
-    };
-    #[cfg(all(not(windows), not(target_os = "linux")))]
     let is_engine_file = |p: &Path| {
         p.extension()
             .and_then(|e| e.to_str())
@@ -2153,14 +1846,12 @@ fn swap_engine_binaries(staging: &Path, live: &Path, backup: &Path) -> Result<()
     }
     let mut files: Vec<PathBuf> = by_name.into_values().collect();
     files.sort_by_key(|p| {
-        // exes (false → sorts first) before DLLs/so, so the locked-live-exe copy is
-        // attempted first and a sharing violation bails before any DLL/so is touched
+        // exes (false → sorts first) before DLLs, so the locked-live-exe copy is
+        // attempted first and a sharing violation bails before any DLL is touched
         // (keeps the live engine intact + the attempt safely retryable).
-        let is_exec = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.ends_with(".exe") || is_known_executable_basename(name));
-        !is_exec
+        !p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
     });
     for src in files {
         let Some(name) = src.file_name() else {
@@ -2170,80 +1861,10 @@ fn swap_engine_binaries(staging: &Path, live: &Path, backup: &Path) -> Result<()
         if dst.exists() {
             let _ = std::fs::copy(&dst, backup.join(name));
         }
-        #[cfg(target_os = "linux")]
-        {
-            let next = dst.with_file_name(format!(".{}.next", name.to_string_lossy()));
-            std::fs::copy(&src, &next).context("stage native engine replacement")?;
-            std::fs::rename(&next, &dst).context("replace native engine image")?;
-        }
-        #[cfg(not(target_os = "linux"))]
         std::fs::copy(&src, &dst)
             .with_context(|| format!("install engine file {}", name.to_string_lossy()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&src) {
-                let mut perms = meta.permissions();
-                let mode = perms.mode();
-                let is_exec =
-                    is_known_executable_basename(&name.to_string_lossy()) || (mode & 0o111 != 0);
-                if is_exec {
-                    perms.set_mode(mode | 0o755);
-                }
-                let _ = std::fs::set_permissions(&dst, perms);
-            }
-        }
     }
     Ok(())
-}
-
-fn is_known_executable_basename(name: &str) -> bool {
-    const KNOWN: &[&str] = &[
-        "llama-server",
-        "llama-cli",
-        "llama-bench",
-        "llama-quantize",
-        "llama-perplexity",
-        "llama-embedding",
-        "llama-tokenize",
-        "llama-imatrix",
-        "llama-speculative",
-        "llama-lookup",
-        "llama-parallel",
-        "llama-passkey",
-        "llama-cvector-generator",
-        "llama-export-lora",
-        "llama-gguf-split",
-        "llama-infill",
-        "llama-run",
-        "llama-simple",
-        "llama-simple-chat",
-        "llama-vsession",
-        "llama-batched",
-        "llama-batched-bench",
-        "llama-baby-llama",
-        "llama-convert-llama2c-to-ggml",
-        "llama-finetune",
-        "llama-gguf-hash",
-    ];
-    let bare = name.strip_suffix(".exe").unwrap_or(name);
-    KNOWN.contains(&bare)
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn is_so_library(name: &str) -> bool {
-    if !name.starts_with("lib") {
-        return false;
-    }
-    if name.ends_with(".so") {
-        return true;
-    }
-    if let Some(pos) = name.find(".so.") {
-        let suffix = &name[pos + 4..];
-        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.')
-    } else {
-        false
-    }
 }
 
 /// Keep the newest `keep` engine rollback backups, removing older ones. The
@@ -2546,43 +2167,10 @@ struct LlamaPick {
     version: Option<String>,
 }
 
-/// Newest release of `repo` whose assets hold a build this PC can use.
-/// Since October 2026 llama.cpp and whisper.cpp publish their binary builds
-/// (`bNNNN`) as prereleases, and their "latest" release is a version tag
-/// with no binaries, so `releases/latest` alone finds nothing to install.
-/// A build is uploaded platform by platform over several minutes, so the
-/// check is for the asset the picker needs, not for any binary.
-fn github_build_release(repo: &str, usable: impl Fn(&[GhAsset]) -> bool) -> Result<GhRelease> {
-    newest_with_assets(github_releases(repo)?, usable)
-        .ok_or_else(|| anyhow!("no {repo} release with a build for this PC"))
-}
-
-fn github_llama_release(gpu: GpuKind) -> Result<GhRelease> {
-    newest_llama_release(github_releases(LLAMA_REPO)?, gpu)
-        .ok_or_else(|| anyhow!("no llama.cpp release with a build for this PC"))
-}
-
-/// Prefer a complete GPU release over a newer CPU-first partial upload. Keep
-/// CPU fallback only when none of the recent releases has a matching GPU build.
-fn newest_llama_release(mut releases: Vec<GhRelease>, gpu: GpuKind) -> Option<GhRelease> {
-    let index = releases
-        .iter()
-        .position(|r| {
-            pick_llama(&r.assets, gpu)
-                .is_ok_and(|pick| gpu == GpuKind::None || pick.version.is_some())
-        })
-        .or_else(|| {
-            releases
-                .iter()
-                .position(|r| pick_llama(&r.assets, gpu).is_ok())
-        })?;
-    Some(releases.swap_remove(index))
-}
-
-fn github_releases(repo: &str) -> Result<Vec<GhRelease>> {
-    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=30");
+fn github_release(repo: &str) -> Result<GhRelease> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let out = run_capture(
-        curl_exe(),
+        "curl.exe",
         &[
             "-sL",
             "--retry",
@@ -2593,35 +2181,18 @@ fn github_releases(repo: &str) -> Result<Vec<GhRelease>> {
             &url,
         ],
     )
-    .with_context(|| format!("fetch releases for {repo}"))?;
+    .with_context(|| format!("fetch latest release for {repo}"))?;
     if !out.status.success() {
         bail!("GitHub API request for {repo} failed");
     }
-    serde_json::from_slice(&out.stdout).with_context(|| format!("parse releases JSON for {repo}"))
+    serde_json::from_slice(&out.stdout).with_context(|| format!("parse release JSON for {repo}"))
 }
 
-/// Pure: the first (newest) release whose assets pass `usable`.
-fn newest_with_assets(
-    releases: Vec<GhRelease>,
-    usable: impl Fn(&[GhAsset]) -> bool,
-) -> Option<GhRelease> {
-    releases.into_iter().find(|r| usable(&r.assets))
-}
-
-/// The downloadable assets of the newest release with builds (whisper path +
-/// tests don't need the tag). The llama path uses [`github_build_release`]
-/// directly to also stamp the build tag.
-#[cfg(test)]
+/// Just the downloadable assets of the latest release (whisper path + tests
+/// don't need the tag). The llama path uses [`github_release`] to also stamp
+/// the build tag.
 fn github_assets(repo: &str) -> Result<Vec<GhAsset>> {
-    let prefix = if repo == WHISPER_REPO {
-        "whisper-"
-    } else {
-        "llama-"
-    };
-    Ok(github_build_release(repo, |assets| {
-        assets.iter().any(|a| a.name.starts_with(prefix))
-    })?
-    .assets)
+    Ok(github_release(repo)?.assets)
 }
 
 /// Parse the CUDA version out of a llama.cpp build asset name, e.g.
@@ -2638,18 +2209,6 @@ fn cuda_version_of(name: &str) -> Option<(u32, u32)> {
 
 /// Pick the llama.cpp build for the detected GPU.
 fn pick_llama(assets: &[GhAsset], _gpu: GpuKind) -> Result<LlamaPick> {
-    #[cfg(target_os = "linux")]
-    {
-        let arch = linux_arch()?;
-        pick_llama_linux(assets, _gpu, arch)
-    }
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-    {
-        let _ = assets;
-        Err(anyhow!(
-            "managed llama.cpp installation is unsupported on this platform"
-        ))
-    }
     #[cfg(target_os = "macos")]
     {
         let mac_asset = assets
@@ -2726,119 +2285,15 @@ fn pick_llama(assets: &[GhAsset], _gpu: GpuKind) -> Result<LlamaPick> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn linux_arch() -> Result<&'static str> {
-    if cfg!(target_arch = "x86_64") {
-        Ok("x64")
-    } else if cfg!(target_arch = "aarch64") {
-        Ok("arm64")
-    } else {
-        bail!("unsupported Linux architecture")
-    }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_linux_cuda_version(name: &str, arch: &str) -> Option<(u32, u32)> {
-    let prefix = "-bin-ubuntu-cuda-";
-    let suffix = format!("-{arch}.tar.gz");
-    let after = name.split(prefix).nth(1)?;
-    let ver = after.strip_suffix(&suffix)?;
-    let mut it = ver.split('.');
-    let maj: u32 = it.next()?.parse().ok()?;
-    let min: u32 = it.next()?.parse().ok()?;
-    if it.next().is_some() {
-        return None;
-    }
-    Some((maj, min))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn pick_llama_linux(assets: &[GhAsset], gpu: GpuKind, arch: &str) -> Result<LlamaPick> {
-    if gpu == GpuKind::Nvidia {
-        let mut cuda_picks: Vec<((u32, u32), &GhAsset, &GhAsset)> = Vec::new();
-        for build in assets {
-            if !build.name.starts_with("llama-") {
-                continue;
-            }
-            if let Some((maj, min)) = parse_linux_cuda_version(&build.name, arch) {
-                let needle = format!("-cuda-{maj}.{min}-{arch}.tar.gz");
-                let cudart_name = format!("cudart-{}", build.name);
-                if let Some(cudart) = assets.iter().find(|a| {
-                    a.name.starts_with("cudart-")
-                        && (a.name == cudart_name || a.name.ends_with(&needle))
-                }) {
-                    cuda_picks.push(((maj, min), build, cudart));
-                }
-            }
-        }
-        if let Some(((maj, min), build, cudart)) = cuda_picks.into_iter().max_by_key(|(v, _, _)| *v)
-        {
-            return Ok(LlamaPick {
-                build_url: build.browser_download_url.clone(),
-                build_size: build.size,
-                cudart_url: Some(cudart.browser_download_url.clone()),
-                cudart_size: cudart.size,
-                version: Some(format!("{maj}.{min}")),
-            });
-        }
-    }
-
-    if gpu == GpuKind::Other {
-        let vk_suffix = format!("-bin-ubuntu-vulkan-{arch}.tar.gz");
-        if let Some(vk) = assets
-            .iter()
-            .find(|a| a.name.starts_with("llama-") && a.name.ends_with(&vk_suffix))
-        {
-            return Ok(LlamaPick {
-                build_url: vk.browser_download_url.clone(),
-                build_size: vk.size,
-                cudart_url: None,
-                cudart_size: 0,
-                version: Some("Vulkan".to_string()),
-            });
-        }
-    }
-
-    let cpu_suffix = format!("-bin-ubuntu-{arch}.tar.gz");
-    let cpu_suffix_explicit = format!("-bin-ubuntu-cpu-{arch}.tar.gz");
-    let cpu = assets
-        .iter()
-        .find(|a| {
-            a.name.starts_with("llama-")
-                && (a.name.ends_with(&cpu_suffix) || a.name.ends_with(&cpu_suffix_explicit))
-        })
-        .ok_or_else(|| anyhow!("no llama Linux CPU build asset for {arch}"))?;
-
-    Ok(LlamaPick {
-        build_url: cpu.browser_download_url.clone(),
-        build_size: cpu.size,
-        cudart_url: None,
-        cudart_size: 0,
-        version: None,
-    })
-}
-
 /// Parse the CUDA version from a whisper cuBLAS asset name, e.g.
 /// `whisper-cublas-12.4.0-bin-x64.zip` -> `(12, 4, 0)`.
-#[cfg(any(not(target_os = "linux"), test))]
 fn whisper_cublas_version_of(name: &str) -> Option<(u32, u32, u32)> {
-    // Old name "whisper-cublas-12.4.0-bin-x64.zip"; since October 2026
-    // "whisper-bin-win-cuda-12.4.0-x64.zip". Both are x64 builds with the CUDA
-    // runtime inside.
-    let ver = name
-        .strip_prefix("whisper-cublas-")
-        .and_then(|after| after.strip_suffix("-bin-x64.zip"))
-        .or_else(|| {
-            name.strip_prefix("whisper-bin-win-cuda-")
-                .and_then(|after| after.strip_suffix("-x64.zip"))
-        })?;
+    let after = name.strip_prefix("whisper-cublas-")?; // "12.4.0-bin-x64.zip"
+    let ver = after.strip_suffix("-bin-x64.zip")?; // "12.4.0"
     let mut it = ver.split('.');
     let maj: u32 = it.next()?.parse().ok()?;
     let min: u32 = it.next()?.parse().ok()?;
-    let patch: u32 = it.next().map_or(Some(0), |p| p.parse().ok())?;
-    if it.next().is_some() {
-        return None;
-    }
+    let patch: u32 = it.next()?.parse().ok()?;
     Some((maj, min, patch))
 }
 
@@ -2849,52 +2304,33 @@ fn whisper_cublas_version_of(name: &str) -> Option<(u32, u32, u32)> {
 /// GPU-accelerates via PTX JIT (whisper_init: use gpu = 1, model loads into VRAM).
 /// Returns (url, size).
 fn pick_whisper(assets: &[GhAsset], force_cpu: bool) -> Result<(String, u64)> {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = force_cpu;
-        let arch = linux_arch()?;
-        return pick_whisper_linux(assets, arch);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        if cfg!(target_os = "macos") {
-            let is_arm = cfg!(target_arch = "aarch64");
-            let needle = if is_arm { "macos-arm64" } else { "macos" };
-            if let Some(a) = assets.iter().find(|a| a.name.contains(needle)) {
-                return Ok((a.browser_download_url.clone(), a.size));
-            }
-            if let Some(a) = assets
-                .iter()
-                .find(|a| a.name.contains("macos") || a.name.contains("darwin"))
-            {
-                return Ok((a.browser_download_url.clone(), a.size));
-            }
+    if cfg!(target_os = "macos") {
+        let is_arm = cfg!(target_arch = "aarch64");
+        let needle = if is_arm { "macos-arm64" } else { "macos" };
+        if let Some(a) = assets.iter().find(|a| a.name.contains(needle)) {
+            return Ok((a.browser_download_url.clone(), a.size));
         }
-        if !force_cpu {
-            let best = assets
-                .iter()
-                .filter_map(|a| whisper_cublas_version_of(&a.name).map(|v| (v, a)))
-                .max_by_key(|(v, _)| *v);
-            if let Some((_, build)) = best {
-                return Ok((build.browser_download_url.clone(), build.size));
-            }
-        }
-        assets
+        if let Some(a) = assets
             .iter()
-            .find(|a| a.name == "whisper-bin-x64.zip")
-            .map(|a| (a.browser_download_url.clone(), a.size))
-            .ok_or_else(|| anyhow!("no whisper-bin-x64.zip asset"))
+            .find(|a| a.name.contains("macos") || a.name.contains("darwin"))
+        {
+            return Ok((a.browser_download_url.clone(), a.size));
+        }
     }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn pick_whisper_linux(assets: &[GhAsset], arch: &str) -> Result<(String, u64)> {
-    let expected = format!("whisper-bin-ubuntu-{arch}.tar.gz");
+    if !force_cpu {
+        let best = assets
+            .iter()
+            .filter_map(|a| whisper_cublas_version_of(&a.name).map(|v| (v, a)))
+            .max_by_key(|(v, _)| *v);
+        if let Some((_, build)) = best {
+            return Ok((build.browser_download_url.clone(), build.size));
+        }
+    }
     assets
         .iter()
-        .find(|a| a.name == expected)
+        .find(|a| a.name == "whisper-bin-x64.zip")
         .map(|a| (a.browser_download_url.clone(), a.size))
-        .ok_or_else(|| anyhow!("no {expected} asset"))
+        .ok_or_else(|| anyhow!("no whisper-bin-x64.zip asset"))
 }
 
 // ---- downloads + extraction (curl.exe + tar.exe) ---------------------------
@@ -3027,44 +2463,9 @@ fn download_and_extract(
     // Download the zip with LIVE byte progress + cancel support (was a silent
     // blocking curl before, so the bar sat empty during the binary downloads).
     curl_resumable(url, &zip, size, label, cancel, on)?;
-    #[cfg(target_os = "linux")]
-    {
-        let digest = github_asset_digest(url)?;
-        verify_sha256(&zip, &digest, label)?;
-    }
     extract_zip(&zip, dest_dir)?;
     let _ = std::fs::remove_file(&zip);
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn github_asset_digest(url: &str) -> Result<String> {
-    let path = url
-        .strip_prefix("https://github.com/")
-        .ok_or_else(|| anyhow!("release asset host is not supported"))?;
-    let (repository, release) = path
-        .split_once("/releases/download/")
-        .ok_or_else(|| anyhow!("invalid release asset URL"))?;
-    if !matches!(repository, LLAMA_REPO | WHISPER_REPO) {
-        bail!("unrecognized engine repository");
-    }
-    let (tag, name) = release
-        .split_once('/')
-        .ok_or_else(|| anyhow!("invalid release asset path"))?;
-    let api = format!("https://api.github.com/repos/{repository}/releases/tags/{tag}");
-    let out = run_capture(curl_exe(), &["--fail", "-sL", "--max-time", "30", &api])?;
-    if !out.status.success() {
-        bail!("cannot verify engine release manifest");
-    }
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    let digest = value["assets"]
-        .as_array()
-        .and_then(|assets| assets.iter().find(|a| a["name"].as_str() == Some(name)))
-        .and_then(|a| a["digest"].as_str())
-        .and_then(|d| d.strip_prefix("sha256:"))
-        .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| anyhow!("engine release has no SHA-256 digest"))?;
-    Ok(digest.to_owned())
 }
 
 /// Full path to the libarchive `tar.exe` under System32 (Win10 1803+), so PATH
@@ -3072,26 +2473,10 @@ fn github_asset_digest(url: &str) -> Result<String> {
 /// back to a bare `tar.exe` only if System32's copy is somehow absent. (Mirrors
 /// the TTS/OCR installers' system_bsdtar.)
 fn system_tar() -> PathBuf {
-    #[cfg(windows)]
-    {
-        std::env::var_os("SystemRoot")
-            .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
-            .filter(|p| p.is_file())
-            .unwrap_or_else(|| PathBuf::from("tar.exe"))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let bsdtar = Path::new("/usr/bin/bsdtar");
-        if bsdtar.is_file() {
-            bsdtar.to_path_buf()
-        } else {
-            PathBuf::from("tar")
-        }
-    }
-    #[cfg(all(not(windows), not(target_os = "linux")))]
-    {
-        PathBuf::from("tar")
-    }
+    std::env::var_os("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("tar.exe"))
 }
 
 /// SECURITY (P1-1): true iff an archive entry path stays inside the extraction
@@ -3129,42 +2514,20 @@ fn extract_zip(zip: &Path, dest_dir: &Path) -> Result<()> {
     // System32-pinned bsdtar (P1-1) so a `tar.exe` earlier on PATH can't be run.
     let tar = system_tar();
     let tar_s = tar.to_string_lossy().to_string();
-
-    #[cfg(target_os = "linux")]
-    {
-        let listing = run_capture(&tar_s, &["-tf", &zip.to_string_lossy()])
-            .with_context(|| format!("list archive {}", zip.display()))?;
-        if !listing.status.success() {
-            bail!("could not list archive: {}", zip.display());
-        }
-        for entry in String::from_utf8_lossy(&listing.stdout).lines() {
-            if !archive_entry_is_safe(entry) {
-                bail!("refusing unsafe archive entry: {entry}");
-            }
-        }
-
-        let vlisting = run_capture(&tar_s, &["-tvf", &zip.to_string_lossy()])
-            .with_context(|| format!("verbose list archive {}", zip.display()))?;
-        if !vlisting.status.success() {
-            bail!("could not verbose list archive: {}", zip.display());
-        }
-        validate_tar_links(&String::from_utf8_lossy(&vlisting.stdout))?;
+    // SECURITY (P1-1): list entries and reject any that would escape dest BEFORE
+    // extracting — a poisoned release zip could otherwise zip-slip via `..` or an
+    // absolute/drive path. (Windows symlink creation needs a privilege the app
+    // lacks, so a symlink entry just fails to extract rather than escaping.)
+    let listing = run_capture(&tar_s, &["-tf", &zip.to_string_lossy()])
+        .with_context(|| format!("list archive {}", zip.display()))?;
+    if !listing.status.success() {
+        bail!("could not list archive: {}", zip.display());
     }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let listing = run_capture(&tar_s, &["-tf", &zip.to_string_lossy()])
-            .with_context(|| format!("list archive {}", zip.display()))?;
-        if !listing.status.success() {
-            bail!("could not list archive: {}", zip.display());
-        }
-        for entry in String::from_utf8_lossy(&listing.stdout).lines() {
-            if !archive_entry_is_safe(entry) {
-                bail!("refusing unsafe archive entry: {entry}");
-            }
+    for entry in String::from_utf8_lossy(&listing.stdout).lines() {
+        if !archive_entry_is_safe(entry) {
+            bail!("refusing unsafe archive entry: {entry}");
         }
     }
-
     // bsdtar (tar.exe) on Windows 10 1803+ extracts zip archives.
     let status = launch_hidden_wait(
         &tar_s,
@@ -3191,90 +2554,6 @@ fn extract_zip(zip: &Path, dest_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn validate_tar_links(listing: &str) -> Result<()> {
-    for line in listing.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('l')
-            || trimmed.starts_with('h')
-            || trimmed.contains(" -> ")
-            || trimmed.contains(" link to ")
-        {
-            let (left, target) = if let Some((l, r)) = trimmed.split_once(" -> ") {
-                (l, r)
-            } else if let Some((l, r)) = trimmed.split_once(" link to ") {
-                (l, r)
-            } else {
-                bail!("refusing unvalidatable link entry in archive: {trimmed}");
-            };
-            let link_path = left
-                .split_whitespace()
-                .last()
-                .ok_or_else(|| anyhow!("malformed link entry: {trimmed}"))?;
-            let link_path = link_path.strip_prefix("./").unwrap_or(link_path);
-            if !archive_entry_is_safe(link_path) {
-                bail!("unsafe link path: {link_path}");
-            }
-            let target_base = if trimmed.contains(" link to ") {
-                "root-link"
-            } else {
-                link_path
-            };
-            if !archive_link_target_is_safe(target_base, target) {
-                bail!("refusing unsafe archive link target: {link_path} -> {target}");
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn archive_link_target_is_safe(link_path: &str, target: &str) -> bool {
-    let t = target.trim().replace('\\', "/");
-    let lp = link_path.trim().replace('\\', "/");
-    if t.is_empty() {
-        return false;
-    }
-    if t.starts_with('/') {
-        return false;
-    }
-    let b = t.as_bytes();
-    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-        return false;
-    }
-    let parent = Path::new(&lp).parent().unwrap_or_else(|| Path::new(""));
-    let mut stack: Vec<&str> = Vec::new();
-    for comp in parent.iter() {
-        let s = comp.to_string_lossy();
-        if s != "." && !s.is_empty() {
-            stack.push(comp.to_str().unwrap_or(""));
-        }
-    }
-    for comp in t.split('/') {
-        if comp.is_empty() || comp == "." {
-            continue;
-        }
-        let is_dots_spaces = comp.chars().all(|ch| ch == '.' || ch == ' ');
-        if is_dots_spaces {
-            if comp == ".." {
-                if stack.pop().is_none() {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        } else if comp.trim_end_matches([' ', '.']) == ".." {
-            return false;
-        } else {
-            stack.push(comp);
-        }
-    }
-    true
 }
 
 /// Resilient resumable download to a known size. Re-runs `curl -C -` (which
@@ -3711,54 +2990,23 @@ fn verify_sha256(path: &Path, expected_hex: &str, label: &str) -> Result<()> {
 /// break parsing on a non-English Windows. None when the query fails, so the
 /// caller skips the pre-check rather than blocking a possibly-valid install.
 fn free_bytes_on_volume(path: &Path) -> Option<u64> {
-    #[cfg(windows)]
-    {
-        let root = path.ancestors().last().unwrap_or(path);
-        let script = format!(
-            "[System.IO.DriveInfo]::new([string]'{}').AvailableFreeSpace",
-            root.to_string_lossy()
-        );
-        let out = run_capture(
-            "powershell",
-            &["-NoProfile", "-NonInteractive", "-Command", &script],
-        )
-        .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<u64>()
-            .ok()
+    let root = path.ancestors().last().unwrap_or(path);
+    let script = format!(
+        "[System.IO.DriveInfo]::new([string]'{}').AvailableFreeSpace",
+        root.to_string_lossy()
+    );
+    let out = run_capture(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    #[cfg(target_os = "linux")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let existing = path
-            .ancestors()
-            .find(|a| a.exists())
-            .unwrap_or_else(|| Path::new("/"));
-        let c_path = CString::new(existing.as_os_str().as_bytes()).ok()?;
-        unsafe {
-            let mut stat: libc::statvfs = std::mem::zeroed();
-            if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                let bsize = if stat.f_frsize > 0 {
-                    stat.f_frsize as u64
-                } else {
-                    stat.f_bsize as u64
-                };
-                Some((stat.f_bavail as u64).saturating_mul(bsize))
-            } else {
-                None
-            }
-        }
-    }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    {
-        None
-    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// P1.5 — bail before downloading if the volume can't hold `need` bytes (+10%
@@ -3779,37 +3027,15 @@ fn ensure_disk_space(root: &Path, need: u64, on: &dyn Fn(Progress)) -> Result<()
         free / GIB
     )));
     if free < want {
-        return Err(DiskSpaceError {
-            need_gib: want.div_ceil(GIB),
-            free_gib: free / GIB,
-            root: root.to_path_buf(),
-        }
-        .into());
+        bail!(
+            "not enough free disk space — the local AI needs about {} GB on the drive holding {}, but only {} GB is free; free up space and retry",
+            want.div_ceil(GIB),
+            root.display(),
+            free / GIB
+        );
     }
     Ok(())
 }
-
-/// The local-AI volume is too small for a download; Settings names both sizes.
-#[derive(Debug)]
-pub struct DiskSpaceError {
-    pub need_gib: u64,
-    pub free_gib: u64,
-    pub root: PathBuf,
-}
-
-impl std::fmt::Display for DiskSpaceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "not enough free disk space — the local AI needs about {} GB on the drive holding {}, but only {} GB is free; free up space and retry",
-            self.need_gib,
-            self.root.display(),
-            self.free_gib
-        )
-    }
-}
-
-impl std::error::Error for DiskSpaceError {}
 
 fn find_exe(dir: &Path, name: &str) -> Option<PathBuf> {
     let want = name.to_ascii_lowercase();
@@ -3851,107 +3077,15 @@ fn spawn_hidden(exe: &str, args: &[&str]) -> Result<Child> {
         .with_context(|| format!("spawn {exe}"))
 }
 
-/// Spawn a prepared command without a console window and tie it to the app's
-/// lifetime job. Child modules (Strata) build their own command lines, but
-/// spawning stays here.
-fn spawn_owned(cmd: &mut Command) -> Result<Child> {
-    crate::download::no_window(cmd);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        let parent_pid = std::process::id() as libc::pid_t;
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::prctl(
-                    libc::PR_SET_PDEATHSIG,
-                    libc::SIGTERM as libc::c_ulong,
-                    0,
-                    0,
-                    0,
-                ) != 0
-                {
-                    libc::_exit(1);
-                }
-                if libc::getppid() != parent_pid {
-                    libc::_exit(1);
-                }
-                Ok(())
-            });
-        }
-    }
-    #[cfg(target_os = "linux")]
-    let child = spawn_linux_owned(std::mem::replace(cmd, Command::new("true")))?;
-    #[cfg(not(target_os = "linux"))]
-    let child = cmd.spawn().context("spawn a local AI process")?;
-    #[cfg(windows)]
-    assign_to_lifetime_job(&child);
-    Ok(child)
-}
-
 /// Launch a hidden server process (kept alive; returned to the caller).
 fn launch_hidden(exe: &Path, args: &[&str]) -> Result<Child> {
     let exe_s = exe.to_string_lossy().to_string();
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        let mut cmd = hidden_command(&exe_s, args);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let parent_pid = std::process::id() as libc::pid_t;
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::prctl(
-                    libc::PR_SET_PDEATHSIG,
-                    libc::SIGTERM as libc::c_ulong,
-                    0,
-                    0,
-                    0,
-                ) != 0
-                {
-                    libc::_exit(1);
-                }
-                if libc::getppid() != parent_pid {
-                    libc::_exit(1);
-                }
-                Ok(())
-            });
-        }
-        spawn_linux_owned(cmd)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let child = spawn_hidden(&exe_s, args)?;
-        #[cfg(windows)]
-        assign_to_lifetime_job(&child);
-        Ok(child)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn spawn_linux_owned(command: Command) -> Result<Child> {
-    // PR_SET_PDEATHSIG follows the spawning THREAD, not just the process. Keep
-    // the native spawn owner alive beyond short-lived installer/activation threads.
-    type Request = (Command, std::sync::mpsc::SyncSender<std::io::Result<Child>>);
-    static OWNER: OnceLock<std::sync::mpsc::Sender<Request>> = OnceLock::new();
-    let owner = OWNER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Request>();
-        let _ = std::thread::Builder::new()
-            .name("local-ai-process-owner".into())
-            .spawn(move || {
-                while let Ok((mut command, result)) = rx.recv() {
-                    let _ = result.send(command.spawn());
-                }
-            });
-        tx
-    });
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    owner
-        .send((command, tx))
-        .map_err(|_| anyhow!("local AI process owner unavailable"))?;
-    rx.recv()
-        .map_err(|_| anyhow!("local AI process owner stopped"))?
-        .context("spawn a local AI process")
+    let child = spawn_hidden(&exe_s, args)?;
+    // Tie the server's lifetime to ours so a hard exit of THIS process can't
+    // orphan it on :8080 (see `assign_to_lifetime_job`).
+    #[cfg(windows)]
+    assign_to_lifetime_job(&child);
+    Ok(child)
 }
 
 /// Assign a spawned child to a process-wide Windows Job Object configured with
@@ -4029,182 +3163,3 @@ pub(super) fn run_capture(exe: &str, args: &[&str]) -> Result<std::process::Outp
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod linux_asset_picker_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    use super::*;
-
-    fn mock_asset(name: &str) -> GhAsset {
-        GhAsset {
-            name: name.to_string(),
-            browser_download_url: format!(
-                "https://github.com/ggml-org/llama.cpp/releases/download/b11793/{name}"
-            ),
-            size: 1_000_000,
-        }
-    }
-
-    #[test]
-    fn test_linux_pick_llama_cpu_when_no_gpu() {
-        let assets = vec![
-            mock_asset("llama-b11793-bin-ubuntu-x64.tar.gz"),
-            mock_asset("llama-b11793-bin-ubuntu-arm64.tar.gz"),
-            mock_asset("llama-b11793-bin-ubuntu-vulkan-x64.tar.gz"),
-            mock_asset("llama-b11793-bin-ubuntu-cuda-13.4-x64.tar.gz"),
-            mock_asset("cudart-llama-b11793-bin-ubuntu-cuda-13.4-x64.tar.gz"),
-        ];
-
-        let pick_x64 = pick_llama_linux(&assets, GpuKind::None, "x64").unwrap();
-        assert_eq!(pick_x64.version, None);
-        assert!(pick_x64
-            .build_url
-            .ends_with("llama-b11793-bin-ubuntu-x64.tar.gz"));
-        assert!(pick_x64.cudart_url.is_none());
-
-        let pick_arm64 = pick_llama_linux(&assets, GpuKind::None, "arm64").unwrap();
-        assert_eq!(pick_arm64.version, None);
-        assert!(pick_arm64
-            .build_url
-            .ends_with("llama-b11793-bin-ubuntu-arm64.tar.gz"));
-        assert!(pick_arm64.cudart_url.is_none());
-    }
-
-    #[test]
-    fn test_linux_pick_llama_cuda_highest_version_with_matching_cudart() {
-        let assets = vec![
-            mock_asset("llama-b11793-bin-ubuntu-x64.tar.gz"),
-            mock_asset("llama-b11793-bin-ubuntu-cuda-12.8-x64.tar.gz"),
-            mock_asset("cudart-llama-b11793-bin-ubuntu-cuda-12.8-x64.tar.gz"),
-            mock_asset("llama-b11793-bin-ubuntu-cuda-13.4-x64.tar.gz"),
-            mock_asset("cudart-llama-b11793-bin-ubuntu-cuda-13.4-x64.tar.gz"),
-        ];
-
-        let pick = pick_llama_linux(&assets, GpuKind::Nvidia, "x64").unwrap();
-        assert_eq!(pick.version.as_deref(), Some("13.4"));
-        assert!(pick
-            .build_url
-            .ends_with("llama-b11793-bin-ubuntu-cuda-13.4-x64.tar.gz"));
-        assert!(pick
-            .cudart_url
-            .unwrap()
-            .ends_with("cudart-llama-b11793-bin-ubuntu-cuda-13.4-x64.tar.gz"));
-    }
-
-    #[test]
-    fn test_linux_pick_llama_cuda_skips_when_cudart_missing() {
-        let assets = vec![
-            mock_asset("llama-b11793-bin-ubuntu-x64.tar.gz"),
-            mock_asset("llama-b11793-bin-ubuntu-cuda-12.8-x64.tar.gz"),
-            mock_asset("cudart-llama-b11793-bin-ubuntu-cuda-12.8-x64.tar.gz"),
-            // 13.4 has NO matching cudart
-            mock_asset("llama-b11793-bin-ubuntu-cuda-13.4-x64.tar.gz"),
-        ];
-
-        let pick = pick_llama_linux(&assets, GpuKind::Nvidia, "x64").unwrap();
-        assert_eq!(pick.version.as_deref(), Some("12.8"));
-        assert!(pick
-            .build_url
-            .ends_with("llama-b11793-bin-ubuntu-cuda-12.8-x64.tar.gz"));
-    }
-
-    #[test]
-    fn test_linux_pick_llama_cuda_falls_to_cpu_when_no_cudart_matches() {
-        let assets = vec![
-            mock_asset("llama-b11793-bin-ubuntu-x64.tar.gz"),
-            mock_asset("llama-b11793-bin-ubuntu-cuda-13.4-x64.tar.gz"),
-        ];
-
-        let pick = pick_llama_linux(&assets, GpuKind::Nvidia, "x64").unwrap();
-        assert_eq!(pick.version, None);
-        assert!(pick
-            .build_url
-            .ends_with("llama-b11793-bin-ubuntu-x64.tar.gz"));
-    }
-
-    #[test]
-    fn test_linux_pick_llama_vulkan_for_other() {
-        let assets = vec![
-            mock_asset("llama-b11793-bin-ubuntu-x64.tar.gz"),
-            mock_asset("llama-b11793-bin-ubuntu-vulkan-x64.tar.gz"),
-        ];
-
-        let pick = pick_llama_linux(&assets, GpuKind::Other, "x64").unwrap();
-        assert_eq!(pick.version.as_deref(), Some("Vulkan"));
-        assert!(pick
-            .build_url
-            .ends_with("llama-b11793-bin-ubuntu-vulkan-x64.tar.gz"));
-        assert!(pick.cudart_url.is_none());
-    }
-
-    #[test]
-    fn test_linux_pick_llama_vulkan_falls_to_cpu_when_missing() {
-        let assets = vec![mock_asset("llama-b11793-bin-ubuntu-arm64.tar.gz")];
-
-        let pick = pick_llama_linux(&assets, GpuKind::Other, "arm64").unwrap();
-        assert_eq!(pick.version, None);
-        assert!(pick
-            .build_url
-            .ends_with("llama-b11793-bin-ubuntu-arm64.tar.gz"));
-    }
-
-    #[test]
-    fn test_linux_pick_whisper_native_cpu() {
-        let assets = vec![
-            mock_asset("whisper-bin-ubuntu-x64.tar.gz"),
-            mock_asset("whisper-bin-ubuntu-arm64.tar.gz"),
-        ];
-
-        let (url_x64, _) = pick_whisper_linux(&assets, "x64").unwrap();
-        assert!(url_x64.ends_with("whisper-bin-ubuntu-x64.tar.gz"));
-
-        let (url_arm64, _) = pick_whisper_linux(&assets, "arm64").unwrap();
-        assert!(url_arm64.ends_with("whisper-bin-ubuntu-arm64.tar.gz"));
-    }
-
-    #[test]
-    fn test_linux_archive_link_target_safety() {
-        assert!(archive_link_target_is_safe("libllama.so", "libllama.so.0"));
-        assert!(archive_link_target_is_safe(
-            "lib/libllama.so",
-            "libllama.so.0"
-        ));
-        assert!(archive_link_target_is_safe(
-            "lib/libllama.so",
-            "../lib/libllama.so.0"
-        ));
-
-        assert!(!archive_link_target_is_safe("libllama.so", "../escape"));
-        assert!(!archive_link_target_is_safe(
-            "lib/libllama.so",
-            "../../escape"
-        ));
-        assert!(!archive_link_target_is_safe("libllama.so", "/etc/passwd"));
-        assert!(!archive_link_target_is_safe("libllama.so", "C:\\escape"));
-
-        assert!(!archive_link_target_is_safe("libllama.so", ".. "));
-        assert!(!archive_link_target_is_safe("libllama.so", "..."));
-    }
-
-    #[test]
-    fn test_linux_tar_verbose_listing_validation() {
-        let valid_listing = "\
--rwxr-xr-x 0/0 12345 2024-01-01 00:00 llama-server
--rw-r--r-- 0/0  5432 2024-01-01 00:00 libllama.so.0.0.1
-lrwxrwxrwx 0/0     0 2024-01-01 00:00 libllama.so.0 -> libllama.so.0.0.1
-lrwxrwxrwx 0/0     0 2024-01-01 00:00 libllama.so -> libllama.so.0
-";
-        assert!(validate_tar_links(valid_listing).is_ok());
-
-        let invalid_symlink_listing = "\
--rwxr-xr-x 0/0 12345 2024-01-01 00:00 llama-server
-lrwxrwxrwx 0/0     0 2024-01-01 00:00 libllama.so -> ../../etc/shadow
-";
-        assert!(validate_tar_links(invalid_symlink_listing).is_err());
-
-        let unparseable_link = "\
-lrwxrwxrwx 0/0     0 2024-01-01 00:00 mysterious-link-entry
-";
-        assert!(validate_tar_links(unparseable_link).is_err());
-    }
-}

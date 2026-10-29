@@ -138,7 +138,7 @@ fn expected_sentinel() -> Sentinel {
 /// loads them from).
 #[must_use]
 pub fn diar_dir() -> Option<PathBuf> {
-    crate::paths::speech_model_dir("diar")
+    crate::paths::data_root().map(|d| d.join("diar"))
 }
 
 /// Absolute path to the pyannote segmentation model (`None` if APPDATA unset).

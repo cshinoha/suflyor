@@ -16,10 +16,7 @@ pub mod audio;
 // Remaining non-Windows seam: same public `overlay_backend::audio` surface,
 // but capture / device enumeration / recording entry points fail with
 // explicit unsupported errors (no OS calls, no fake success).
-#[cfg(target_os = "linux")]
-#[path = "audio_linux.rs"]
-pub mod audio;
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 #[path = "audio_unavailable.rs"]
 pub mod audio;
 pub mod audio_metrics;
@@ -28,6 +25,7 @@ pub mod audio_metrics;
 pub(crate) mod audio_route;
 pub mod bridge;
 pub mod capabilities;
+pub mod codex_direct;
 pub mod codex_subscription;
 pub mod components;
 pub mod config;
@@ -45,9 +43,9 @@ pub mod journal;
 pub mod kb;
 pub mod local_ai;
 pub mod memory;
+pub mod network;
 pub mod mlx_install;
 pub mod mlx_runtime;
-pub mod nemotron_diar;
 pub mod ocr;
 pub mod ocr_install;
 pub mod paths;

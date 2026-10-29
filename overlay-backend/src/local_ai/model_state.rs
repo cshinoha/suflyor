@@ -23,10 +23,8 @@ pub fn select_local_provider(cfg: &mut crate::config::Config, root: &Path) -> bo
 /// Default install root: `%USERPROFILE%\suflyor-local-ai`.
 #[must_use]
 pub fn default_root() -> PathBuf {
-    crate::paths::model_storage_root().unwrap_or_else(|| {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join("suflyor-local-ai")
-    })
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join("suflyor-local-ai")
 }
 
 /// Persist a successfully started managed or user-selected model.
@@ -224,9 +222,6 @@ pub fn repair_managed_model_state_after_verification(
 /// and matching projector state instead of trusting the persisted UI flag.
 #[must_use]
 pub fn local_vision_available(cfg: &crate::config::Config, root: &Path) -> bool {
-    if super::is_managed_strata_endpoint(&cfg.ai_local_base_url) {
-        return super::strata_vision_available(root);
-    }
     !is_managed_llama_endpoint(&cfg.ai_local_base_url)
         || (cfg.ai_local_custom_gguf.trim().is_empty()
             && managed_model_vision_capable(
@@ -332,18 +327,6 @@ pub fn gigaam_model_present(dir: &Path) -> bool {
     file_len(&dir.join("model.int8.onnx")) >= GIGAAM_MODEL_SIZE
 }
 
-/// Write the bundled `vocab.txt` beside a complete GigaAM-v3 model when it is
-/// missing or empty. The model does not load without it, while the presence
-/// check above reads only the model file. Returns `true` when it wrote one.
-pub fn repair_gigaam_vocab(dir: &Path) -> std::io::Result<bool> {
-    let vocab = dir.join("vocab.txt");
-    if !gigaam_model_present(dir) || file_len(&vocab) > 0 {
-        return Ok(false);
-    }
-    std::fs::write(vocab, super::GIGAAM_VOCAB)?;
-    Ok(true)
-}
-
 #[must_use]
 pub fn quality_vision_present(root: &Path) -> bool {
     file_has_expected_size(&root.join("llama.cpp").join(MMPROJ26_FILE), MMPROJ26_SIZE)
@@ -360,7 +343,7 @@ pub fn quality_vision_supported(root: &Path) -> bool {
 #[must_use]
 pub fn local_model_resource_warning(root: &Path, base_url: &str, model_id: &str) -> String {
     if !is_managed_llama_endpoint(base_url) {
-        return "Требования к памяти выбранной внешней модели неизвестны.".to_string();
+        return "[!] Требования к памяти выбранной внешней модели неизвестны.".to_string();
     }
     let lower = model_id.to_ascii_lowercase();
     if lower.contains("26b-a4b") {
@@ -374,23 +357,23 @@ pub fn local_model_resource_warning(root: &Path, base_url: &str, model_id: &str)
             }
         };
         format!(
-            "Gemma 26B-A4B: {:.1} GiB на диске; {matrix}. Память для vision: неизвестно.",
+            "[!] Gemma 26B-A4B: {:.1} GiB на диске; {matrix}. Память для vision: неизвестно.",
             GEMMA26_SIZE as f64 / GIB as f64
         )
     } else if lower.contains("12b") {
         format!(
-            "Gemma 12B QAT fallback: {:.1} GiB на диске. Матрица 8 ГБ VRAM / 16-31 ГБ RAM подтверждена владельцем. Память для vision: неизвестно.",
+            "[!] Gemma 12B QAT fallback: {:.1} GiB на диске. Матрица 8 ГБ VRAM / 16-31 ГБ RAM подтверждена владельцем. Память для vision: неизвестно.",
             GEMMA_SIZE as f64 / GIB as f64
         )
     } else if lower.contains("e4b") || lower.contains("4b") {
         format!(
-            "Legacy Gemma 4B: {:.1} GiB на диске. Память для vision: неизвестно.",
+            "[!] Legacy Gemma 4B: {:.1} GiB на диске. Память для vision: неизвестно.",
             LEGACY_GEMMA_SIZE as f64 / GIB as f64
         )
     } else if model_id.trim().is_empty() && base_model_present(root) {
         local_model_resource_warning(root, base_url, &fallback_model_name(root))
     } else {
-        "Требования к памяти выбранной локальной модели неизвестны.".to_string()
+        "[!] Требования к памяти выбранной локальной модели неизвестны.".to_string()
     }
 }
 

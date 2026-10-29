@@ -40,9 +40,7 @@ const APP_SERVER_ARGS: &[&str] = &[
     "--strict-config",
     "-c",
     "cli_auth_credentials_store=\"keyring\"",
-    #[cfg(windows)]
     "-c",
-    #[cfg(windows)]
     "windows.sandbox=\"elevated\"",
     "-c",
     "default_permissions=\"suflyor-text-only\"",
@@ -76,6 +74,7 @@ pub enum LoginEvent {
         plan: Option<String>,
     },
     SignInRequired,
+    NotInstalled,
     Error,
 }
 
@@ -87,6 +86,7 @@ pub struct CodexModel {
     pub default_reasoning_effort: Option<String>,
     pub reasoning_efforts: Vec<String>,
     pub input_modalities: Vec<String>,
+    pub supports_fast: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +388,7 @@ fn parse_model(value: &Value) -> Result<CodexModel, RpcFailure> {
         .get("defaultReasoningEffort")
         .and_then(Value::as_str)
         .and_then(safe_short_label);
+    let supports_fast = model_supports_fast(value)?;
     Ok(CodexModel {
         id,
         display_name,
@@ -398,7 +399,48 @@ fn parse_model(value: &Value) -> Result<CodexModel, RpcFailure> {
         default_reasoning_effort,
         reasoning_efforts,
         input_modalities,
+        supports_fast,
     })
+}
+
+fn model_supports_fast(value: &Value) -> Result<bool, RpcFailure> {
+    let service_tiers = value
+        .get("serviceTiers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if service_tiers.len() > 16 {
+        return Err(RpcFailure::Protocol);
+    }
+    for tier in service_tiers {
+        let id = tier
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(safe_short_label)
+            .ok_or(RpcFailure::Protocol)?;
+        if matches!(id.as_str(), "fast" | "priority") {
+            return Ok(true);
+        }
+    }
+
+    let additional = value
+        .get("additionalSpeedTiers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if additional.len() > 16 {
+        return Err(RpcFailure::Protocol);
+    }
+    for tier in additional {
+        let id = tier
+            .as_str()
+            .and_then(safe_short_label)
+            .ok_or(RpcFailure::Protocol)?;
+        if id == "fast" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn string_array(
@@ -473,6 +515,23 @@ fn safe_display_label(value: &str) -> Option<String> {
     .then(|| value.to_string())
 }
 
+/// Read current subscription-account state without exposing email or tokens.
+#[must_use]
+pub fn account_state() -> AccountState {
+    match account_state_inner() {
+        Ok(state) => state,
+        Err(RpcFailure::NotInstalled) => AccountState::NotInstalled,
+        Err(_) => AccountState::Error,
+    }
+}
+
+fn account_state_inner() -> Result<AccountState, RpcFailure> {
+    let mut server = AppServer::start()?;
+    server.initialize()?;
+    let result = server.request(2, "account/read", json!({"refreshToken":false}))?;
+    parse_account_state(&result)
+}
+
 /// Reserve a device-login attempt before its worker thread starts. Starting a
 /// new attempt invalidates any older one, including workers not scheduled yet.
 #[must_use]
@@ -491,7 +550,7 @@ pub fn device_login(attempt: LoginAttempt, mut notify: impl FnMut(LoginEvent)) {
     let result = device_login_inner(attempt.0, &mut notify);
     match result {
         Ok(()) | Err(RpcFailure::Cancelled) => {}
-        Err(RpcFailure::NotInstalled) => notify(LoginEvent::Error),
+        Err(RpcFailure::NotInstalled) => notify(LoginEvent::NotInstalled),
         Err(_) => notify(LoginEvent::Error),
     }
 }
@@ -599,10 +658,12 @@ fn disconnect_inner() -> Result<(), RpcFailure> {
 pub fn run_turn(
     model: &str,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     messages: &[ChatMessage],
     mut notify: impl FnMut(TurnEvent) -> bool,
 ) -> Result<TokenUsage, TurnFailure> {
-    run_turn_inner(model, reasoning_effort, messages, &mut notify).map_err(map_turn_failure)
+    run_turn_inner(model, reasoning_effort, service_tier, messages, &mut notify)
+        .map_err(map_turn_failure)
 }
 
 fn map_turn_failure(failure: RpcFailure) -> TurnFailure {
@@ -621,6 +682,7 @@ fn map_turn_failure(failure: RpcFailure) -> TurnFailure {
 fn run_turn_inner(
     model: &str,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     messages: &[ChatMessage],
     notify: &mut impl FnMut(TurnEvent) -> bool,
 ) -> Result<TokenUsage, RpcFailure> {
@@ -629,6 +691,12 @@ fn run_turn_inner(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(safe_reasoning_effort)
+        .transpose()?
+        .flatten();
+    let selected_service_tier = service_tier
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(safe_service_tier)
         .transpose()?
         .flatten();
     let input = secure_turn_input(messages)?;
@@ -666,6 +734,7 @@ fn run_turn_inner(
         &thread_id,
         &selected_model,
         selected_effort.as_deref(),
+        selected_service_tier.as_deref(),
         &workspace_text,
         input,
     );
@@ -679,6 +748,7 @@ fn run_turn_inner(
         &thread_id,
         &selected_model,
         selected_effort.as_deref(),
+        selected_service_tier.as_deref(),
         &workspace,
         &mut turn_id,
         notify,
@@ -700,6 +770,7 @@ fn receive_turn(
     thread_id: &str,
     model: &str,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     workspace: &Path,
     turn_id: &mut Option<String>,
     notify: &mut impl FnMut(TurnEvent) -> bool,
@@ -750,6 +821,7 @@ fn receive_turn(
                 thread_id,
                 model,
                 reasoning_effort,
+                service_tier,
                 workspace,
             )?;
             continue;
@@ -1029,6 +1101,7 @@ fn secure_turn_params(
     thread_id: &str,
     model: &str,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     workspace: &str,
     input: Vec<Value>,
 ) -> Value {
@@ -1045,6 +1118,9 @@ fn secure_turn_params(
     if let Some(effort) = reasoning_effort {
         params["effort"] = Value::String(effort.to_string());
     }
+    if let Some(tier) = service_tier {
+        params["serviceTier"] = Value::String(tier.to_string());
+    }
     params
 }
 
@@ -1053,6 +1129,7 @@ fn validate_thread_settings_update(
     thread_id: &str,
     model: &str,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     workspace: &Path,
 ) -> Result<(), RpcFailure> {
     let params = message.get("params").ok_or(RpcFailure::Protocol)?;
@@ -1100,7 +1177,23 @@ fn validate_thread_settings_update(
             "settings-reasoning-effort",
         )?;
     }
+    if let Some(expected) = service_tier {
+        require_contract(
+            settings.get("serviceTier").and_then(Value::as_str) == Some(expected),
+            "settings-service-tier",
+        )?;
+    }
     Ok(())
+}
+
+fn safe_service_tier(value: &str) -> Result<Option<String>, RpcFailure> {
+    match value {
+        // Codex calls the feature Fast mode, while the current wire request
+        // value is `priority`. Accept the legacy/config spelling defensively
+        // but always normalize before talking to app-server.
+        "fast" | "priority" => Ok(Some("priority".to_string())),
+        _ => Err(RpcFailure::InvalidModel),
+    }
 }
 
 fn safe_reasoning_effort(value: &str) -> Result<Option<String>, RpcFailure> {
@@ -1404,22 +1497,6 @@ fn spawn_app_server(
             command.env(name, value);
         }
     }
-    #[cfg(unix)]
-    for name in [
-        "HOME",
-        "PATH",
-        "LANG",
-        "LC_ALL",
-        "TMPDIR",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
     command.env("CODEX_HOME", codex_home);
     #[cfg(windows)]
     {
@@ -1453,9 +1530,25 @@ fn rpc_request(id: u64, method: &str, params: Value) -> Value {
 
 fn codex_executable_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+
+    // The official Windows app and npm package both support/advertise a
+    // CODEX_CLI_PATH override. Honour it first when it points at a native exe.
+    // Do not execute .cmd/.bat wrappers directly: CreateProcess cannot launch
+    // them without cmd.exe, and the native binary is available inside the npm
+    // package anyway.
+    if let Some(path) = std::env::var_os("CODEX_CLI_PATH") {
+        let path = PathBuf::from(path);
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        {
+            candidates.push(path);
+        }
+    }
+
     // Prefer the real Codex Desktop bundle over WindowsApps execution aliases,
     // which can exist on PATH but reject CreateProcess with access denied.
-    #[cfg(windows)]
     if let Some(local) = dirs::data_local_dir() {
         let bundled = local.join("OpenAI").join("Codex").join("bin");
         if let Ok(entries) = fs::read_dir(bundled) {
@@ -1466,13 +1559,55 @@ fn codex_executable_candidates() -> Vec<PathBuf> {
             );
         }
     }
+
+    // Current standalone installs may keep the native binary under
+    // %USERPROFILE%\.codex\packages\standalone\current\bin.
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(
+            home.join(".codex")
+                .join("packages")
+                .join("standalone")
+                .join("current")
+                .join("bin")
+                .join("codex.exe"),
+        );
+    }
+
+    // npm exposes `codex.cmd` on Windows, while the executable we can safely
+    // spawn lives inside @openai/codex-win32-*/vendor/... . Search both the
+    // default npm prefix and every PATH entry, which also covers custom npm/fnm
+    // prefixes without shelling out to npm.
+    if let Some(appdata) = dirs::config_dir() {
+        push_npm_codex_candidates(&appdata.join("npm"), &mut candidates);
+    }
     if let Some(path) = std::env::var_os("PATH") {
-        let executable = format!("codex{}", std::env::consts::EXE_SUFFIX);
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join(&executable)));
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join("codex.exe"));
+            push_npm_codex_candidates(&dir, &mut candidates);
+        }
     }
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|path| path.is_file() && seen.insert(path.clone()));
     candidates
+}
+
+fn push_npm_codex_candidates(root: &Path, candidates: &mut Vec<PathBuf>) {
+    let package = root
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("node_modules")
+        .join("@openai");
+    for (package_name, target) in [
+        ("codex-win32-x64", "x86_64-pc-windows-msvc"),
+        ("codex-win32-arm64", "aarch64-pc-windows-msvc"),
+    ] {
+        let vendor = package.join(package_name).join("vendor").join(target);
+        candidates.push(vendor.join("bin").join("codex.exe"));
+        // Older package layouts used an extra `codex` directory instead of
+        // `bin`; keeping this candidate is cheap and preserves compatibility.
+        candidates.push(vendor.join("codex").join("codex.exe"));
+    }
 }
 
 #[cfg(test)]
@@ -1629,10 +1764,7 @@ mod tests {
     #[test]
     fn experimental_security_contract_is_explicit_and_model_pinned_twice() {
         assert!(APP_SERVER_ARGS.contains(&"--strict-config"));
-        assert_eq!(
-            APP_SERVER_ARGS.contains(&"windows.sandbox=\"elevated\""),
-            cfg!(windows)
-        );
+        assert!(APP_SERVER_ARGS.contains(&"windows.sandbox=\"elevated\""));
         assert!(APP_SERVER_ARGS.contains(&"default_permissions=\"suflyor-text-only\""));
         assert!(
             APP_SERVER_ARGS.contains(&"permissions.suflyor-text-only.filesystem.:root=\"deny\"")
@@ -1672,6 +1804,7 @@ mod tests {
             "thread-1",
             "gpt-5.4",
             Some("high"),
+            Some("priority"),
             r"C:\safe\empty",
             vec![json!({"type":"text","text":"hello","text_elements":[]})],
         );
@@ -1679,6 +1812,7 @@ mod tests {
         assert_eq!(turn["approvalPolicy"], "never");
         assert_eq!(turn["permissions"], SECURE_PROFILE);
         assert_eq!(turn["effort"], "high");
+        assert_eq!(turn["serviceTier"], "priority");
         assert_eq!(turn["environments"], json!([]));
         assert_eq!(turn["input"].as_array().unwrap().len(), 1);
         assert_eq!(turn["input"][0]["type"], "text");
@@ -1686,6 +1820,9 @@ mod tests {
         assert!(!wire.contains("shellCommand"));
         assert!(!wire.contains("dynamicToolCall"));
         assert!(!wire.contains("process/"));
+        assert_eq!(safe_service_tier("fast"), Ok(Some("priority".into())));
+        assert_eq!(safe_service_tier("priority"), Ok(Some("priority".into())));
+        assert_eq!(safe_service_tier("standard"), Err(RpcFailure::InvalidModel));
         assert_eq!(safe_reasoning_effort("xhigh"), Ok(Some("xhigh".into())));
         assert_eq!(
             safe_reasoning_effort("high\nmalicious"),
@@ -1704,7 +1841,9 @@ mod tests {
                 {"reasoningEffort":"medium","description":"Balanced"},
                 {"reasoningEffort":"high","description":"Deeper reasoning"}
             ],
-            "inputModalities":["text","image"]
+            "inputModalities":["text","image"],
+            "serviceTiers":[{"id":"priority","name":"Fast","description":"Lower latency"}],
+            "additionalSpeedTiers":["fast"]
         }))
         .unwrap();
         assert_eq!(model.id, "gpt-5.4-codex");
@@ -1719,6 +1858,7 @@ mod tests {
             model.input_modalities,
             ["text".to_string(), "image".to_string()]
         );
+        assert!(model.supports_fast);
         assert_eq!(
             parse_model(&json!({"model":"gpt 5 <token>","displayName":"bad"})),
             Err(RpcFailure::Protocol)
@@ -2013,6 +2153,7 @@ mod tests {
                 "threadSettings":{
                     "model":"gpt-5.6-luna",
                     "effort":"low",
+                    "serviceTier":"priority",
                     "approvalPolicy":"never",
                     "cwd":path,
                     "sandboxPolicy":{"type":"readOnly","networkAccess":false},
@@ -2026,6 +2167,7 @@ mod tests {
                 "thread-1",
                 "gpt-5.6-luna",
                 Some("low"),
+                Some("priority"),
                 temp.path()
             ),
             Ok(())
@@ -2039,6 +2181,7 @@ mod tests {
                 "thread-1",
                 "gpt-5.6-luna",
                 Some("low"),
+                Some("priority"),
                 temp.path()
             ),
             Err(RpcFailure::Security)

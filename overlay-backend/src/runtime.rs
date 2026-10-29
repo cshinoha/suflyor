@@ -43,7 +43,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 mod summary_plan;
-mod terms;
 mod trigger_detect;
 
 #[cfg(test)]
@@ -58,14 +57,9 @@ use summary_plan::{
     SUMMARY_INPUT_BUDGET_CLOUD_CHARS, SUMMARY_INPUT_BUDGET_LOCAL_CHARS, SUMMARY_MAX_TOKENS,
     SUMMARY_PARTIAL_MAX_TOKENS,
 };
-pub use terms::{
-    build_term_prompts, hide_terms_line_while_streaming, new_terms, split_terms_line, term_rows,
-    TERM_DEFINITION_MAX_TOKENS,
-};
 pub use trigger_detect::{
-    build_auto_tile_prompts, build_fast_auto_tile_prompts, detect_trigger,
-    extract_question_candidate, looks_like_real_speech, select_conversation_lines,
-    strip_filler_prefix, Trigger, FAST_ANSWER_FORMAT, FAST_USER_HEAD,
+    build_auto_tile_prompts, detect_trigger, extract_question_candidate, looks_like_real_speech,
+    strip_filler_prefix, Trigger,
 };
 
 /// Post-meeting debrief — run Sonnet over the user's MIC-side
@@ -139,8 +133,7 @@ pub async fn run_post_meeting_debrief(
             content: ai::MessageContent::Text(mic_text),
         },
     ];
-    let request = ai::complete_endpoint(&endpoint, messages, 1024);
-    let answer = match ai::with_priority(ai::AiPriority::Background, request).await {
+    let answer = match ai::complete_endpoint(&endpoint, messages, 1024).await {
         Ok(text) => text,
         Err(e) => {
             log::warn!("post-meeting debrief AI call failed: {e:#}");
@@ -151,7 +144,7 @@ pub async fn run_post_meeting_debrief(
             let body = if crate::deep_lock::is_blocked_error(&chain) {
                 crate::deep_lock::blocked_notice(ui_is_ru).to_string()
             } else if ui_is_ru {
-                "Не удалось сформировать разбор (ошибка AI). Подробности — в логе («Собрать логи» в Диагностике).".to_string()
+                "Не удалось сформировать разбор (ошибка ИИ). Подробности — в логе («Собрать логи» в Диагностике).".to_string()
             } else {
                 "Couldn't generate the debrief (AI error). Details in the log (Diagnostics → Collect logs).".to_string()
             };
@@ -436,7 +429,7 @@ pub async fn retry_meeting_summary(
 }
 
 struct ManagedPrepSession {
-    _ai: ai::AiPermit,
+    _ai: tokio::sync::SemaphorePermit<'static>,
     _lifecycle: tokio::sync::OwnedSemaphorePermit,
     root: std::path::PathBuf,
     model: crate::local_ai::ManagedModel,
@@ -590,16 +583,20 @@ async fn summary_complete(
     if exclusive {
         ai::complete_exclusive(base_url, bearer, model, messages, max_tokens).await
     } else {
-        let endpoint = ai::AiEndpoint {
-            protocol,
-            base_url: base_url.to_string(),
-            bearer: bearer.to_string(),
-            model: model.to_string(),
-            reasoning_effort: None,
-            is_local: false,
-        };
-        let request = ai::complete_endpoint(&endpoint, messages, max_tokens);
-        ai::with_priority(ai::AiPriority::Background, request).await
+        ai::complete_endpoint(
+            &ai::AiEndpoint {
+                protocol,
+                base_url: base_url.to_string(),
+                bearer: bearer.to_string(),
+                model: model.to_string(),
+                reasoning_effort: None,
+                service_tier: None,
+                is_local: false,
+            },
+            messages,
+            max_tokens,
+        )
+        .await
     }
 }
 
@@ -1118,10 +1115,10 @@ fn spawn_summary_error_tile(
 ) {
     let msg = if ui_is_ru {
         "Не получилось составить summary — AI недоступен. \
-         Проверьте Настройки → AI-провайдеры и попробуйте ещё раз."
+         Проверьте Настройки → AI и попробуйте ещё раз."
     } else {
         "Couldn't build the summary — the AI endpoint is unavailable. \
-         Check Settings → AI providers and try again."
+         Check Settings → AI and try again."
     };
     if let Err(e2) = events.spawn_tile_full(
         TileSpec {
@@ -1154,7 +1151,7 @@ fn spawn_summary_error_tile(
 pub struct ReaskInputs {
     /// Last AI question shown to the user. Raw on first F3 of a
     /// session (set by ask/manual_ask/maybe_spawn_tile);
-    /// "Re-ask: …" form on subsequent F3s (set by this port's
+    /// "🔁 reask: …" form on subsequent F3s (set by this port's
     /// own writeback). Required — port short-circuits with
     /// `tile:error` if absent.
     pub last_question: Option<String>,
@@ -1186,22 +1183,6 @@ pub struct ReaskOutcome {
     /// add on the shim side). Zero only if the model returned
     /// zero-token usage (degenerate).
     pub cost_microcents_delta: u64,
-}
-
-/// Title of a re-ask tile, also stored as the new last question. A question
-/// that is already a re-ask keeps its title, so repeated F3 does not stack the
-/// prefix.
-fn reask_title(last_q: &str, is_ru: bool) -> String {
-    let prefix = if is_ru {
-        "Уточнение: "
-    } else {
-        "Re-ask: "
-    };
-    if last_q.starts_with(prefix) {
-        last_q.to_string()
-    } else {
-        format!("{prefix}{last_q}")
-    }
 }
 
 /// F3 Reask: builds a fresh AI call using the LAST question + previous
@@ -1243,6 +1224,7 @@ pub async fn reask_last(
         bearer,
         model,
         reasoning_effort,
+        service_tier,
         is_local,
         response_language,
         ui_is_ru,
@@ -1258,6 +1240,7 @@ pub async fn reask_last(
             ep.bearer,
             ep.model,
             ep.reasoning_effort,
+            ep.service_tier,
             ep.is_local,
             c.response_language.clone(),
             c.ui_is_ru(),
@@ -1330,6 +1313,7 @@ pub async fn reask_last(
         bearer,
         model: model.clone(),
         reasoning_effort,
+        service_tier,
         is_local,
     };
     let (answer, usage) = match ai::complete_with_usage_endpoint(&endpoint, messages, 512).await {
@@ -1367,9 +1351,9 @@ pub async fn reask_last(
                         answer: if crate::deep_lock::is_blocked_error(&format!("{e:#}")) {
                             crate::deep_lock::blocked_notice(ui_is_ru)
                         } else if ui_is_ru {
-                            "Не удалось получить ответ от AI. Проверьте, что выбранный провайдер запущен (Настройки → AI-провайдеры)."
+                            "Не удалось получить ответ от AI. Проверьте, что выбранный провайдер запущен (Настройки → AI)."
                         } else {
-                            "Couldn't get a response from AI. Check that the selected provider is running (Settings → AI providers)."
+                            "Couldn't get a response from AI. Check that the selected provider is running (Settings → AI)."
                         }
                         .into(),
                         source: "reask".into(),
@@ -1389,7 +1373,12 @@ pub async fn reask_last(
     };
     // Local inference is free — don't bill it at the cloud fallback rate
     // (cost_microcents maps an unknown local model id to Sonnet pricing).
-    let micro = if is_local || protocol == ai::AiProtocol::CodexSubscription {
+    let micro = if is_local
+        || matches!(
+            protocol,
+            ai::AiProtocol::CodexSubscription | ai::AiProtocol::CodexDirect
+        )
+    {
         0
     } else {
         ai::cost_microcents(&model, usage.input, usage.output)
@@ -1422,7 +1411,7 @@ pub async fn reask_last(
     // tile chrome is preserved. (Per port #1 review-agent note,
     // a future polish round will give the adapter real per-kind
     // branches.)
-    let display_q = reask_title(&last_q, ui_is_ru);
+    let display_q = format!("🔁 reask: {last_q}");
     let answer_trimmed = answer.trim().to_string();
     if let Err(e) = events.spawn_tile_full(
         TileSpec {
@@ -1518,6 +1507,7 @@ pub async fn manual_spawn_tile(
         bearer,
         model,
         reasoning_effort,
+        service_tier,
         is_local,
         response_language,
         ui_is_ru,
@@ -1534,6 +1524,7 @@ pub async fn manual_spawn_tile(
             ep.bearer,
             ep.model,
             ep.reasoning_effort,
+            ep.service_tier,
             ep.is_local,
             c.response_language.clone(),
             c.ui_is_ru(),
@@ -1589,7 +1580,7 @@ pub async fn manual_spawn_tile(
                 }
                 .into(),
                 answer: if ui_is_ru {
-                    "Стенограмма пустая — нечего спрашивать. Запустите сессию (захват аудио), дождитесь реплик и снова нажмите F6."
+                    "Транскрипт пустой — нечего спрашивать. Запустите сессию (захват аудио), дождитесь реплик и снова нажмите F6."
                 } else {
                     "Transcript is empty — nothing to ask. Start a session (audio capture), wait for lines, then press F6 again."
                 }
@@ -1657,6 +1648,7 @@ pub async fn manual_spawn_tile(
         bearer,
         model: model.clone(),
         reasoning_effort,
+        service_tier,
         is_local,
     };
     let (answer, usage) = match ai::complete_with_usage_endpoint(&endpoint, messages, 512).await {
@@ -1686,9 +1678,9 @@ pub async fn manual_spawn_tile(
                         answer: if crate::deep_lock::is_blocked_error(&format!("{e:#}")) {
                             crate::deep_lock::blocked_notice(ui_is_ru)
                         } else if ui_is_ru {
-                            "Не удалось получить ответ от AI. Проверьте, что выбранный провайдер запущен (Настройки → AI-провайдеры)."
+                            "Не удалось получить ответ от AI. Проверьте, что выбранный провайдер запущен (Настройки → AI)."
                         } else {
-                            "Couldn't get a response from AI. Check that the selected provider is running (Settings → AI providers)."
+                            "Couldn't get a response from AI. Check that the selected provider is running (Settings → AI)."
                         }
                         .into(),
                         source: "manual_spawn".into(),
@@ -1705,7 +1697,12 @@ pub async fn manual_spawn_tile(
     };
     // Local inference is free (see reask_last) — zero it so F6 on a local
     // model doesn't inflate the session cost meter / trip the cap.
-    let micro = if is_local || protocol == ai::AiProtocol::CodexSubscription {
+    let micro = if is_local
+        || matches!(
+            protocol,
+            ai::AiProtocol::CodexSubscription | ai::AiProtocol::CodexDirect
+        )
+    {
         0
     } else {
         ai::cost_microcents(&model, usage.input, usage.output)

@@ -150,29 +150,10 @@ pub enum VisionMode {
 /// is the ISO tag the rest of the app answers in. No persona/profile is applied
 /// (a role like «отвечай как психолог» would distort a factual answer).
 #[must_use]
-pub fn test_practice_prompt(response_lang: &str) -> String {
-    let lang_line = match response_lang {
-        "ru" => "Отвечай на русском языке.",
-        "en" => "Answer in English.",
-        _ => "Отвечай на языке вопроса.",
-    };
+pub fn test_practice_prompt(_response_lang: &str) -> String {
     format!(
-        "Режим тренировки и самопроверки: пользователь УЖЕ ответил на учебный вопрос и хочет \
-         свериться и понять, где ошибся. Это не оцениваемый экзамен.\n\
-         Сначала определи ТИП вопроса и ответь под него:\n\
-         - Один верный вариант → «Ответ: <буква или текст варианта>».\n\
-         - Несколько верных вариантов → перечисли ВСЕ верные: «Ответ: B, D» (или все подходящие).\n\
-         - Заполнить пропуск / вставить слово (в тексте есть «___» или пропуск) → дай слово или \
-         фразу, которой заполняется пропуск: «Ответ: <слово/фраза>». Пустой «___» — это и есть \
-         место для ответа, его НАДО заполнить, а НЕ повод писать «не уверен».\n\
-         - Открытый вопрос без вариантов → дай краткий правильный ответ.\n\
-         ПЕРВОЙ строкой всегда «Ответ: …». Затем КРАТКО объясни, почему ответ верный (для выбора — \
-         ещё и почему основные неверные варианты неверны) — ради этого и нужен режим (понять \
-         ошибку). 2–4 коротких пункта, без воды.\n\
-         «Не уверен» (и что мешает) пиши ТОЛЬКО если сам текст вопроса не читается (слишком мелко \
-         или обрезано) либо он по-настоящему неоднозначен. Отсутствие букв A/B/C само по себе \
-         НЕ причина — это может быть вопрос на заполнение пропуска или открытый. НЕ выдумывай ответ.\n\
-         {lang_line} Без преамбулы. Допустим Markdown."
+        "{}\n\n=== Режим самопроверки ===\nПользователь может сверять уже решённую учебную задачу. Если на изображении есть вопрос — реши его по общим правилам. Если вопроса нет — разберись в содержимом изображения, не утверждай, что вопрос отсутствует, вместо полезного анализа. Это не оцениваемый экзамен.",
+        crate::ai::prompt::UNIFIED_ANSWER_RULES_RU
     )
 }
 
@@ -191,7 +172,7 @@ pub fn build_test_practice_request(image_data_url: &str, response_lang: &str) ->
             role: "user".into(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
-                    text: "Вопрос со скриншота — разбери для самопроверки.".to_string(),
+                    text: "Разбери содержимое скриншота для самопроверки. Если есть вопрос — ответь на него; если вопроса нет — проанализируй изображение.".to_string(),
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
@@ -234,6 +215,7 @@ pub async fn test_connection(base_url: String, bearer: String, model: String) ->
         bearer,
         model,
         reasoning_effort: None,
+        service_tier: None,
         is_local: false,
     })
     .await
@@ -345,11 +327,12 @@ mod tests {
     }
 
     #[test]
-    fn test_practice_prompt_honors_response_language() {
-        assert!(test_practice_prompt("ru").contains("на русском"));
-        assert!(test_practice_prompt("en").contains("in English"));
-        // Unknown tag falls back to "language of the question".
-        assert!(test_practice_prompt("de").contains("на языке вопроса"));
+    fn test_practice_prompt_is_russian_for_every_input_language() {
+        for lang in ["ru", "en", "de"] {
+            let prompt = test_practice_prompt(lang);
+            assert!(prompt.contains("ИСКЛЮЧИТЕЛЬНО на русском"));
+            assert!(prompt.contains("=== Определи тип вопроса ==="));
+        }
     }
 
     #[test]

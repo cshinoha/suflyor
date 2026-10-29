@@ -11,6 +11,46 @@ pub use crate::ai::AiEndpoint;
 use crate::ai::AiProtocol;
 use crate::credentials::SecretSlot;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeyBindings {
+    pub help: String,
+    pub reask: String,
+    pub knowledge: String,
+    pub new_tile: String,
+    pub close_all_tiles: String,
+    pub archive: String,
+    pub vision: String,
+    pub vision_translate: String,
+    pub vision_ocr: String,
+    pub ask: String,
+    pub ask_deep: String,
+    pub read_selected: String,
+    pub read_ocr: String,
+    pub read_pause: String,
+}
+
+impl Default for HotkeyBindings {
+    fn default() -> Self {
+        Self {
+            help: "F1".into(),
+            reask: "F3".into(),
+            knowledge: "F4".into(),
+            new_tile: "F6".into(),
+            close_all_tiles: "Shift+F6".into(),
+            archive: "F7".into(),
+            vision: "F8".into(),
+            vision_translate: "Shift+F8".into(),
+            vision_ocr: "Ctrl+F8".into(),
+            ask: "F9".into(),
+            ask_deep: "Shift+F9".into(),
+            read_selected: "Shift+Alt+1".into(),
+            read_ocr: "Shift+Alt+2".into(),
+            read_pause: "Shift+Alt+3".into(),
+        }
+    }
+}
+
 /// The curated `/key` snippet pack (the ~1000-line default data literal) lives
 /// in its own file to keep this module navigable; `default_snippets` is the
 /// only item it exposes. Unit tests live in `config/tests.rs` (declared at the
@@ -26,6 +66,22 @@ use snippets::default_snippets;
 /// NOT need a bump — `#[serde(default)]` already loads old files.
 const CURRENT_CONFIG_VERSION: u32 = 2;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VisionCaptureRegion {
+    /// X/Y/width/height normalized to the selected capture source bounds.
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Default for VisionCaptureRegion {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -39,6 +95,29 @@ pub struct Config {
     /// Pre-meeting context (system prompt prefix), free-form.
     /// e.g. "Это собеседование на Senior SRE position. Мой опыт: 7 лет K8s..."
     pub meeting_context: String,
+
+    /// Network routing for cloud AI/STT. 0=system, 1=direct->proxy,
+    /// 2=proxy->direct, 3=direct only, 4=proxy only.
+    #[serde(default)]
+    pub network_proxy_mode: i32,
+    /// HTTP(S) or SOCKS5 proxy URL. Never include this in diagnostics/logs.
+    #[serde(default)]
+    pub network_proxy_url: String,
+
+    /// User-editable Whisper/Groq Latin technical vocabulary (first in STT prompt).
+    /// Keep an explicit empty string when disabled. Old config files get the original default.
+    #[serde(default = "default_stt_tech_vocab")]
+    pub stt_tech_vocab: String,
+
+    /// Empty template keeps the original automatic prompt composition.
+    /// Tokens: [CANONICAL_TECH_VOCAB], [trigger_keywords], [meeting_context].
+    #[serde(default)]
+    pub stt_groq_prompt_template: String,
+    /// 0=automatic original, 1=custom template, 2=no prompt.
+    #[serde(default)]
+    pub stt_groq_prompt_mode: i32,
+    #[serde(default)]
+    pub stt_whisper_prompt_template: String,
 
     /// Named profiles for meeting_context (swap quickly).
     pub context_profiles: Vec<ContextProfile>,
@@ -76,31 +155,77 @@ pub struct Config {
     pub openai_base_url: String,
     #[serde(default = "default_openai_model")]
     pub openai_model: String,
-    /// Reasoning level sent with each request to the cloud bridge
-    /// (`reasoning_effort`) and to the OpenAI Responses profile
-    /// (`reasoning.effort`): `none`, `minimal`, `low`, `medium`, `high`.
-    /// Empty sends nothing and keeps the model's own default.
+    /// Separate OpenAI model used while the overlay is in Smart mode (and by smart tile escalation).
+    /// Empty keeps backward-compatible behavior and falls back to `openai_model`.
     #[serde(default)]
-    pub ai_reasoning_effort: String,
+    pub openai_smart_model: String,
+    /// Vision-only OpenAI models. Empty values fall back to the corresponding
+    /// text profile, preserving older configs.
     #[serde(default)]
-    pub openai_reasoning_effort: String,
+    pub openai_vision_model: String,
+    #[serde(default)]
+    pub openai_vision_smart_model: String,
     /// Direct Anthropic Messages API profile. The API key is intentionally not
     /// serialized; it lives in Windows Credential Manager.
     #[serde(default = "default_anthropic_base_url")]
     pub anthropic_base_url: String,
     #[serde(default = "default_anthropic_model")]
     pub anthropic_model: String,
-    /// Exact account-managed model id selected from the official Codex
-    /// app-server catalog. No credential or endpoint is persisted alongside it.
+    /// Separate Anthropic model used by the Smart route. Empty falls back to
+    /// `anthropic_model`.
+    #[serde(default)]
+    pub anthropic_smart_model: String,
+    /// Vision-only Anthropic models. Empty values fall back to the corresponding
+    /// text profile, preserving older configs.
+    #[serde(default)]
+    pub anthropic_vision_model: String,
+    #[serde(default)]
+    pub anthropic_vision_smart_model: String,
+    /// Codex account transport. `app_server` preserves the official local
+    /// Codex runtime path; `direct` uses ChatGPT OAuth + Codex Responses.
+    #[serde(default = "default_codex_transport")]
+    pub codex_transport: String,
+    /// Exact account-managed model id selected from the active Codex catalog.
+    /// No credential is persisted alongside it.
     #[serde(default)]
     pub codex_model: String,
-    /// Empty means the selected model's app-server default.
+    /// Separate account model for Smart mode (and smart tile escalation). Empty
+    /// falls back to `codex_model` so existing profiles keep working.
+    #[serde(default)]
+    pub codex_smart_model: String,
+    /// Empty means the selected model transport's default reasoning effort.
     #[serde(default)]
     pub codex_reasoning_effort: String,
+    /// Smart-mode reasoning is independent from the Normal profile. Empty = model default.
+    #[serde(default)]
+    pub codex_smart_reasoning_effort: String,
+    /// Use the Codex/OpenAI Fast service tier for the selected account model.
+    /// The Settings UI enables this only when the active Codex catalog
+    /// advertises Fast support for that model.
+    #[serde(default)]
+    pub codex_fast_mode: bool,
+    /// Independent Fast tier switch for Smart text mode.
+    #[serde(default)]
+    pub codex_smart_fast_mode: bool,
     /// Image-capable Codex model selected independently for F8. The Settings
     /// picker fills this only from catalog entries advertising `image` input.
     #[serde(default)]
     pub codex_vision_model: String,
+    /// Separate image-capable Codex model used while global AI mode is Smart.
+    #[serde(default)]
+    pub codex_vision_smart_model: String,
+    /// Independent reasoning profiles for Normal/Smart Vision. Empty = model default.
+    #[serde(default)]
+    pub codex_vision_reasoning_effort: String,
+    #[serde(default)]
+    pub codex_vision_smart_reasoning_effort: String,
+    /// Use the Codex/OpenAI Fast service tier for F8 vision requests when the
+    /// selected image-capable account model advertises Fast support.
+    #[serde(default)]
+    pub codex_vision_fast_mode: bool,
+    /// Independent Fast tier switch for Smart Vision.
+    #[serde(default)]
+    pub codex_vision_smart_fast_mode: bool,
     /// Managed macOS MLX text model. Runtime endpoint/token are process-local.
     #[serde(default = "default_ai_mlx_model")]
     pub ai_mlx_model: String,
@@ -137,21 +262,6 @@ pub struct Config {
     /// model to think. Only affects the LOCAL provider.
     #[serde(default)]
     pub ai_local_thinking: bool,
-    /// The local model may call read-only tools while it answers: the
-    /// knowledge base and personal memory, and the web when `ai_web_search`
-    /// is on (ADR-003). On by default: these tools never leave the PC.
-    #[serde(default = "default_true")]
-    pub ai_agent_tools: bool,
-    /// With `ai_agent_tools`: web search (DuckDuckGo) and page reading. The
-    /// model's queries leave the PC, so this is a separate opt-in.
-    #[serde(default)]
-    pub ai_web_search: bool,
-    /// A Strata folder the user installed before Suflyor, and the run config
-    /// in it to start (`strata-<model>.json`). Empty: Suflyor's own install.
-    #[serde(default)]
-    pub ai_strata_dir: String,
-    #[serde(default)]
-    pub ai_strata_config: String,
     /// Backwards-compatible 26B flag for the bundled local LLM. `true` selects
     /// the owner-approved Gemma 4 26B-A4B primary; `false` uses the explicit
     /// 4B/12B filename in `ai_local_model`. A missing or invalid target falls
@@ -181,6 +291,9 @@ pub struct Config {
     pub vision_bearer: String,
     #[serde(default)]
     pub vision_model: String,
+    /// Smart-mode model for the custom vision bridge. Empty falls back to `vision_model`.
+    #[serde(default)]
+    pub vision_smart_model: String,
     /// Local vision endpoint — a 2nd OpenAI-compatible server running a vision
     /// model (e.g. Qwen2-VL on another port) while text stays on the primary
     /// local model. Empty fields fall back to the text-local ones (`ai_local_*`).
@@ -190,6 +303,24 @@ pub struct Config {
     pub vision_local_bearer: String,
     #[serde(default)]
     pub vision_local_model: String,
+    /// Smart-mode model for the local vision server. Empty falls back to `vision_local_model`.
+    #[serde(default)]
+    pub vision_local_smart_model: String,
+
+    /// Screenshot capture UX. `saved` is the standard mode: the first F8 asks
+    /// for a region, then later F8 presses capture it immediately. `manual`
+    /// keeps the legacy select-every-time flow.
+    #[serde(default = "default_vision_capture_mode")]
+    pub vision_capture_mode: String,
+    /// Saved-region source: `screen` (virtual desktop) or `window`.
+    #[serde(default = "default_vision_capture_source")]
+    pub vision_capture_source: String,
+    /// Normalized rectangle relative to the selected source. None = not configured yet.
+    #[serde(default)]
+    pub vision_capture_region: Option<VisionCaptureRegion>,
+    /// Window title captured during first-time window-source setup.
+    #[serde(default)]
+    pub vision_capture_window_title: String,
 
     /// Feature #4 — append an IPA transcription to each non-trivial word in the
     /// F8 TRANSLATE-mode output (e.g. schedule [ˈʃedjuːl]). OFF by default: it's a
@@ -236,6 +367,26 @@ pub struct Config {
     /// "whisper-large-v3-turbo" (~3× faster, slightly less accurate).
     /// Default: large-v3 — accuracy beats latency for interview use.
     pub stt_model: String,
+    /// Independent API credentials and model choices for cloud STT engines.
+    #[serde(default)]
+    pub stt_speechmatics_key: String,
+    #[serde(default = "default_speechmatics_model")]
+    pub stt_speechmatics_model: String,
+    #[serde(default)]
+    pub stt_elevenlabs_key: String,
+    #[serde(default = "default_elevenlabs_model")]
+    pub stt_elevenlabs_model: String,
+    /// Keyterm prompting is a paid ElevenLabs Scribe v2 feature. Opt in explicitly.
+    #[serde(default = "default_elevenlabs_keyterms_enabled")]
+    pub stt_elevenlabs_keyterms_enabled: bool,
+    /// One keyterm per line, or a comma-separated list. Standalone macros:
+    /// [CANONICAL_TECH_VOCAB], [trigger_keywords], [meeting_context].
+    #[serde(default = "default_elevenlabs_keyterms_template")]
+    pub stt_elevenlabs_keyterms_template: String,
+    #[serde(default)]
+    pub stt_deepgram_key: String,
+    #[serde(default = "default_deepgram_model")]
+    pub stt_deepgram_model: String,
 
     /// STT provider: "cloud" (Groq Whisper), "gigaam" (local in-process
     /// GigaAM-v3 via ONNX — the macOS default), or
@@ -243,6 +394,10 @@ pub struct Config {
     /// best for mixed RU+EN). Missing fields follow the platform default.
     #[serde(default = "default_stt_provider")]
     pub stt_provider: String,
+    /// Ordered reserve STT providers. Empty slots are ignored; duplicates and
+    /// the primary provider are filtered at runtime. Old profiles default off.
+    #[serde(default)]
+    pub stt_fallbacks: Vec<String>,
     /// Directory holding the local GigaAM model (`model.int8.onnx` + `vocab.txt`).
     /// Defaults to the same `~/suflyor-local-ai/gigaam-v3` path the installer uses.
     #[serde(default = "default_stt_gigaam_dir")]
@@ -267,6 +422,48 @@ pub struct Config {
 
     /// Preferred monitor name for tile windows. None = first non-primary, fallback to primary.
     pub tile_monitor_name: Option<String>,
+
+    /// Tile placement rectangle inside the chosen monitor, in thousandths
+    /// [left, top, width, height]. None = use the whole monitor.
+    /// Relative coordinates survive a second-monitor move/resolution change.
+    #[serde(default)]
+    pub tile_zone: Option<[u16; 4]>,
+
+    /// Corner from which new tiles are laid out on the selected monitor.
+    /// Supported values: top_right, top_left, bottom_right, bottom_left.
+    #[serde(default = "default_tile_anchor")]
+    pub tile_anchor: String,
+
+    /// Compact layout in all answer tiles: hide top chrome and follow-up editor.
+    /// Older config.json files without this field retain the normal layout.
+    #[serde(default)]
+    pub tile_reading_mode: bool,
+    #[serde(default = "default_tile_memory_stars")]
+    pub tile_memory_stars: bool,
+    #[serde(default = "default_tile_font_body")]
+    pub tile_font_body: i32,
+    #[serde(default = "default_tile_font_heading")]
+    pub tile_font_heading: i32,
+    #[serde(default = "default_tile_font_subheading")]
+    pub tile_font_subheading: i32,
+    #[serde(default = "default_tile_font_code")]
+    pub tile_font_code: i32,
+    #[serde(default = "default_tile_font_table")]
+    pub tile_font_table: i32,
+    #[serde(default = "default_tile_font_alert")]
+    pub tile_font_alert: i32,
+
+
+    /// Maximum number of simultaneously open tile windows. Before a new tile
+    /// is created at the cap, the oldest live tile is closed and its AI task /
+    /// conversation state is discarded.
+    #[serde(default = "default_max_live_tiles")]
+    pub max_live_tiles: usize,
+
+    /// User-editable global hotkey bindings. Values use global-hotkey syntax,
+    /// e.g. "F9", "Shift+F6", "Ctrl+Alt+KeyQ". Applied on app restart.
+    #[serde(default)]
+    pub hotkeys: HotkeyBindings,
 
     /// Whitespace-separated trigger keywords for auto-tile spawn (case-insensitive).
     /// Example: "kubernetes etcd terraform postgres". Plus any "?" sentence.
@@ -416,14 +613,6 @@ pub struct Config {
     #[serde(default)]
     pub auto_tile_every_line: bool,
 
-    /// Fast answers for calls and interviews: auto tiles use a short prompt
-    /// (one-line answer first, then two or three points, up to ~70 words)
-    /// with a smaller token limit, and a local server keeps that prompt
-    /// cached. Off = the detailed prompt. Not used by the managed MLX
-    /// server, which has its own compact prompt.
-    #[serde(default = "default_true")]
-    pub ai_fast_answers: bool,
-
     /// "Reader mode" tile mute — suppress AUTO-detected AI tiles (the
     /// `TileKind::Ai` answers the detector spawns on each transcript line) so
     /// the user can record + just listen without tiles popping up. Manual asks
@@ -450,12 +639,11 @@ pub struct Config {
     #[serde(default)]
     pub compact_bar: bool,
 
-    // NOTE: the legacy `hotkey_*` (F9/F10/F11/F12) and `manual_ask_mode` and
-    // `custom_css` fields were REMOVED (P1.3). They were dead config that never
-    // matched runtime behaviour — the app uses FIXED hotkeys (F1/F3/F4/F6/F8/F9/
-    // Shift+F8/Shift+F9), push-to-talk is hard-wired, and there is no CSS surface
-    // in the Slint build. `#[serde(default)]` on the struct means old config.json
-    // files carrying these keys still load fine (serde ignores the unknown keys).
+    // NOTE: the legacy flat `hotkey_*` (F9/F10/F11/F12) fields were REMOVED
+    // (P1.3). Configurable bindings now live in the typed `hotkeys` object above.
+    // Old config.json files carrying the legacy keys still load fine because
+    // serde ignores unknown fields. Push-to-talk remains hard-wired and there is
+    // no CSS surface in the Slint build.
     /// UI language for Settings + Overlay + Tile chrome strings (NOT
     /// AI response language — that's `response_language` above). v0.0.42.
     /// Supported: "ru" (default, current primary), "en". Anything else
@@ -520,17 +708,11 @@ pub struct Config {
     /// design, postgres tuning checklist, etc.).
     pub snippets: Vec<Snippet>,
 
-    /// Phase E6 v20 — tile body opacity (0.5..1.0). Lets the user see
-    /// THROUGH tiles to the meeting window underneath. Default 1.0 =
-    /// opaque (current behaviour). Cherry-picked from the design
-    /// bundle 2 `body-opacity` prop; only this one design change was
-    /// adopted — see cycle 26 chat thread for risk-analysis rationale.
+    /// Tile background visibility preset persisted as opacity: 1.0 = opaque,
+    /// 0.30 = 70% transparent background, 0.0 = hidden. Legacy slider values
+    /// are normalized by the host at runtime; tile text itself stays opaque.
     #[serde(default = "default_tile_body_opacity")]
     pub tile_body_opacity: f32,
-
-    /// Omarchy tile inactivity timeout in seconds; zero disables automatic closing.
-    #[serde(default = "default_omarchy_tile_idle_seconds")]
-    pub omarchy_tile_idle_seconds: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -654,6 +836,12 @@ impl Config {
         Self {
             config_version: CURRENT_CONFIG_VERSION,
             meeting_context: String::new(),
+            network_proxy_mode: 0,
+            network_proxy_url: String::new(),
+            stt_tech_vocab: default_stt_tech_vocab(),
+            stt_groq_prompt_template: String::new(),
+            stt_groq_prompt_mode: 0,
+            stt_whisper_prompt_template: String::new(),
             context_profiles: vec![],
             active_profile: None,
             mic_device: None,
@@ -666,13 +854,27 @@ impl Config {
             ai_provider: default_ai_provider(),
             openai_base_url: default_openai_base_url(),
             openai_model: default_openai_model(),
-            ai_reasoning_effort: String::new(),
-            openai_reasoning_effort: String::new(),
+            openai_smart_model: String::new(),
+            openai_vision_model: String::new(),
+            openai_vision_smart_model: String::new(),
             anthropic_base_url: default_anthropic_base_url(),
             anthropic_model: default_anthropic_model(),
+            anthropic_smart_model: String::new(),
+            anthropic_vision_model: String::new(),
+            anthropic_vision_smart_model: String::new(),
+            codex_transport: default_codex_transport(),
             codex_model: String::new(),
+            codex_smart_model: String::new(),
             codex_reasoning_effort: String::new(),
+            codex_smart_reasoning_effort: String::new(),
+            codex_fast_mode: false,
+            codex_smart_fast_mode: false,
             codex_vision_model: String::new(),
+            codex_vision_smart_model: String::new(),
+            codex_vision_reasoning_effort: String::new(),
+            codex_vision_smart_reasoning_effort: String::new(),
+            codex_vision_fast_mode: false,
+            codex_vision_smart_fast_mode: false,
             ai_mlx_model: default_ai_mlx_model(),
             vision_mlx_model: default_vision_mlx_model(),
             ai_local_base_url: default_ai_local_base_url(),
@@ -682,19 +884,21 @@ impl Config {
             ai_local_prep_model: String::new(),
             ai_local_vision: false,
             ai_local_thinking: false,
-            ai_agent_tools: true,
-            ai_web_search: false,
-            ai_strata_dir: String::new(),
-            ai_strata_config: String::new(),
             ai_local_quality: false,
             ai_local_context: default_ai_local_context(),
             vision_provider: default_vision_provider(),
             vision_base_url: String::new(),
             vision_bearer: String::new(),
             vision_model: String::new(),
+            vision_smart_model: String::new(),
             vision_local_base_url: String::new(),
             vision_local_bearer: String::new(),
             vision_local_model: String::new(),
+            vision_local_smart_model: String::new(),
+            vision_capture_mode: default_vision_capture_mode(),
+            vision_capture_source: default_vision_capture_source(),
+            vision_capture_region: None,
+            vision_capture_window_title: String::new(),
             vision_phonetics: false,
             vision_test_practice: false,
             tts_voice: "tera:ru_f1".into(),
@@ -704,13 +908,35 @@ impl Config {
             groq_api_key: String::new(),
             stt_language: Some("ru".into()),
             stt_model: "whisper-large-v3".into(),
+            stt_speechmatics_key: String::new(),
+            stt_speechmatics_model: default_speechmatics_model(),
+            stt_elevenlabs_key: String::new(),
+            stt_elevenlabs_model: default_elevenlabs_model(),
+            stt_elevenlabs_keyterms_enabled: true,
+            stt_elevenlabs_keyterms_template: default_elevenlabs_keyterms_template(),
+            stt_deepgram_key: String::new(),
+            stt_deepgram_model: default_deepgram_model(),
             stt_provider: default_stt_provider(),
+            stt_fallbacks: Vec::new(),
             stt_gigaam_dir: default_stt_gigaam_dir(),
             stt_gigaam_gpu: default_stt_gigaam_gpu(),
             stt_whisper_url: default_stt_whisper_url(),
             stt_whisper_bearer: String::new(),
             stt_whisper_model: default_stt_whisper_model(),
             tile_monitor_name: None,
+            tile_zone: None,
+            tile_anchor: default_tile_anchor(),
+            tile_reading_mode: false,
+            tile_memory_stars: true,
+            tile_font_body: 15,
+            tile_font_heading: 22,
+            tile_font_subheading: 19,
+            tile_font_code: 13,
+            tile_font_table: 13,
+            tile_font_alert: 14,
+
+            max_live_tiles: default_max_live_tiles(),
+            hotkeys: HotkeyBindings::default(),
             stealth_enabled: false, // OFF by default — easier to debug & not every use case needs stealth
             trigger_keywords: default_trigger_keywords(),
             auto_tiles_enabled: true,
@@ -738,12 +964,10 @@ impl Config {
             max_session_cost_usd: default_max_session_cost_usd(),
             detector_skip_mic: default_detector_skip_mic(),
             auto_tile_every_line: false,
-            ai_fast_answers: true,
             suppress_tiles: false,
             deep_lock: false,
             compact_bar: false,
             tile_body_opacity: default_tile_body_opacity(),
-            omarchy_tile_idle_seconds: default_omarchy_tile_idle_seconds(),
         }
     }
 }
@@ -800,6 +1024,7 @@ impl Config {
                         .map_or_else(String::new, |e| e.bearer.clone()),
                     model: self.ai_mlx_model.clone(),
                     reasoning_effort: None,
+                    service_tier: None,
                     is_local: true,
                 }
             }
@@ -815,6 +1040,7 @@ impl Config {
                     bearer: self.ai_local_bearer.clone(),
                     model,
                     reasoning_effort: None,
+                    service_tier: None,
                     is_local: true,
                 }
             }
@@ -822,36 +1048,74 @@ impl Config {
                 protocol: AiProtocol::OpenAiResponses,
                 base_url: self.openai_base_url.clone(),
                 bearer: protected_provider_secret(SecretSlot::OpenAi),
-                model: self.openai_model.clone(),
+                model: if prep && !self.openai_smart_model.trim().is_empty() {
+                    self.openai_smart_model.clone()
+                } else {
+                    self.openai_model.clone()
+                },
                 reasoning_effort: None,
+                service_tier: None,
                 is_local: false,
             },
             "anthropic" => AiEndpoint {
                 protocol: AiProtocol::AnthropicMessages,
                 base_url: self.anthropic_base_url.clone(),
                 bearer: protected_provider_secret(SecretSlot::Anthropic),
-                model: self.anthropic_model.clone(),
+                model: if prep && !self.anthropic_smart_model.trim().is_empty() {
+                    self.anthropic_smart_model.clone()
+                } else {
+                    self.anthropic_model.clone()
+                },
                 reasoning_effort: None,
+                service_tier: None,
                 is_local: false,
             },
-            "codex" if cfg!(any(windows, target_os = "linux")) => AiEndpoint {
-                protocol: AiProtocol::CodexSubscription,
-                base_url: String::new(),
-                bearer: String::new(),
-                model: self.codex_model.clone(),
-                reasoning_effort: (!self.codex_reasoning_effort.trim().is_empty())
-                    .then(|| self.codex_reasoning_effort.clone()),
-                is_local: false,
+            "codex" if cfg!(windows) => {
+                let direct = self.codex_transport == "direct";
+                AiEndpoint {
+                    protocol: if direct {
+                        AiProtocol::CodexDirect
+                    } else {
+                        AiProtocol::CodexSubscription
+                    },
+                    base_url: if direct {
+                        crate::codex_direct::CODEX_BASE_URL.to_string()
+                    } else {
+                        String::new()
+                    },
+                    bearer: String::new(),
+                    model: if prep && !self.codex_smart_model.trim().is_empty() {
+                        self.codex_smart_model.clone()
+                    } else {
+                        self.codex_model.clone()
+                    },
+                    reasoning_effort: {
+                        let effort = if prep {
+                            &self.codex_smart_reasoning_effort
+                        } else {
+                            &self.codex_reasoning_effort
+                        };
+                        (!effort.trim().is_empty()).then(|| effort.clone())
+                    },
+                    service_tier: (if prep {
+                        self.codex_smart_fast_mode
+                    } else {
+                        self.codex_fast_mode
+                    })
+                    .then(|| "priority".to_string()),
+                    is_local: false,
+                }
             },
-            // The subscription adapter supports native Windows and Linux.
-            // Keep unsupported platforms fail-closed rather than silently
-            // billing the configured cloud bridge.
+            // Codex account transports are currently wired into the Windows
+            // host settings flow. Keep an imported/saved choice fail-closed on
+            // other platforms instead of silently billing the cloud bridge.
             "codex" => AiEndpoint {
                 protocol: AiProtocol::OpenAiCompatible,
                 base_url: String::new(),
                 bearer: String::new(),
                 model: String::new(),
                 reasoning_effort: None,
+                service_tier: None,
                 is_local: false,
             },
             _ => AiEndpoint {
@@ -864,6 +1128,7 @@ impl Config {
                     self.ai_model.clone()
                 },
                 reasoning_effort: None,
+                service_tier: None,
                 is_local: false,
             },
         }
@@ -871,8 +1136,8 @@ impl Config {
 
     /// V0.8.0 (Поток D) — one-shot CLOUD escalation endpoint. A local provider
     /// escalates through the legacy cloud bridge; a direct cloud provider stays
-    /// on its native API. Used when the user escalates a single hard question (a
-    /// Shift+F9 ask, a per-tile "↑ ask the smart model", or a 🧠 follow-up)
+    /// on its native API. Used by the global Smart answer mode and by explicit
+    /// per-tile smart escalation / smart follow-ups.
     /// without flipping the persistent provider — so the default stays local
     /// (free, private) and there is no "forgot to switch back" trap.
     ///
@@ -894,6 +1159,7 @@ impl Config {
                 bearer: self.ai_bearer.clone(),
                 model: self.prep_model.clone(),
                 reasoning_effort: None,
+                service_tier: None,
                 is_local: false,
             }
         }
@@ -906,44 +1172,40 @@ impl Config {
     /// falls back to [`DEFAULT_VISION_MODEL`].
     #[must_use]
     pub fn same_text_model_accepts_images_declared(&self) -> bool {
+        self.same_text_model_accepts_images_declared_for(false)
+            && self.same_text_model_accepts_images_declared_for(true)
+    }
+
+    #[must_use]
+    fn same_text_model_accepts_images_declared_for(&self, smart: bool) -> bool {
         match self.ai_provider.as_str() {
             "mlx" => crate::mlx_install::catalog_model(&self.ai_mlx_model)
                 .is_some_and(|model| model.supports_images),
             "local" => self.ai_local_vision,
-            "codex" if cfg!(any(windows, target_os = "linux")) => {
-                !self.codex_model.trim().is_empty() && self.codex_model == self.codex_vision_model
+            "codex" if cfg!(windows) => {
+                let text_model = if smart && !self.codex_smart_model.trim().is_empty() {
+                    &self.codex_smart_model
+                } else {
+                    &self.codex_model
+                };
+                let vision_model = if smart && !self.codex_vision_smart_model.trim().is_empty() {
+                    &self.codex_vision_smart_model
+                } else {
+                    &self.codex_vision_model
+                };
+                !text_model.trim().is_empty() && text_model == vision_model
             }
             _ => false,
         }
     }
 
-    /// The reasoning level per remote profile, for
-    /// [`crate::ai::set_reasoning_efforts`]: the bridge speaks Chat
-    /// Completions, the OpenAI profile the Responses API.
     #[must_use]
-    pub fn reasoning_efforts(&self) -> Vec<(AiProtocol, String, String)> {
-        [
-            (
-                AiProtocol::OpenAiCompatible,
-                &self.ai_base_url,
-                &self.ai_reasoning_effort,
-            ),
-            (
-                AiProtocol::OpenAiResponses,
-                &self.openai_base_url,
-                &self.openai_reasoning_effort,
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, url, effort)| !url.trim().is_empty() && !effort.trim().is_empty())
-        .map(|(protocol, url, effort)| {
-            (protocol, url.trim().to_string(), effort.trim().to_string())
-        })
-        .collect()
+    pub fn vision_endpoint(&self) -> Option<AiEndpoint> {
+        self.vision_endpoint_for(false)
     }
 
     #[must_use]
-    pub fn vision_endpoint(&self) -> Option<AiEndpoint> {
+    pub fn vision_endpoint_for(&self, smart: bool) -> Option<AiEndpoint> {
         let pick = |specific: &str, fallback: &str| {
             if specific.trim().is_empty() {
                 fallback.to_string()
@@ -952,14 +1214,19 @@ impl Config {
             }
         };
         match self.vision_provider.as_str() {
-            "same" if !self.same_text_model_accepts_images_declared() => None,
-            "same" => Some(self.ai_endpoint(false)),
+            "same" if !self.same_text_model_accepts_images_declared_for(smart) => None,
+            "same" => Some(self.ai_endpoint(smart)),
             "cloud" => Some(AiEndpoint {
                 protocol: AiProtocol::OpenAiCompatible,
                 base_url: pick(&self.vision_base_url, &self.ai_base_url),
                 bearer: pick(&self.vision_bearer, &self.ai_bearer),
-                model: pick(&self.vision_model, DEFAULT_VISION_MODEL),
+                model: if smart {
+                    pick(&self.vision_smart_model, &pick(&self.vision_model, DEFAULT_VISION_MODEL))
+                } else {
+                    pick(&self.vision_model, DEFAULT_VISION_MODEL)
+                },
                 reasoning_effort: None,
+                service_tier: None,
                 is_local: false,
             }),
             "mlx" => {
@@ -976,6 +1243,7 @@ impl Config {
                         .map_or_else(String::new, |endpoint| endpoint.bearer.clone()),
                     model: selected.id.to_string(),
                     reasoning_effort: None,
+                    service_tier: None,
                     is_local: true,
                 })
             }
@@ -983,36 +1251,80 @@ impl Config {
                 protocol: AiProtocol::OpenAiCompatible,
                 base_url: pick(&self.vision_local_base_url, &self.ai_local_base_url),
                 bearer: pick(&self.vision_local_bearer, &self.ai_local_bearer),
-                model: pick(&self.vision_local_model, &self.ai_local_model),
+                model: if smart {
+                    pick(&self.vision_local_smart_model, &pick(&self.vision_local_model, &self.ai_local_model))
+                } else {
+                    pick(&self.vision_local_model, &self.ai_local_model)
+                },
                 reasoning_effort: None,
+                service_tier: None,
                 is_local: true,
             }),
-            "openai" => Some(AiEndpoint {
-                protocol: AiProtocol::OpenAiResponses,
-                base_url: self.openai_base_url.clone(),
-                bearer: protected_provider_secret(SecretSlot::OpenAi),
-                model: self.openai_model.clone(),
-                reasoning_effort: None,
-                is_local: false,
-            }),
-            "anthropic" => Some(AiEndpoint {
-                protocol: AiProtocol::AnthropicMessages,
-                base_url: self.anthropic_base_url.clone(),
-                bearer: protected_provider_secret(SecretSlot::Anthropic),
-                model: self.anthropic_model.clone(),
-                reasoning_effort: None,
-                is_local: false,
-            }),
-            "codex"
-                if cfg!(any(windows, target_os = "linux"))
-                    && !self.codex_vision_model.trim().is_empty() =>
-            {
+            "openai" => {
+                let normal = pick(&self.openai_vision_model, &self.openai_model);
                 Some(AiEndpoint {
-                    protocol: AiProtocol::CodexSubscription,
-                    base_url: String::new(),
-                    bearer: String::new(),
-                    model: self.codex_vision_model.clone(),
+                    protocol: AiProtocol::OpenAiResponses,
+                    base_url: self.openai_base_url.clone(),
+                    bearer: protected_provider_secret(SecretSlot::OpenAi),
+                    model: if smart {
+                        pick(&self.openai_vision_smart_model, &normal)
+                    } else {
+                        normal
+                    },
                     reasoning_effort: None,
+                    service_tier: None,
+                    is_local: false,
+                })
+            }
+            "anthropic" => {
+                let normal = pick(&self.anthropic_vision_model, &self.anthropic_model);
+                Some(AiEndpoint {
+                    protocol: AiProtocol::AnthropicMessages,
+                    base_url: self.anthropic_base_url.clone(),
+                    bearer: protected_provider_secret(SecretSlot::Anthropic),
+                    model: if smart {
+                        pick(&self.anthropic_vision_smart_model, &normal)
+                    } else {
+                        normal
+                    },
+                    reasoning_effort: None,
+                    service_tier: None,
+                    is_local: false,
+                })
+            }
+            "codex" if cfg!(windows) && !self.codex_vision_model.trim().is_empty() => {
+                let direct = self.codex_transport == "direct";
+                Some(AiEndpoint {
+                    protocol: if direct {
+                        AiProtocol::CodexDirect
+                    } else {
+                        AiProtocol::CodexSubscription
+                    },
+                    base_url: if direct {
+                        crate::codex_direct::CODEX_BASE_URL.to_string()
+                    } else {
+                        String::new()
+                    },
+                    bearer: String::new(),
+                    model: if smart && !self.codex_vision_smart_model.trim().is_empty() {
+                        self.codex_vision_smart_model.clone()
+                    } else {
+                        self.codex_vision_model.clone()
+                    },
+                    reasoning_effort: {
+                        let effort = if smart {
+                            &self.codex_vision_smart_reasoning_effort
+                        } else {
+                            &self.codex_vision_reasoning_effort
+                        };
+                        (!effort.trim().is_empty()).then(|| effort.clone())
+                    },
+                    service_tier: (if smart {
+                        self.codex_vision_smart_fast_mode
+                    } else {
+                        self.codex_vision_fast_mode
+                    })
+                    .then(|| "priority".to_string()),
                     is_local: false,
                 })
             }
@@ -1027,7 +1339,10 @@ impl Config {
     pub fn readiness(&self) -> ReadinessReport {
         // AI — resolve the ACTIVE provider (local vs cloud) via the resolver.
         let ep = self.ai_endpoint(false);
-        let ai_configured = if ep.protocol == AiProtocol::CodexSubscription {
+        let ai_configured = if matches!(
+            ep.protocol,
+            AiProtocol::CodexSubscription | AiProtocol::CodexDirect
+        ) {
             !ep.model.trim().is_empty()
         } else {
             !ep.base_url.trim().is_empty()
@@ -1041,8 +1356,12 @@ impl Config {
                 AiProtocol::OpenAiResponses => "openai",
                 AiProtocol::AnthropicMessages => "anthropic",
                 AiProtocol::CodexSubscription => "codex-subscription",
+                AiProtocol::CodexDirect => "codex-direct",
             };
-            if ep.protocol == AiProtocol::CodexSubscription {
+            if matches!(
+                ep.protocol,
+                AiProtocol::CodexSubscription | AiProtocol::CodexDirect
+            ) {
                 format!("{} · {}", provider, ep.model)
             } else {
                 format!("{} · {} · {}", provider, ep.base_url, ep.model)
@@ -1062,6 +1381,9 @@ impl Config {
                 };
                 (ok, d)
             }
+            "speechmatics" => (!self.stt_speechmatics_key.trim().is_empty(), "Speechmatics".into()),
+            "elevenlabs" => (!self.stt_elevenlabs_key.trim().is_empty(), "ElevenLabs".into()),
+            "deepgram" => (!self.stt_deepgram_key.trim().is_empty(), "Deepgram".into()),
             "whisper" => {
                 let ok = !self.stt_whisper_url.trim().is_empty();
                 let d = if ok {
@@ -1095,7 +1417,10 @@ impl Config {
         // never a bearer (mirrors the AI line).
         let (vision_configured, vision_detail) = match self.vision_endpoint() {
             Some(ep) => {
-                let is_codex = ep.protocol == AiProtocol::CodexSubscription;
+                let is_codex = matches!(
+                    ep.protocol,
+                    AiProtocol::CodexSubscription | AiProtocol::CodexDirect
+                );
                 let ok =
                     !ep.model.trim().is_empty() && (is_codex || !ep.base_url.trim().is_empty());
                 let d = if ok {
@@ -1138,6 +1463,9 @@ impl Config {
     }
 }
 
+/// Names are shared by the STT settings dropdown and the fallback queue.
+const STT_PROVIDER_IDS: [&str; 6] = ["cloud", "gigaam", "whisper", "speechmatics", "elevenlabs", "deepgram"];
+
 /// Resolved STT backend for a session. Mirrors [`AiEndpoint`]: the config's
 /// `stt_provider` string selects which transcription engine `stt::spawn` uses.
 /// "cloud" (Groq) is the default so existing configs are unchanged.
@@ -1145,6 +1473,9 @@ impl Config {
 pub enum SttBackendCfg {
     /// Groq Whisper cloud API.
     Cloud { api_key: String, model: String },
+    Speechmatics { api_key: String, model: String },
+    Elevenlabs { api_key: String, model: String, keyterms: Vec<String> },
+    Deepgram { api_key: String, model: String },
     /// Local whisper.cpp server (OpenAI-compatible `/audio/transcriptions`).
     Whisper {
         base_url: String,
@@ -1153,14 +1484,116 @@ pub enum SttBackendCfg {
     },
     /// Local in-process GigaAM-v3 (ONNX). `model_dir` holds `model.int8.onnx` + `vocab.txt`.
     Gigaam { model_dir: String },
+    /// Primary first, then explicitly ordered fallback engines.
+    FallbackChain { backends: Vec<SttBackendCfg> },
+}
+
+impl SttBackendCfg {
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Cloud { .. } => "cloud",
+            Self::Speechmatics { .. } => "speechmatics",
+            Self::Elevenlabs { .. } => "elevenlabs",
+            Self::Deepgram { .. } => "deepgram",
+            Self::Whisper { .. } => "whisper",
+            Self::Gigaam { .. } => "gigaam",
+            Self::FallbackChain { .. } => "fallback-chain",
+        }
+    }
+
+    #[must_use]
+    pub fn missing_key(&self) -> bool {
+        match self {
+            Self::Cloud { api_key, .. }
+            | Self::Speechmatics { api_key, .. }
+            | Self::Elevenlabs { api_key, .. }
+            | Self::Deepgram { api_key, .. } => api_key.trim().is_empty(),
+            Self::FallbackChain { backends } => backends.iter().all(Self::missing_key),
+            _ => false,
+        }
+    }
 }
 
 impl Config {
+    /// Construct a provider-specific STT hint from the CURRENT context profile.
+    /// Other providers do not accept free-form Whisper prompts.
+    pub fn stt_prompt_for(&self, provider: &str) -> Option<String> {
+        if provider == "cloud" {
+            return match self.stt_groq_prompt_mode {
+                // Explicitly suppress the multipart `prompt` field, regardless
+                // of vocabulary, trigger keywords, or meeting context.
+                2 => None,
+                // An empty custom prompt is genuinely empty; do not fall back.
+                1 if self.stt_groq_prompt_template.trim().is_empty() => None,
+                1 => crate::stt::build_configured_whisper_prompt(
+                    &self.stt_groq_prompt_template, &self.stt_tech_vocab,
+                    &self.trigger_keywords, &self.meeting_context,
+                ),
+                _ => self.stt_original_prompt(),
+            };
+        }
+        if provider == "whisper" {
+            return crate::stt::build_configured_whisper_prompt(
+                &self.stt_whisper_prompt_template, &self.stt_tech_vocab,
+                &self.trigger_keywords, &self.meeting_context,
+            );
+        }
+        None
+    }
+
+    /// Exactly the original automatically constructed Groq prompt before
+    /// applying the per-provider mode or user template.
+    pub fn stt_original_prompt(&self) -> Option<String> {
+        crate::stt::build_whisper_prompt_with_vocab(
+            &self.stt_tech_vocab, &self.trigger_keywords, &self.meeting_context,
+        )
+    }
+
     /// Resolve which STT backend to use from `stt_provider`. Unknown / "cloud"
     /// → Groq, so old configs behave exactly as before.
     #[must_use]
     pub fn stt_backend(&self) -> SttBackendCfg {
-        match self.stt_provider.as_str() {
+        let main = self.stt_backend_named(&self.stt_provider);
+        let primary_name = if STT_PROVIDER_IDS.contains(&self.stt_provider.as_str()) {
+            self.stt_provider.as_str()
+        } else {
+            "cloud"
+        };
+        let mut seen = vec![primary_name];
+        let mut backends = vec![main.clone()];
+        for candidate in self.stt_fallbacks.iter().take(5) {
+            let id = candidate.trim();
+            if STT_PROVIDER_IDS.contains(&id) && !seen.contains(&id) {
+                seen.push(id);
+                backends.push(self.stt_backend_named(id));
+            }
+        }
+        if backends.len() == 1 { main }
+        else { SttBackendCfg::FallbackChain { backends } }
+    }
+
+    fn stt_backend_named(&self, provider: &str) -> SttBackendCfg {
+        match provider {
+            "speechmatics" => SttBackendCfg::Speechmatics {
+                api_key: self.stt_speechmatics_key.clone(), model: self.stt_speechmatics_model.clone(),
+            },
+            "elevenlabs" => SttBackendCfg::Elevenlabs {
+                api_key: self.stt_elevenlabs_key.clone(),
+                model: self.stt_elevenlabs_model.clone(),
+                keyterms: if self.stt_elevenlabs_keyterms_enabled
+                    && matches!(self.stt_elevenlabs_model.as_str(), "scribe_v2" | "scribe_v2_medical") {
+                    build_elevenlabs_keyterms(
+                        &self.stt_elevenlabs_keyterms_template,
+                        &self.stt_tech_vocab,
+                        &self.trigger_keywords,
+                        &self.meeting_context,
+                    )
+                } else { Vec::new() },
+            },
+            "deepgram" => SttBackendCfg::Deepgram {
+                api_key: self.stt_deepgram_key.clone(), model: self.stt_deepgram_model.clone(),
+            },
             "gigaam" => SttBackendCfg::Gigaam {
                 model_dir: self.stt_gigaam_dir.clone(),
             },
@@ -1176,16 +1609,28 @@ impl Config {
         }
     }
 
+    /// True if the selected cloud backend has no saved key.
+    #[must_use]
+    pub fn stt_missing_cloud_key(&self) -> bool {
+        self.stt_backend().missing_key()
+    }
+
     /// True when STT runs locally (GigaAM or local Whisper) — callers skip the
     /// Groq-key "configured" check.
     #[must_use]
     pub fn stt_is_local(&self) -> bool {
-        matches!(self.stt_provider.as_str(), "gigaam" | "whisper")
+        match self.stt_backend() {
+            SttBackendCfg::Gigaam { .. } | SttBackendCfg::Whisper { .. } => true,
+            SttBackendCfg::FallbackChain { backends } => backends.iter().all(|b| {
+                matches!(b, SttBackendCfg::Gigaam { .. } | SttBackendCfg::Whisper { .. })
+            }),
+            _ => false,
+        }
     }
 }
 
-const fn default_true() -> bool {
-    true
+fn default_codex_transport() -> String {
+    "app_server".into()
 }
 
 fn default_ai_provider() -> String {
@@ -1228,6 +1673,14 @@ fn default_vision_provider() -> String {
     "cloud".into()
 }
 
+fn default_vision_capture_mode() -> String {
+    "saved".into()
+}
+
+fn default_vision_capture_source() -> String {
+    "screen".into()
+}
+
 fn default_ai_local_base_url() -> String {
     // llama.cpp (the shipped setup-local-ai.ps1 pipeline) serves on :8080.
     // Ollama users can change this to :11434 in Settings.
@@ -1237,6 +1690,68 @@ fn default_ai_local_base_url() -> String {
 fn default_ai_local_context() -> String {
     "auto".into()
 }
+
+fn default_speechmatics_model() -> String { "melia-1".into() }
+fn default_elevenlabs_model() -> String { "scribe_v2".into() }
+
+fn default_elevenlabs_keyterms_enabled() -> bool { true }
+
+fn default_elevenlabs_keyterms_template() -> String {
+    // Explicit Java/Scala terms take precedence over the legacy large vocabulary.
+    "Java\nScala\nSpring Boot\nJVM\nKafka\n[CANONICAL_TECH_VOCAB]\n[trigger_keywords]".into()
+}
+
+fn push_elevenlabs_keyterm(
+    result: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    raw: &str,
+) {
+    let term = raw.trim();
+    if term.is_empty() || term.chars().count() >= 50 || term.split_whitespace().count() > 5
+        || term.chars().any(|c| matches!(c, '<' | '>' | '{' | '}' | '[' | ']' | '\\')) {
+        return;
+    }
+    if seen.insert(term.to_lowercase()) { result.push(term.to_owned()); }
+}
+
+/// Create safe, short Scribe v2 keyterms from an editable template. Cap at 100
+/// to avoid ElevenLabs' additional 20-second minimum billing for >100 terms.
+fn build_elevenlabs_keyterms(
+    template: &str, canonical: &str, triggers: &str, meeting: &str,
+) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    for raw in template.split(|c: char| c == '\n' || c == ',' || c == ';') {
+        if result.len() >= 100 { break; }
+        let item = raw.trim();
+        let expansion = match item {
+            "[CANONICAL_TECH_VOCAB]" | "{{CANONICAL_TECH_VOCAB}}" | "CANONICAL_TECH_VOCAB" => Some(canonical),
+            "[trigger_keywords]" | "{{trigger_keywords}}" => Some(triggers),
+            "[meeting_context]" | "{{meeting_context}}" => Some(meeting),
+            _ => None,
+        };
+        if let Some(source) = expansion {
+            // Existing vocabularies are space-delimited; explicit line-separated
+            // entries can be multiword terms. Long prose is never sent as keyterms.
+            for entry in source.split(|c: char| c == '\n' || c == ',' || c == ';') {
+                if result.len() >= 100 { break; }
+                let entry = entry.trim();
+                if entry.split_whitespace().count() <= 5 && entry.chars().count() < 50 {
+                    push_elevenlabs_keyterm(&mut result, &mut seen, entry);
+                } else if item != "[meeting_context]" && item != "{{meeting_context}}" {
+                    for token in entry.split_whitespace() {
+                        if result.len() >= 100 { break; }
+                        push_elevenlabs_keyterm(&mut result, &mut seen, token);
+                    }
+                }
+            }
+        } else {
+            push_elevenlabs_keyterm(&mut result, &mut seen, item);
+        }
+    }
+    result
+}
+fn default_deepgram_model() -> String { "nova-3".into() }
 
 fn default_stt_provider() -> String {
     if cfg!(target_os = "macos") {
@@ -1264,12 +1779,16 @@ fn default_stt_whisper_model() -> String {
     "whisper-large-v3-turbo".into()
 }
 
-fn default_omarchy_tile_idle_seconds() -> u32 {
-    30
-}
-
 fn default_tile_body_opacity() -> f32 {
     1.0
+}
+
+fn default_tile_anchor() -> String {
+    "top_right".into()
+}
+
+fn default_max_live_tiles() -> usize {
+    16
 }
 
 fn default_post_meeting_debrief_enabled() -> bool {
@@ -1362,6 +1881,10 @@ fn default_tile_font_size() -> u32 {
 /// the full list always.
 ///
 /// Curated 2026-05-25 by domain (line-grouped for readability).
+fn default_stt_tech_vocab() -> String {
+    crate::stt::CANONICAL_TECH_VOCAB.to_owned()
+}
+
 fn default_trigger_keywords() -> String {
     "\
         kubernetes k8s k3s etcd helm kustomize argocd flux istio linkerd cilium calico \
@@ -1555,13 +2078,6 @@ pub fn load() -> Config {
             &crate::local_ai::default_root(),
         ));
     dirty |= migrate_macos_gigaam_default(&mut cfg, managed_gigaam_ready);
-    if cfg.stt_provider == "gigaam" {
-        let managed = crate::local_ai::gigaam_default_dir(&crate::local_ai::default_root());
-        dirty |= repair_gigaam_dir(
-            &mut cfg,
-            crate::local_ai::gigaam_model_present(&managed).then_some(managed.as_path()),
-        );
-    }
     // v2: CoreML was slower and retained substantially more RSS than CPU on
     // Apple Silicon. Migrate the former implicit-on default once; users can
     // still opt back in through Settings after this version is stamped.
@@ -1622,27 +2138,11 @@ fn migrate_macos_gigaam_cpu_default(cfg: &mut Config) -> bool {
     true
 }
 
-/// Point GigaAM STT at the complete managed install when the saved folder has
-/// no model file. Settings already shows the managed folder in that case, so
-/// the check and the session load the folder the person sees.
-fn repair_gigaam_dir(cfg: &mut Config, managed_complete: Option<&std::path::Path>) -> bool {
-    let saved = std::path::Path::new(cfg.stt_gigaam_dir.trim());
-    let saved_has_model = !cfg.stt_gigaam_dir.trim().is_empty()
-        && std::fs::metadata(saved.join("model.int8.onnx")).is_ok_and(|m| m.len() > 0);
-    match managed_complete {
-        Some(managed) if cfg.stt_provider == "gigaam" && !saved_has_model => {
-            cfg.stt_gigaam_dir = managed.to_string_lossy().into_owned();
-            true
-        }
-        _ => false,
-    }
-}
-
 fn migrate_macos_gigaam_default(cfg: &mut Config, managed_ready: bool) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
     }
-    let unknown_provider = !matches!(cfg.stt_provider.as_str(), "cloud" | "gigaam" | "whisper");
+    let unknown_provider = !matches!(cfg.stt_provider.as_str(), "cloud" | "gigaam" | "whisper" | "speechmatics" | "elevenlabs" | "deepgram");
     let unconfigured_cloud = cfg.stt_provider == "cloud" && cfg.groq_api_key.trim().is_empty();
     if managed_ready && (unconfigured_cloud || unknown_provider) {
         cfg.stt_provider = "gigaam".into();
@@ -1669,7 +2169,23 @@ pub(crate) fn save_to_path(path: &std::path::Path, cfg: &Config) -> Result<()> {
     // (wiping the user's live keys / profiles / devices / hotkeys). On Windows
     // std::fs::rename overwrites the destination (MoveFileEx replace-existing).
     let tmp = path.with_extension("json.tmp");
-    crate::paths::write_private(&tmp, &bytes).context("write config (tmp)")?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .context("write config (tmp)")?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&bytes).context("write config (tmp)")?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&tmp, &bytes).context("write config (tmp)")?;
 
     // Keep ONE generation of the previous on-disk config as config.json.bak
     // before we replace it. Atomic-save already guarantees we never see a torn
@@ -1693,7 +2209,7 @@ pub(crate) fn save_to_path(path: &std::path::Path, cfg: &Config) -> Result<()> {
             .and_then(|old| serde_json::to_vec_pretty(&secret_redacted(&old)).ok())
         {
             Some(redacted) => {
-                if let Err(e) = crate::paths::write_private(&bak, &redacted) {
+                if let Err(e) = std::fs::write(&bak, redacted) {
                     log::debug!("config .bak snapshot skipped ({e})");
                 }
             }
@@ -1706,7 +2222,9 @@ pub(crate) fn save_to_path(path: &std::path::Path, cfg: &Config) -> Result<()> {
 
 pub fn save(cfg: &Config) -> Result<()> {
     let path = config_path()?;
-    save_to_path(&path, cfg)
+    save_to_path(&path, cfg)?;
+    crate::network::update_if_initialized(cfg);
+    Ok(())
 }
 
 /// A clone of `cfg` with every at-rest secret blanked, for the `config.json.bak`
@@ -1716,11 +2234,16 @@ pub fn save(cfg: &Config) -> Result<()> {
 /// user can re-enter them). Keep in sync with the secret `String` fields.
 fn secret_redacted(cfg: &Config) -> Config {
     let mut c = cfg.clone();
+    // The URL may contain proxy Basic Auth credentials.
+    c.network_proxy_url.clear();
     c.ai_bearer.clear();
     c.ai_local_bearer.clear();
     c.vision_bearer.clear();
     c.vision_local_bearer.clear();
     c.groq_api_key.clear();
+    c.stt_speechmatics_key.clear();
+    c.stt_elevenlabs_key.clear();
+    c.stt_deepgram_key.clear();
     c.stt_whisper_bearer.clear();
     c.hermes_bridge_token.clear();
     c.hermes_api_key.clear();
@@ -1733,7 +2256,7 @@ fn secret_redacted(cfg: &Config) -> Config {
 /// The caller is responsible for warning that the file contains secrets.
 pub fn export_to(path: &std::path::Path, cfg: &Config) -> Result<()> {
     let bytes = portable_config_bytes(cfg).context("serialize config")?;
-    crate::paths::write_private(path, &bytes).context("write export")?;
+    std::fs::write(path, bytes).context("write export")?;
     Ok(())
 }
 
@@ -1741,9 +2264,6 @@ fn portable_config_bytes(cfg: &Config) -> Result<Vec<u8>> {
     let mut value = serde_json::to_value(cfg).context("serialize config value")?;
     if let Some(fields) = value.as_object_mut() {
         fields.remove("deep_lock");
-        // Folders on this PC: another PC has its own Strata, or none.
-        fields.remove("ai_strata_dir");
-        fields.remove("ai_strata_config");
     }
     serde_json::to_vec_pretty(&value).context("serialize portable config")
 }
@@ -1792,18 +2312,40 @@ pub fn merge_server_settings(current: &Config, imported: Config) -> Config {
     next.ai_prompt_cache = imported.ai_prompt_cache;
     next.openai_base_url = imported.openai_base_url;
     next.openai_model = imported.openai_model;
-    next.ai_reasoning_effort = imported.ai_reasoning_effort;
-    next.openai_reasoning_effort = imported.openai_reasoning_effort;
+    next.openai_smart_model = imported.openai_smart_model;
+    next.openai_vision_model = imported.openai_vision_model;
+    next.openai_vision_smart_model = imported.openai_vision_smart_model;
     next.anthropic_base_url = imported.anthropic_base_url;
     next.anthropic_model = imported.anthropic_model;
+    next.anthropic_smart_model = imported.anthropic_smart_model;
+    next.anthropic_vision_model = imported.anthropic_vision_model;
+    next.anthropic_vision_smart_model = imported.anthropic_vision_smart_model;
+    next.codex_transport = if imported.codex_transport == "direct" {
+        "direct".into()
+    } else {
+        "app_server".into()
+    };
     // Empty remains the legacy/fresh "unset" marker. Importing an older
     // profile must not erase an explicit account model chosen on this PC.
     if !imported.codex_model.trim().is_empty() {
         next.codex_model = imported.codex_model;
         next.codex_reasoning_effort = imported.codex_reasoning_effort;
+        next.codex_fast_mode = imported.codex_fast_mode;
+    }
+    if !imported.codex_smart_model.trim().is_empty() {
+        next.codex_smart_model = imported.codex_smart_model;
+        next.codex_smart_reasoning_effort = imported.codex_smart_reasoning_effort;
+        next.codex_smart_fast_mode = imported.codex_smart_fast_mode;
     }
     if !imported.codex_vision_model.trim().is_empty() {
         next.codex_vision_model = imported.codex_vision_model;
+        next.codex_vision_reasoning_effort = imported.codex_vision_reasoning_effort;
+        next.codex_vision_fast_mode = imported.codex_vision_fast_mode;
+    }
+    if !imported.codex_vision_smart_model.trim().is_empty() {
+        next.codex_vision_smart_model = imported.codex_vision_smart_model;
+        next.codex_vision_smart_reasoning_effort = imported.codex_vision_smart_reasoning_effort;
+        next.codex_vision_smart_fast_mode = imported.codex_vision_smart_fast_mode;
     }
     next.ai_mlx_model = imported.ai_mlx_model;
     next.vision_mlx_model = imported.vision_mlx_model;
@@ -1814,19 +2356,16 @@ pub fn merge_server_settings(current: &Config, imported: Config) -> Config {
     next.ai_local_prep_model = imported.ai_local_prep_model;
     next.ai_local_vision = imported.ai_local_vision;
     next.ai_local_thinking = imported.ai_local_thinking;
-    next.ai_fast_answers = imported.ai_fast_answers;
-    next.ai_agent_tools = imported.ai_agent_tools;
-    next.ai_web_search = imported.ai_web_search;
-    // NOTE: ai_strata_dir/ai_strata_config are deliberately NOT transferred:
-    // they are folders on THIS PC. A full profile export leaves them out too.
     // Vision channel (separate endpoint).
     next.vision_provider = imported.vision_provider;
     next.vision_base_url = imported.vision_base_url;
     next.vision_bearer = imported.vision_bearer;
     next.vision_model = imported.vision_model;
+    next.vision_smart_model = imported.vision_smart_model;
     next.vision_local_base_url = imported.vision_local_base_url;
     next.vision_local_bearer = imported.vision_local_bearer;
     next.vision_local_model = imported.vision_local_model;
+    next.vision_local_smart_model = imported.vision_local_smart_model;
     // NOTE: vision_phonetics is deliberately NOT transferred — it's a per-user
     // OUTPUT preference (append IPA to a translation), not a server endpoint, so it
     // stays machine-local like response_language / stt_language / ui_language. Do not
@@ -1836,9 +2375,20 @@ pub fn merge_server_settings(current: &Config, imported: Config) -> Config {
     // import must neither deep-lock this PC nor release its lock.
     // STT provider + per-backend server settings.
     next.stt_provider = imported.stt_provider;
+    next.stt_fallbacks = imported.stt_fallbacks;
     next.groq_api_key = imported.groq_api_key;
     next.stt_language = imported.stt_language;
     next.stt_model = imported.stt_model;
+    next.stt_groq_prompt_template = imported.stt_groq_prompt_template;
+    next.stt_whisper_prompt_template = imported.stt_whisper_prompt_template;
+    next.stt_speechmatics_key = imported.stt_speechmatics_key;
+    next.stt_speechmatics_model = imported.stt_speechmatics_model;
+    next.stt_elevenlabs_key = imported.stt_elevenlabs_key;
+    next.stt_elevenlabs_model = imported.stt_elevenlabs_model;
+    next.stt_elevenlabs_keyterms_enabled = imported.stt_elevenlabs_keyterms_enabled;
+    next.stt_elevenlabs_keyterms_template = imported.stt_elevenlabs_keyterms_template;
+    next.stt_deepgram_key = imported.stt_deepgram_key;
+    next.stt_deepgram_model = imported.stt_deepgram_model;
     next.stt_gigaam_dir = imported.stt_gigaam_dir;
     next.stt_gigaam_gpu = imported.stt_gigaam_gpu;
     next.stt_whisper_url = imported.stt_whisper_url;
@@ -1888,7 +2438,7 @@ pub fn export_server_settings_to(path: &std::path::Path, cfg: &Config) -> Result
     // server ones. Single source of truth for "what is a server field".
     let server_only = merge_server_settings(&Config::defaults(), cfg.clone());
     let bytes = portable_config_bytes(&server_only).context("serialize server settings")?;
-    crate::paths::write_private(path, &bytes).context("write server-settings export")?;
+    std::fs::write(path, bytes).context("write server-settings export")?;
     Ok(())
 }
 
@@ -1954,14 +2504,9 @@ pub struct ServerSettingsPreview {
     pub gigaam_dir_incoming: String,
 }
 
-fn is_scheme_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
-}
-
 /// Mask the host of a URL for a COPYABLE / loggable string, keeping the scheme,
 /// port and path so it's still recognisable without leaking the private LAN IP
-/// or hostname. `http://192.168.0.142:18902/v1` -> `http://***:18902/v1`. A query
-/// string or a fragment is reduced to `?***` / `#***`. Empty
+/// or hostname. `http://192.168.0.142:18902/v1` -> `http://***:18902/v1`. Empty
 /// input -> empty output. Best-effort: anything it can't parse is returned with
 /// the authority blanked rather than echoed.
 #[must_use]
@@ -1970,32 +2515,18 @@ pub fn mask_host(url: &str) -> String {
     if url.is_empty() {
         return String::new();
     }
-    // Split off scheme:// if present. Only a real scheme counts (letters, digits,
-    // '+', '-', '.'): a "://" further in, for example in a query value of a URL
-    // that has no scheme of its own, must not move the boundary past the host.
+    // Split off scheme:// if present.
     let (scheme, rest) = match url.find("://") {
-        Some(i) if i > 0 && url[..i].bytes().all(is_scheme_byte) => (&url[..i + 3], &url[i + 3..]),
-        _ => ("", url),
+        Some(i) => (&url[..i + 3], &url[i + 3..]),
+        None => ("", url),
     };
     // SECURITY: Per RFC 3986 URI generic syntax, the authority component is
     // delimited by the first '/', '?', or '#' character (or end of string).
     // Using rest.find(['/', '?', '#']) ensures query strings and fragments without
     // a leading slash do not leak into authority parsing or corrupt port detection.
-    // Slashes in front of the authority (`//host/v1`, `http:///host/v1`) are kept
-    // as they are, so that the host behind them is parsed as the authority and
-    // masked instead of landing in the verbatim remainder.
-    let slashes = rest.len() - rest.trim_start_matches('/').len();
-    let (lead, rest) = rest.split_at(slashes);
-    let (authority, tail) = match rest.find(['/', '?', '#']) {
+    let (authority, path) = match rest.find(['/', '?', '#']) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
-    };
-    // A query string or a fragment may carry a token or a key: keep only the
-    // delimiter, so the string stays recognisable without its values.
-    let (path, hidden) = match tail.find(['?', '#']) {
-        Some(i) if tail[i..].starts_with('?') => (&tail[..i], "?***"),
-        Some(i) => (&tail[..i], "#***"),
-        None => (tail, ""),
     };
     // SECURITY: strip embedded user credentials (userinfo) before host/port parsing.
     // If a URL contains userinfo (e.g., http://user:password@host/v1), authority.rfind(':')
@@ -2038,7 +2569,7 @@ pub fn mask_host(url: &str) -> String {
             None => "",
         }
     };
-    format!("{scheme}{lead}***{port}{path}{hidden}")
+    format!("{scheme}***{port}{path}")
 }
 
 /// P1.7 — PURE, REDACTED preview of a server-settings import. For each endpoint
@@ -2130,9 +2661,13 @@ pub fn preview_server_settings(current: &Config, imported: &Config) -> ServerSet
             model_old: current.stt_model.clone(),
             model_new: imported.stt_model.clone(),
             // STT credentials: Groq API key OR the local whisper bearer.
-            key_present_old: present(&current.groq_api_key) || present(&current.stt_whisper_bearer),
+            key_present_old: present(&current.groq_api_key) || present(&current.stt_whisper_bearer)
+                || present(&current.stt_speechmatics_key) || present(&current.stt_elevenlabs_key)
+                || present(&current.stt_deepgram_key),
             key_present_new: present(&imported.groq_api_key)
-                || present(&imported.stt_whisper_bearer),
+                || present(&imported.stt_whisper_bearer)
+                || present(&imported.stt_speechmatics_key) || present(&imported.stt_elevenlabs_key)
+                || present(&imported.stt_deepgram_key),
             has_key_field: true,
         },
         gigaam_dir_current: current.stt_gigaam_dir.clone(),
@@ -2186,3 +2721,11 @@ pub fn shared_from(cfg: Config) -> SharedConfig {
 
 #[cfg(test)]
 mod tests;
+
+fn default_tile_memory_stars() -> bool { true }
+fn default_tile_font_body() -> i32 { 15 }
+fn default_tile_font_heading() -> i32 { 22 }
+fn default_tile_font_subheading() -> i32 { 19 }
+fn default_tile_font_code() -> i32 { 13 }
+fn default_tile_font_table() -> i32 { 13 }
+fn default_tile_font_alert() -> i32 { 14 }

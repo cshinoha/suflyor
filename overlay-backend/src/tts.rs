@@ -1486,6 +1486,11 @@ pub fn set_engine(engine_raw: &str) {
     let kind = parse_engine(engine_raw);
     with(|t| t.set_engine(kind));
 }
+/// The engine currently selected for read-aloud.
+#[must_use]
+pub fn active_engine() -> EngineKind {
+    with(|t| t.engine_kind()).unwrap_or(EngineKind::Piper)
+}
 /// Latest READY handshake of the Tera sidecar (Settings status + tests).
 #[must_use]
 pub fn tera_ready() -> Option<TeraReady> {
@@ -1588,9 +1593,6 @@ fn sidecar_stderr(kind: EngineKind) -> Stdio {
 
 fn spawn_engine_sidecar(exe: &Path, kind: EngineKind) -> std::io::Result<Proc> {
     let mut cmd = Command::new(exe);
-    if let Some(root) = tts_root() {
-        cmd.env("SUFLYOR_TTS_DIR", root);
-    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(sidecar_stderr(kind));
@@ -1602,7 +1604,7 @@ fn spawn_engine_sidecar(exe: &Path, kind: EngineKind) -> std::io::Result<Proc> {
 
 /// `%APPDATA%\suflyor\tts`.
 fn tts_root() -> Option<PathBuf> {
-    crate::paths::speech_model_dir("tts")
+    crate::paths::data_root().map(|d| d.join("tts"))
 }
 
 /// Scan the installed voices for the chooser (a subdir with `*.onnx` +

@@ -99,8 +99,10 @@ pub fn manifest_from_json(raw: &str) -> Result<Manifest> {
 #[must_use]
 pub fn release_dir() -> Option<PathBuf> {
     let manifest = manifest().ok()?;
-    crate::paths::speech_model_dir("tts")
-        .map(|dir| dir.join(format!("teratts-v2-{}", manifest.revision)))
+    crate::paths::data_root().map(|d| {
+        d.join("tts")
+            .join(format!("teratts-v2-{}", manifest.revision))
+    })
 }
 
 /// Installed-state shown in Settings (before/without running the sidecar).

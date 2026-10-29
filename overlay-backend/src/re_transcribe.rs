@@ -62,8 +62,15 @@ const MAX_REASONABLE_SECS: u64 = 24 * 60 * 60;
 fn chunk_secs(backend: &SttBackendCfg) -> u64 {
     match backend {
         SttBackendCfg::Cloud { .. } => 600,
+        SttBackendCfg::Speechmatics { .. } => 120,
+        SttBackendCfg::Elevenlabs { .. } => 300,
+        SttBackendCfg::Deepgram { .. } => 300,
         SttBackendCfg::Whisper { .. } => 300,
         SttBackendCfg::Gigaam { .. } => 60,
+        // The offline re-transcriber sends the same chunk through each engine.
+        // Respect the strictest engine cap, including the local 60s limit.
+        SttBackendCfg::FallbackChain { backends } =>
+            backends.iter().map(chunk_secs).min().unwrap_or(60),
     }
 }
 
@@ -177,7 +184,6 @@ pub fn assemble_lines(mic_text: &str, system_text: &str) -> Vec<TranscriptLine> 
 pub async fn transcribe_session(
     cfg: &SharedConfig,
     session_id: &str,
-    ru: bool,
     on_progress: &impl Fn(Progress),
 ) -> Result<Vec<TranscriptLine>> {
     let dir = recorder::recordings_dir()?.join(session_id);
@@ -185,22 +191,23 @@ pub async fn transcribe_session(
         bail!("no recordings found for this session");
     }
     // Snapshot the STT config once (provider, language, whisper prompt).
-    let (backend, language, whisper_prompt) = {
+    let (backend, language, whisper_prompt, local_whisper_prompt) = {
         let c = cfg.read();
         (
             c.stt_backend(),
             c.stt_language.clone(),
-            stt::build_whisper_prompt(&c.trigger_keywords, &c.meeting_context),
+            c.stt_prompt_for("cloud"),
+            c.stt_prompt_for("whisper"),
         )
     };
 
     // Fail fast (mirror `start_session_inner`'s pre-flight) BEFORE loading any
     // WAV into RAM: a misconfigured backend should error in milliseconds, not
     // after reading up to ~230 MB/channel only to fail inside `transcribe_once`.
+    if cfg.read().stt_missing_cloud_key() {
+        bail!("selected STT API key is not configured");
+    }
     match &backend {
-        SttBackendCfg::Cloud { api_key, .. } if api_key.trim().is_empty() => {
-            bail!("cloud STT is not configured (empty API key)");
-        }
         SttBackendCfg::Gigaam { model_dir } => stt::validate_gigaam_dir(model_dir)?,
         _ => {}
     }
@@ -214,9 +221,9 @@ pub async fn transcribe_session(
     };
 
     let mut texts = [String::new(), String::new()]; // [mic, system]
-    for (idx, file, source) in [
-        (0usize, "mic.wav", AudioSource::Mic),
-        (1, "system.wav", AudioSource::System),
+    for (idx, file, who, source) in [
+        (0usize, "mic.wav", "you", AudioSource::Mic),
+        (1, "system.wav", "the other side", AudioSource::System),
     ] {
         let path = dir.join(file);
         if !path.exists() {
@@ -244,12 +251,11 @@ pub async fn transcribe_session(
         let mut samples = reader.into_samples::<i16>();
         let mut text = String::new();
         for part in 1..=n_chunks {
-            on_progress(Progress::Step(transcription_progress(
-                ru,
-                idx == 0,
-                part,
-                n_chunks,
-            )));
+            on_progress(Progress::Step(if n_chunks > 1 {
+                format!("Re-transcribing {who}… {part}/{n_chunks}")
+            } else {
+                format!("Re-transcribing {who}…")
+            }));
             let mut buf =
                 read_next_chunk(&mut samples, chunk).with_context(|| format!("load {file}"))?;
             if buf.is_empty() {
@@ -268,6 +274,7 @@ pub async fn transcribe_session(
                 &buf,
                 language.as_deref(),
                 whisper_prompt.as_deref(),
+                local_whisper_prompt.as_deref(),
             )
             .await
             .with_context(|| format!("re-transcribe {file} (part {part}/{n_chunks})"))?;
@@ -283,20 +290,6 @@ pub async fn transcribe_session(
     Ok(lines)
 }
 
-fn transcription_progress(ru: bool, is_mic: bool, part: usize, n_chunks: usize) -> String {
-    let step = match (ru, is_mic) {
-        (true, true) => "Повторное распознавание вашей речи…",
-        (false, true) => "Re-transcribing you…",
-        (true, false) => "Повторное распознавание речи собеседника…",
-        (false, false) => "Re-transcribing the other side…",
-    };
-    if n_chunks > 1 {
-        format!("{step} {part}/{n_chunks}")
-    } else {
-        step.to_string()
-    }
-}
-
 /// Full flow: re-transcribe a session's saved recordings, then run the meeting
 /// summary over the fresh transcript (spawns a Summary tile via `events`, exactly
 /// like the live bar button). Returns the transcript line count for logging.
@@ -309,19 +302,11 @@ pub async fn retranscribe_and_summarize(
     events: Arc<dyn RuntimeEvents>,
     cfg: SharedConfig,
     session_id: &str,
-    ru: bool,
     on_progress: &impl Fn(Progress),
 ) -> Result<usize> {
-    let transcript = transcribe_session(&cfg, session_id, ru, on_progress).await?;
+    let transcript = transcribe_session(&cfg, session_id, on_progress).await?;
     let n = transcript.len();
-    on_progress(Progress::Step(
-        if ru {
-            "Составление сводки…"
-        } else {
-            "Building summary…"
-        }
-        .to_string(),
-    ));
+    on_progress(Progress::Step("Building summary…".to_string()));
     // Pass the archive session id so the conspect persists under it — a failed
     // reduce can then be retried from the saved parts without re-running STT.
     crate::runtime::run_meeting_summary(events, cfg, transcript, session_id.to_string(), false)
@@ -333,22 +318,6 @@ pub async fn retranscribe_and_summarize(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn transcription_progress_localizes_both_channels_and_counters() {
-        for (ru, is_mic, expected) in [
-            (false, true, "Re-transcribing you…"),
-            (true, true, "Повторное распознавание вашей речи…"),
-            (false, false, "Re-transcribing the other side…"),
-            (true, false, "Повторное распознавание речи собеседника…"),
-        ] {
-            assert_eq!(transcription_progress(ru, is_mic, 1, 1), expected);
-            assert_eq!(
-                transcription_progress(ru, is_mic, 2, 3),
-                format!("{expected} 2/3")
-            );
-        }
-    }
 
     #[test]
     fn load_wav_round_trips_recorder_format() {

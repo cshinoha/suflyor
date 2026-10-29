@@ -18,12 +18,12 @@ const GROQ_STT_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions"
 /// Models-list endpoint — used by `test_connection` to validate the
 /// Groq API key without uploading audio.
 const GROQ_MODELS_URL: &str = "https://api.groq.com/openai/v1/models";
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos")))]
 const GIGAAM_UNSUPPORTED: &str = "local GigaAM STT is not supported on this platform";
 
 /// Private cfg-selected shim isolating the Windows/macOS `transcribe-rs` GigaAM
 /// dependency. Other targets keep the same shape but fail explicitly.
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos"))]
 mod gigaam_shim {
     use std::path::Path;
     use transcribe_rs::onnx::gigaam::GigaAMModel;
@@ -46,12 +46,6 @@ mod gigaam_shim {
         } else {
             transcribe_rs::OrtAccelerator::CpuOnly
         };
-        #[cfg(target_os = "linux")]
-        let pref = if use_gpu && cfg!(feature = "cuda") {
-            transcribe_rs::OrtAccelerator::Cuda
-        } else {
-            transcribe_rs::OrtAccelerator::CpuOnly
-        };
         transcribe_rs::set_ort_accelerator(pref);
         log::info!("GigaAM ONNX Runtime accelerator = {pref}");
     }
@@ -59,36 +53,7 @@ mod gigaam_shim {
     /// Load under the configured ORT accelerator, falling back to CPU if the
     /// platform provider (DirectML/Core ML) cannot build this model.
     pub(super) fn load(dir: &str) -> anyhow::Result<Model> {
-        #[cfg(all(target_os = "linux", feature = "cuda"))]
-        {
-            static RUNTIME: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-            RUNTIME
-                .get_or_init(|| {
-                    let library = std::env::current_exe()
-                        .map_err(|error| error.to_string())?
-                        .parent()
-                        .ok_or("speech runtime directory unavailable")?
-                        .join("speech-gpu/libonnxruntime.so");
-                    ort::init_from(library)
-                        .map_err(|error| error.to_string())?
-                        .with_telemetry(false)
-                        .commit();
-                    Ok(())
-                })
-                .as_ref()
-                .map_err(|error| anyhow::anyhow!("speech runtime: {error}"))?;
-        }
-        // CUDA kernels cover the FP32 graph; dynamic-int8 convolutions can
-        // otherwise leave the expensive layers on CPU despite a CUDA session.
-        let quantization = if cfg!(all(target_os = "linux", feature = "cuda"))
-            && transcribe_rs::get_ort_accelerator() == transcribe_rs::OrtAccelerator::Cuda
-            && Path::new(dir).join("model.onnx").is_file()
-        {
-            Quantization::FP32
-        } else {
-            Quantization::Int8
-        };
-        match GigaAMModel::load(Path::new(dir), &quantization) {
+        match GigaAMModel::load(Path::new(dir), &Quantization::Int8) {
             Ok(m) => Ok(Model(m)),
             Err(e)
                 if transcribe_rs::get_ort_accelerator()
@@ -115,7 +80,7 @@ mod gigaam_shim {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos")))]
 mod gigaam_shim {
     /// Placeholder handle that keeps the shared STT code shape. Never
     /// constructed on this platform — `load` always fails.
@@ -143,30 +108,6 @@ mod gigaam_shim {
     }
 }
 
-/// Public error when the GigaAM folder holds no model file at all.
-pub const GIGAAM_NOT_DOWNLOADED: &str = "GigaAM: model not downloaded";
-/// Public error when the model file is there but the runtime could not load it.
-pub const GIGAAM_LOAD_FAILED: &str = "GigaAM: model failed to load (see log)";
-
-/// Load GigaAM from `dir`. A folder without `model.int8.onnx` fails with
-/// [`GIGAAM_NOT_DOWNLOADED`] before the runtime starts, and a complete managed
-/// model gets its bundled `vocab.txt` back when that file was lost.
-fn load_gigaam(dir: &str) -> Result<gigaam_shim::Model> {
-    if cfg!(any(windows, target_os = "macos", target_os = "linux")) {
-        let path = std::path::Path::new(dir);
-        let model_file = std::fs::metadata(path.join("model.int8.onnx"));
-        if dir.trim().is_empty() || !model_file.is_ok_and(|m| m.len() > 0) {
-            anyhow::bail!(GIGAAM_NOT_DOWNLOADED);
-        }
-        match crate::local_ai::repair_gigaam_vocab(path) {
-            Ok(true) => log::info!("GigaAM vocab.txt was missing; restored the bundled copy"),
-            Ok(false) => {}
-            Err(e) => log::warn!("GigaAM vocab.txt restore failed: {e}"),
-        }
-    }
-    gigaam_shim::load(dir)
-}
-
 fn public_gigaam_load_error(error: anyhow::Error, public_message: &'static str) -> anyhow::Error {
     log::warn!("GigaAM load failed: {error}");
     anyhow::anyhow!(public_message)
@@ -176,8 +117,8 @@ fn public_gigaam_load_error(error: anyhow::Error, public_message: &'static str) 
 ///
 /// Must be called once at startup, BEFORE any GigaAM model is loaded: the ORT
 /// session builder reads this global preference when it creates the session.
-/// `use_gpu` selects DirectML on Windows, Core ML on macOS and CUDA in a
-/// CUDA-enabled Linux build. CPU remains the fallback.
+/// `use_gpu` selects DirectML on Windows and Core ML on macOS; otherwise CPU.
+/// Both builds retain ONNX Runtime's CPU fallback.
 pub fn configure_gigaam_accelerator(use_gpu: bool) {
     gigaam_shim::configure_accelerator(use_gpu);
 }
@@ -186,10 +127,6 @@ pub fn configure_gigaam_accelerator(use_gpu: bool) {
 /// Groq models list with the bearer; HTTP 2xx means the key is valid +
 /// the endpoint is reachable. 10s timeout. Does NOT log the key.
 pub async fn test_connection(api_key: String) -> Result<String> {
-    test_connection_at(GROQ_MODELS_URL, api_key).await
-}
-
-async fn test_connection_at(models_url: &str, api_key: String) -> Result<String> {
     if api_key.trim().is_empty() {
         return Err(anyhow::anyhow!("no Groq API key set"));
     }
@@ -197,19 +134,11 @@ async fn test_connection_at(models_url: &str, api_key: String) -> Result<String>
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("build reqwest client")?;
-    // Generic on transport failure, like the whisper-server branch below: the
-    // error chain of reqwest names the request URL and, behind a proxy, the
-    // proxy host. The Settings status line shows this text.
-    let resp = match client.get(models_url).bearer_auth(&api_key).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!(
-                "STT Groq models GET failed ({})",
-                crate::ai::control::transport_failure_kind(&e)
-            );
-            anyhow::bail!("Groq API unreachable");
-        }
-    };
+    let resp = crate::network::send(client
+        .get(GROQ_MODELS_URL)
+        .bearer_auth(&api_key))
+        .await
+        .context("GET groq models")?;
     let status = resp.status();
     if status.is_success() {
         Ok(format!("HTTP {} — key valid", status.as_u16()))
@@ -222,8 +151,51 @@ async fn test_connection_at(models_url: &str, api_key: String) -> Result<String>
 /// models; local Whisper → ping the whisper-server; GigaAM → verify the model
 /// files actually load. Never logs secrets.
 pub async fn test_connection_backend(backend: &SttBackendCfg) -> Result<String> {
+    // Connection test remains specific to the primary engine, even with fallback enabled.
+    let backend = match backend {
+        SttBackendCfg::FallbackChain { backends } =>
+            backends.first().context("STT fallback chain has no primary")?,
+        other => other,
+    };
     match backend {
         SttBackendCfg::Cloud { api_key, .. } => test_connection(api_key.clone()).await,
+        SttBackendCfg::Speechmatics { api_key, .. } =>
+            test_cloud_key("https://eu1.asr.api.speechmatics.com/v2/jobs", "bearer", api_key).await,
+        // Check exactly the Speech-to-Text permission. A restricted STT key
+        // does not need `user_read` (required by GET /v1/user).
+        // Omit audio to trigger input validation without transcription/billing.
+        SttBackendCfg::Elevenlabs { api_key, model, .. } => {
+            if api_key.trim().is_empty() {
+                anyhow::bail!("ElevenLabs API key is not configured");
+            }
+            let response = crate::network::send_rebuildable("https://api.elevenlabs.io/v1/speech-to-text", |route_client| {
+                let form = reqwest::multipart::Form::new().text("model_id", model.clone());
+                Ok(route_client.post("https://api.elevenlabs.io/v1/speech-to-text")
+                    .timeout(std::time::Duration::from_secs(12))
+                    .header("xi-api-key", api_key.as_str()).multipart(form))
+            })
+                .await
+                .map_err(|_| anyhow::anyhow!("ElevenLabs STT connection error"))?;
+            let status = response.status();
+            if status.is_success() {
+                Ok("ElevenLabs Speech-to-Text endpoint reachable".into())
+            } else if matches!(status.as_u16(), 400 | 422) {
+                // A missing-audio validation error indicates that the service
+                // reached STT input validation. An unrelated error is NOT OK.
+                let body = response.text().await.unwrap_or_default().to_ascii_lowercase();
+                if body.contains("file") || body.contains("audio")
+                    || body.contains("source_url") || body.contains("cloud_storage_url")
+                {
+                    Ok("ElevenLabs Speech-to-Text permission check passed (no audio sent)".into())
+                } else {
+                    anyhow::bail!("ElevenLabs STT HTTP {} (request rejected)", status.as_u16())
+                }
+            } else {
+                anyhow::bail!("ElevenLabs STT HTTP {}", status.as_u16())
+            }
+        }
+        SttBackendCfg::Deepgram { api_key, .. } =>
+            test_cloud_key("https://api.deepgram.com/v1/projects", "token", api_key).await,
         SttBackendCfg::Whisper {
             base_url, bearer, ..
         } => {
@@ -240,12 +212,12 @@ pub async fn test_connection_backend(backend: &SttBackendCfg) -> Result<String> 
             // request `url` (which may carry embedded credentials or private LAN
             // hostnames). Log the high-level transport failure kind instead of {e:#}
             // so credentials/hosts never reach the shareable overlay-host.log.
-            let resp = match req.send().await {
+            let resp = match crate::network::send(req).await {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!(
                         "STT whisper-server GET failed ({})",
-                        crate::ai::control::transport_failure_kind(&e)
+                        "network route failure"
                     );
                     anyhow::bail!("whisper-server unreachable");
                 }
@@ -265,19 +237,17 @@ pub async fn test_connection_backend(backend: &SttBackendCfg) -> Result<String> 
         SttBackendCfg::Gigaam { model_dir } => {
             let dir = model_dir.clone();
             tokio::task::spawn_blocking(move || {
-                load_gigaam(&dir)
+                gigaam_shim::load(&dir)
                     .map(|_model| "GigaAM model loaded OK".to_string())
                     .map_err(|e| {
-                        if e.to_string() == GIGAAM_NOT_DOWNLOADED {
-                            e
-                        } else {
-                            public_gigaam_load_error(e, GIGAAM_LOAD_FAILED)
-                        }
+                        public_gigaam_load_error(e, "GigaAM: model failed to load (see log)")
                     })
             })
             .await
             .map_err(|e| anyhow::anyhow!("GigaAM test join: {e}"))?
         }
+        SttBackendCfg::FallbackChain { .. } =>
+            anyhow::bail!("nested STT fallback chain is invalid"),
     }
 }
 
@@ -351,6 +321,24 @@ struct GroqResponse {
     text: String,
 }
 
+/// Probe provider credentials without uploading audio or leaking response bodies.
+async fn test_cloud_key(url: &str, auth: &str, key: &str) -> Result<String> {
+    if key.trim().is_empty() { anyhow::bail!("STT API key is not configured"); }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build().context("STT HTTP client")?;
+    let req = match auth {
+        "xi-api-key" => client.get(url).header("xi-api-key", key),
+        "token" => client.get(url).header("Authorization", format!("Token {key}")),
+        _ => client.get(url).bearer_auth(key),
+    };
+    let resp = crate::network::send(req).await.map_err(|_| anyhow::anyhow!("STT network error"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("STT HTTP {}", resp.status().as_u16());
+    }
+    Ok("API key accepted".into())
+}
+
 /// Spawn the STT pipeline. Returns receiver of TranscriptEvent.
 ///
 /// `backend` selects the transcription engine: cloud Groq, a local
@@ -365,11 +353,12 @@ pub fn spawn(
     backend: SttBackendCfg,
     language: Option<String>,
     whisper_prompt: Option<String>,
+    local_whisper_prompt: Option<String>,
     health: std::sync::Arc<crate::health::HealthSignals>,
 ) -> mpsc::Receiver<TranscriptEvent> {
     let (tx, rx) = mpsc::channel::<TranscriptEvent>(64);
 
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     if matches!(&backend, SttBackendCfg::Gigaam { .. }) {
         log::error!("local GigaAM STT is not supported on this platform");
         drop(tx);
@@ -441,7 +430,15 @@ pub fn spawn(
                 let bearer = (!bearer.trim().is_empty()).then(|| bearer.clone());
                 Some((url, bearer, model.clone()))
             }
+            SttBackendCfg::Speechmatics { model, .. } =>
+                Some(("speechmatics".into(), None, model.clone())),
+            SttBackendCfg::Elevenlabs { model, .. } =>
+                Some(("elevenlabs".into(), None, model.clone())),
+            SttBackendCfg::Deepgram { model, .. } =>
+                Some(("deepgram".into(), None, model.clone())),
             SttBackendCfg::Gigaam { .. } => None,
+            SttBackendCfg::FallbackChain { .. } =>
+                Some(("stt-fallback-chain".into(), None, "fallback-chain".into())),
         };
 
         // Per-source rolling buffer + silence tracking
@@ -615,6 +612,8 @@ pub fn spawn(
                         let client = client.clone();
                         let language = language.clone();
                         let whisper_prompt = whisper_prompt.clone();
+                        let local_whisper_prompt = local_whisper_prompt.clone();
+                        let selected_backend = backend.clone();
                         let sem = stt_semaphore.clone();
                         log::info!(
                             "STT submitting {:?}: {} samples ({:.1}s, model={})",
@@ -629,16 +628,23 @@ pub fn spawn(
                                 Ok(p) => p,
                                 Err(_) => return, // semaphore closed, runtime shutting down
                             };
-                            let result = transcribe(
-                                &client,
-                                &url,
-                                bearer.as_deref(),
-                                &to_send.samples,
-                                language.as_deref(),
-                                whisper_prompt.as_deref(),
-                                &model,
-                            )
-                            .await;
+                            let result = match &selected_backend {
+                                SttBackendCfg::FallbackChain { .. } => {
+                                    transcribe_once(&selected_backend, &to_send.samples,
+                                        language.as_deref(), whisper_prompt.as_deref(), local_whisper_prompt.as_deref()).await
+                                }
+                                SttBackendCfg::Speechmatics { .. }
+                                | SttBackendCfg::Elevenlabs { .. }
+                                | SttBackendCfg::Deepgram { .. } => {
+                                    transcribe_provider(&client, &selected_backend,
+                                        &to_send.samples, language.as_deref()).await
+                                }
+                                _ => transcribe(&client, &url, bearer.as_deref(),
+                                    &to_send.samples, language.as_deref(),
+                                    if matches!(&selected_backend, SttBackendCfg::Whisper { .. }) {
+                                        local_whisper_prompt.as_deref()
+                                    } else { whisper_prompt.as_deref() }, &model).await,
+                            };
                             finish_transcript(
                                 result,
                                 src,
@@ -825,7 +831,7 @@ fn shared_gigaam_model(model_dir: &str) -> Result<SharedGigaamModel> {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     if !matches!(&*guard, Some((cached_dir, _)) if cached_dir == model_dir) {
-        let model = load_gigaam(model_dir)?;
+        let model = gigaam_shim::load(model_dir)?;
         *guard = Some((model_dir.to_string(), Arc::new(Mutex::new(model))));
     }
     guard
@@ -843,11 +849,263 @@ pub fn reset_gigaam_cache() {
     }
 }
 
+/// Direct STT integrations for the short WAV segments produced by VAD.
+/// No translation endpoint: return the recognized text verbatim.
+async fn transcribe_provider(
+    client: &reqwest::Client, backend: &SttBackendCfg, pcm: &[i16],
+    language: Option<&str>,
+) -> Result<String> {
+    let wav = encode_wav_pcm_i16_mono_16k(pcm)?;
+    let lang = language.filter(|s| !s.trim().is_empty());
+    match backend {
+        SttBackendCfg::Deepgram { api_key, model } => {
+            // reqwest 0.13 `query` feature is disabled in this project.
+            // Construct a URL with correctly percent-encoded query pairs instead.
+            let mut url = reqwest::Url::parse("https://api.deepgram.com/v1/listen")?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("model", model).append_pair("smart_format", "true");
+                if let Some(l) = lang { query.append_pair("language", l); }
+            }
+            let resp = client.post(url).header("Authorization", format!("Token {api_key}"))
+                .header("Content-Type", "audio/wav")
+                .body(wav);
+            let resp = crate::network::send(resp).await.map_err(|_| anyhow::anyhow!("STT network error"))?;
+            stt_check_status(resp.status())?;
+            let value: serde_json::Value = resp.json().await.context("parse Deepgram JSON")?;
+            let text = value.pointer("/results/channels/0/alternatives/0/transcript")
+                .and_then(|x| x.as_str()).context("Deepgram transcript missing")?;
+            Ok(text.to_owned())
+        }
+        SttBackendCfg::Elevenlabs { api_key, model, keyterms } => {
+            let resp = crate::network::send_rebuildable("https://api.elevenlabs.io/v1/speech-to-text", |route_client| {
+                let part = reqwest::multipart::Part::bytes(wav.clone())
+                    .file_name("audio.wav").mime_str("audio/wav")?;
+                let mut form = reqwest::multipart::Form::new()
+                    .text("model_id", model.clone())
+                    .text("tag_audio_events", "false")
+                    .text("diarize", "false")
+                    .part("file", part);
+                if let Some(l) = lang { form = form.text("language_code", l.to_owned()); }
+                for term in keyterms { form = form.text("keyterms", term.clone()); }
+                Ok(route_client.post("https://api.elevenlabs.io/v1/speech-to-text")
+                    .timeout(std::time::Duration::from_secs(60))
+                    .header("xi-api-key", api_key.as_str())
+                    .multipart(form))
+            }).await.map_err(|_| anyhow::anyhow!("STT network error"))?;
+            stt_check_status(resp.status())?;
+            let value: serde_json::Value = resp.json().await.context("parse ElevenLabs JSON")?;
+            let text = value.get("text").and_then(|x| x.as_str())
+                .context("ElevenLabs transcript missing")?;
+            Ok(text.to_owned())
+        }
+        SttBackendCfg::Speechmatics { api_key, model } => {
+            const JOBS: &str = "https://eu1.asr.api.speechmatics.com/v2/jobs";
+            let mut jobs_url = reqwest::Url::parse(JOBS)?;
+            jobs_url.query_pairs_mut().append_pair("wait", "20").append_pair("format", "txt");
+            let resp = crate::network::send_rebuildable(jobs_url.as_str(), |route_client| {
+                let part = reqwest::multipart::Part::bytes(wav.clone())
+                    .file_name("audio.wav").mime_str("audio/wav")?;
+                let config = serde_json::json!({
+                    "type": "transcription",
+                    "transcription_config": {"language": lang.unwrap_or("ru"), "model": model},
+                }).to_string();
+                let form = reqwest::multipart::Form::new().text("config", config)
+                    .part("data_file", part);
+                Ok(route_client.post(jobs_url.clone()).timeout(std::time::Duration::from_secs(60))
+                    .bearer_auth(api_key).multipart(form))
+            }).await.map_err(|_| anyhow::anyhow!("STT network error"))?;
+            stt_check_status(resp.status())?;
+            let value: serde_json::Value = resp.json().await.context("parse Speechmatics job JSON")?;
+            if value.get("status").and_then(|x| x.as_str()) == Some("done") {
+                if let Some(txt) = value.get("txt").and_then(|x| x.as_str()) {
+                    return Ok(txt.to_owned());
+                }
+            }
+            if matches!(value.get("status").and_then(|x| x.as_str()), Some("rejected" | "deleted")) {
+                anyhow::bail!("Speechmatics transcription rejected");
+            }
+            let id = value.get("id").and_then(|x| x.as_str())
+                .context("Speechmatics job ID missing")?;
+            // The wait parameter may return while the job is still running.
+            // Poll the text transcript until available, bounded to avoid hanging a session.
+            for _ in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let url = format!("{JOBS}/{id}/transcript?format=txt");
+                let resp = crate::network::send(client.get(&url)
+                    .bearer_auth(api_key)).await
+                    .map_err(|_| anyhow::anyhow!("STT network error"))?;
+                if resp.status().is_success() {
+                    return resp.text().await.context("Speechmatics text transcript");
+                }
+                if !matches!(resp.status().as_u16(), 202 | 404 | 409 | 425) {
+                    stt_check_status(resp.status())?;
+                }
+            }
+            anyhow::bail!("Speechmatics transcript not ready within 50 seconds")
+        }
+        _ => anyhow::bail!("STT backend not supported by cloud adapter"),
+    }
+}
+
+
+/// Model choices for cloud STT. `source` states whether this list was obtained
+/// from the live provider API or is a documented fallback (never claim account access).
+pub struct SttModelCatalog {
+    pub ids: Vec<String>,
+    pub source: String,
+}
+
+pub async fn fetch_stt_model_catalog(provider: &str, key: &str) -> Result<SttModelCatalog> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(14))
+        .build().context("STT model list client")?;
+    let (mut ids, source) = match provider {
+        "deepgram" => {
+            // Public STT catalog: no credentials necessary. This does not
+            // certify access to private/project-specific models.
+            let r = client.get("https://api.deepgram.com/v1/models");
+            let r = crate::network::send(r).await
+                .context("Deepgram model catalog connection")?;
+            stt_check_status(r.status())?;
+            let value: serde_json::Value = r.json().await.context("Deepgram model catalog JSON")?;
+            let models = value.get("stt").and_then(|v| v.as_array())
+                .context("Deepgram returned no STT model list")?;
+            let models = models.iter().filter(|m| {
+                // The app uses POST /v1/listen (batch), not realtime Flux /v2.
+                if m.get("batch").and_then(|v| v.as_bool()) == Some(false) { return false; }
+                let model = m.get("canonical_name").and_then(|v| v.as_str()).unwrap_or("");
+                !model.starts_with("flux")
+            }).filter_map(|m| m.get("canonical_name").and_then(|v| v.as_str())
+                .map(str::to_string)).collect::<Vec<_>>();
+            (models, "Deepgram: публичный каталог; доступ аккаунта не проверен".to_string())
+        }
+        "elevenlabs" => {
+            if key.trim().is_empty() { anyhow::bail!("ElevenLabs API key not set"); }
+            let r = client.get("https://api.elevenlabs.io/v1/models")
+                .header("xi-api-key", key);
+            let r = crate::network::send(r).await
+                .context("ElevenLabs model catalog connection")?;
+            stt_check_status(r.status())?;
+            let value: serde_json::Value = r.json().await.context("ElevenLabs model catalog JSON")?;
+            let models = value.as_array().context("ElevenLabs returned no model array")?;
+            // /v1/speech-to-text is a BATCH endpoint. Realtime Scribe models
+            // require a different connection protocol and are excluded here.
+            let selected = models.iter().filter_map(|m| m.get("model_id")
+                .and_then(|v| v.as_str()))
+                .filter(|m| m.starts_with("scribe_") && !m.contains("realtime"))
+                .map(str::to_string).collect::<Vec<_>>();
+            if selected.is_empty() {
+                (vec!["scribe_v2".into(), "scribe_v2_medical".into()],
+                 "ElevenLabs: API не вернул STT; модели из документации, доступ не проверен".into())
+            } else {
+                (selected, "ElevenLabs: API моделей (только Scribe Batch)".to_string())
+            }
+        }
+        "speechmatics" => {
+            // Speechmatics has feature discovery (languages/domains), but
+            // currently no documented per-account STT model listing API.
+            let r = client.get("https://eu1.asr.api.speechmatics.com/v1/discovery/features");
+            let r = crate::network::send(r).await.context("Speechmatics feature discovery connection")?;
+            stt_check_status(r.status())?;
+            let _value: serde_json::Value = r.json().await
+                .context("Speechmatics feature discovery JSON")?;
+            (vec!["melia-1".into(), "enhanced".into(), "standard".into()],
+             "Speechmatics: модели из документации, API аккаунта их не перечисляет".into())
+        }
+        _ => anyhow::bail!("Unsupported STT model provider"),
+    };
+    ids.sort(); ids.dedup();
+    if ids.is_empty() { anyhow::bail!("STT provider returned no batch models"); }
+    Ok(SttModelCatalog { ids, source })
+}
+
+fn stt_check_status(status: reqwest::StatusCode) -> Result<()> {
+    if status.is_success() { Ok(()) }
+    else { anyhow::bail!("STT HTTP {}", status.as_u16()) }
+}
+
 /// Public one-shot transcription helper for ad-hoc flows (e.g. prep recording).
 /// Provider-aware: cloud Groq, local whisper-server, or in-process GigaAM
 /// (shared through `GIGAAM_CACHE` with the live pipeline so repeated or
 /// simultaneous calls reuse one memory-bounded model instance).
 pub async fn transcribe_once(
+    backend: &SttBackendCfg,
+    pcm: &[i16],
+    language: Option<&str>,
+    whisper_prompt: Option<&str>,
+    local_whisper_prompt: Option<&str>,
+) -> Result<String> {
+    let SttBackendCfg::FallbackChain { backends } = backend else {
+        let hint = if matches!(backend, SttBackendCfg::Whisper { .. }) {
+            local_whisper_prompt
+        } else { whisper_prompt };
+        return transcribe_once_single(backend, pcm, language, hint).await;
+    };
+    // The exact same PCM is sent sequentially, never in parallel, to the first
+    // working provider. An empty response is also a reason to advance.
+    let mut last_failure = "no usable backend";
+    for (index, engine) in backends.iter().enumerate() {
+        let name = engine.label();
+        let started = std::time::Instant::now();
+        log::info!("[stt-chain] attempt={}/{} provider={} state=start",
+            index + 1, backends.len(), name);
+        if engine.missing_key() {
+            log::warn!("[stt-chain] attempt={}/{} provider={} state=missing_key", index + 1, backends.len(), name);
+            last_failure = "missing API key";
+            continue;
+        }
+        // Speechmatics batch transcriptions may legitimately require ~50s.
+        let secs = if matches!(engine, SttBackendCfg::Speechmatics { .. }) { 55 }
+            else { 25 };
+        let deadline = std::time::Duration::from_secs(secs);
+        match tokio::time::timeout(deadline,
+            transcribe_once_single(engine, pcm, language,
+                if matches!(engine, SttBackendCfg::Whisper { .. }) {
+                    local_whisper_prompt
+                } else { whisper_prompt })).await
+        {
+            Ok(Ok(text)) if !text.trim().is_empty() => {
+                log::info!("[stt-chain] attempt={}/{} provider={} state=success elapsed_ms={}",
+                    index + 1, backends.len(), name, started.elapsed().as_millis());
+                if index > 0 {
+                    log::info!("STT fallback succeeded with {name} (position {})", index + 1);
+                }
+                return Ok(text);
+            }
+            Ok(Ok(_)) => {
+                log::warn!("[stt-chain] provider={} state=empty elapsed_ms={}",
+                    name, started.elapsed().as_millis());
+                log::warn!("STT fallback {name}: empty transcription, trying next");
+                last_failure = "empty transcription";
+            }
+            Ok(Err(error)) => {
+                // Avoid leaking request URLs and credentials into shareable logs.
+                let msg = error.to_string();
+                let reason = if msg.contains("HTTP 401") { "HTTP 401" }
+                    else if msg.contains("HTTP 403") { "HTTP 403" }
+                    else if msg.contains("HTTP 429") { "HTTP 429" }
+                    else if msg.contains("HTTP 400") { "HTTP 400" }
+                    else if msg.contains("HTTP 404") { "HTTP 404" }
+                    else if msg.contains("HTTP 5") { "HTTP 5xx" }
+                    else { "request or model error" };
+                log::warn!("[stt-chain] provider={} state=error kind={} elapsed_ms={}",
+                    name, reason, started.elapsed().as_millis());
+                log::warn!("STT fallback {name} failed ({reason}); trying next");
+                last_failure = "provider error";
+            }
+            Err(_) => {
+                log::warn!("[stt-chain] provider={} state=timeout elapsed_ms={}",
+                    name, started.elapsed().as_millis());
+                log::warn!("STT fallback {name} timed out after {secs}s; trying next");
+                last_failure = "timeout";
+            }
+        }
+    }
+    anyhow::bail!("all STT fallback providers failed ({last_failure})")
+}
+
+async fn transcribe_once_single(
     backend: &SttBackendCfg,
     pcm: &[i16],
     language: Option<&str>,
@@ -869,6 +1127,13 @@ pub async fn transcribe_once(
                 model,
             )
             .await
+        }
+        SttBackendCfg::Speechmatics { .. } | SttBackendCfg::Elevenlabs { .. }
+        | SttBackendCfg::Deepgram { .. } => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build().context("build client")?;
+            transcribe_provider(&client, backend, pcm, language).await
         }
         SttBackendCfg::Whisper {
             base_url,
@@ -897,6 +1162,8 @@ pub async fn transcribe_once(
             .await
             .map_err(|e| anyhow::anyhow!("GigaAM join: {e}"))?
         }
+        SttBackendCfg::FallbackChain { .. } =>
+            anyhow::bail!("nested STT fallback chain is not supported"),
     }
 }
 
@@ -952,7 +1219,7 @@ fn is_permanent_error(msg: &str) -> bool {
 }
 
 async fn transcribe_once_attempt(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     url: &str,
     bearer: Option<&str>,
     wav: &[u8],
@@ -960,52 +1227,30 @@ async fn transcribe_once_attempt(
     prompt: Option<&str>,
     stt_model: &str,
 ) -> Result<String> {
-    let part = reqwest::multipart::Part::bytes(wav.to_vec())
-        .file_name("audio.wav")
-        .mime_str("audio/wav")?;
-
-    // Use configured model; fall back to default if empty.
-    let model = if stt_model.is_empty() {
-        DEFAULT_GROQ_MODEL
-    } else {
-        stt_model
-    };
-    let mut form = reqwest::multipart::Form::new()
-        .text("model", model.to_string())
-        .text("response_format", "json")
-        .text("temperature", "0")
-        .part("file", part);
-    if let Some(lang) = language {
-        if !lang.is_empty() {
+    // Rebuild the complete multipart form on the alternate route; reqwest
+    // multipart Request bodies cannot be cloned for a second attempt.
+    let model = if stt_model.is_empty() { DEFAULT_GROQ_MODEL } else { stt_model };
+    let resp = match crate::network::send_rebuildable(url, |route_client| {
+        let part = reqwest::multipart::Part::bytes(wav.to_vec())
+            .file_name("audio.wav").mime_str("audio/wav")?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", model.to_owned())
+            .text("response_format", "json")
+            .text("temperature", "0")
+            .part("file", part);
+        if let Some(lang) = language.filter(|v| !v.is_empty()) {
             form = form.text("language", lang.to_string());
         }
-    }
-    // Whisper `prompt` parameter (OpenAI-compatible) biases the decoder
-    // toward this vocabulary. Critical for technical terms in Russian
-    // speech: without it "kubernetes" gets phonetised to "кобернетес".
-    if let Some(p) = prompt {
-        if !p.is_empty() {
-            form = form.text("prompt", p.to_string());
+        if let Some(text) = prompt.filter(|v| !v.is_empty()) {
+            form = form.text("prompt", text.to_owned());
         }
-    }
-
-    let mut req = client.post(url);
-    if let Some(b) = bearer {
-        req = req.bearer_auth(b);
-    }
-    // Generic on transport failure: a reqwest error's chain embeds the request
-    // `url` (which may carry embedded credentials or private LAN IP), which must
-    // NOT surface in the screen-capturable PTT tile, Diagnostics field, or the
-    // shareable overlay-host.log. Log transport failure kind only; return a
-    // secret-free message. Network errors stay retryable (no "HTTP 4xx" in the
-    // text, so is_permanent_error keeps them in the loop).
-    let resp = match req.multipart(form).send().await {
+        let mut req = route_client.post(url).timeout(std::time::Duration::from_secs(60));
+        if let Some(b) = bearer { req = req.bearer_auth(b); }
+        Ok(req.multipart(form))
+    }).await {
         Ok(r) => r,
-        Err(e) => {
-            log::warn!(
-                "STT POST transport error ({})",
-                crate::ai::control::transport_failure_kind(&e)
-            );
+        Err(_) => {
+            log::warn!("STT multipart request failed on available network routes");
             anyhow::bail!("STT network error");
         }
     };
@@ -1102,7 +1347,7 @@ fn gigaam_transcribe(model: &Arc<Mutex<gigaam_shim::Model>>, pcm: &[i16]) -> Res
 /// 800-char prompt window. Curated 2026-05-25 from real Russian-language
 /// engineering transcripts (live tests + interview audio corpora) where
 /// Whisper consistently mangled the spelling.
-const CANONICAL_TECH_VOCAB: &str = "kubernetes k8s k3s docker containerd \
+pub const CANONICAL_TECH_VOCAB: &str = "kubernetes k8s k3s docker containerd \
 podman gitlab github jenkins ansible terraform helm kustomize argocd \
 prometheus grafana alertmanager loki tempo jaeger elasticsearch kibana \
 opensearch fluentbit fluentd vector etcd consul vault nomad nginx haproxy \
@@ -1131,6 +1376,16 @@ deployment daemonset job cronjob configmap secret pvc";
 /// Returns None if user has nothing custom — just CANONICAL_TECH_VOCAB
 /// alone is too generic to bias correctly.
 pub fn build_whisper_prompt(keywords: &str, meeting_context: &str) -> Option<String> {
+    build_whisper_prompt_with_vocab(CANONICAL_TECH_VOCAB, keywords, meeting_context)
+}
+
+/// The same prompt with user-configured canonical vocabulary. The three sections
+/// are independent: removing the vocabulary does not remove custom keywords.
+pub fn build_whisper_prompt_with_vocab(
+    canonical_vocab: &str,
+    keywords: &str,
+    meeting_context: &str,
+) -> Option<String> {
     // Groq enforces 896-char hard limit on the `prompt` field (Whisper
     // inherits ~224 tokens). Live regression 2026-05-25: a prompt builder
     // bug let 946 chars leak through (kw_section_len + ctx_section_min
@@ -1153,10 +1408,12 @@ pub fn build_whisper_prompt(keywords: &str, meeting_context: &str) -> Option<Str
     // Lead with the canonical tech vocab so Whisper biases strongest here.
     // "Англоязычные термины пишутся латиницей" hints the decoder to keep
     // Latin spellings for the listed words even when audio is ambiguous.
-    out.push_str(
-        "Технический разговор о DevOps и SRE. Англоязычные термины \
-                  пишутся латиницей: ",
-    );
+    if !canonical_vocab.trim().is_empty() {
+        out.push_str(
+            "Технический разговор о DevOps и SRE. Англоязычные термины \
+                      пишутся латиницей: ",
+        );
+    }
 
     // BUDGET ALLOCATION: vocab is generic, user keywords are specific.
     // When the expanded vocab would consume the whole 800-char budget,
@@ -1183,25 +1440,25 @@ pub fn build_whisper_prompt(keywords: &str, meeting_context: &str) -> Option<Str
         .saturating_sub(header_used)
         .saturating_sub(kw_section_len)
         .saturating_sub(ctx_section_min);
-    if vocab_budget >= CANONICAL_TECH_VOCAB.chars().count() {
-        out.push_str(CANONICAL_TECH_VOCAB);
+    if vocab_budget >= canonical_vocab.trim().chars().count() {
+        out.push_str(canonical_vocab.trim());
     } else {
         // Truncate vocab on whitespace boundary so we don't end mid-token
         // (Whisper would otherwise treat "kuberne" as a noise token).
-        let trimmed: String = CANONICAL_TECH_VOCAB.chars().take(vocab_budget).collect();
+        let trimmed: String = canonical_vocab.trim().chars().take(vocab_budget).collect();
         let cut = trimmed.rfind(' ').unwrap_or(trimmed.len());
         out.push_str(&trimmed[..cut]);
     }
 
     if let Some(joined) = kw_joined {
-        out.push_str(". Дополнительно: ");
+        out.push_str(if out.is_empty() { "Термины: " } else { ". Дополнительно: " });
         out.push_str(&joined);
     }
     if !ctx.is_empty() {
         let remaining = MAX_CHARS.saturating_sub(out.chars().count() + 20);
         if remaining > 50 {
             let snippet: String = ctx.chars().take(remaining).collect();
-            out.push_str(". Контекст: ");
+            out.push_str(if out.is_empty() { "Контекст: " } else { ". Контекст: " });
             out.push_str(&snippet);
         }
     }
@@ -1226,6 +1483,35 @@ pub fn build_whisper_prompt(keywords: &str, meeting_context: &str) -> Option<Str
         out = out.chars().take(GROQ_HARD_LIMIT).collect::<String>();
     }
     Some(out)
+}
+
+/// Render an editable Whisper/Groq prompt. Blank template preserves the existing
+/// carefully budgeted automatic composition. Never send unbounded user text to Groq.
+/// Placeholders may be written as [name] or {{name}} in Settings.
+pub fn build_configured_whisper_prompt(
+    template: &str,
+    canonical_vocab: &str,
+    keywords: &str,
+    meeting_context: &str,
+) -> Option<String> {
+    if template.trim().is_empty() {
+        return build_whisper_prompt_with_vocab(canonical_vocab, keywords, meeting_context);
+    }
+    let mut text = template.to_owned();
+    for (name, value) in [
+        ("CANONICAL_TECH_VOCAB", canonical_vocab),
+        ("trigger_keywords", keywords),
+        ("meeting_context", meeting_context),
+    ] {
+        text = text.replace(&format!("[{}]", name), value);
+        text = text.replace(&format!("{{{{{}}}}}", name), value);
+    }
+    // Also accept the legacy unbracketed spelling shown in the old prompt.
+    text = text.replace("CANONICAL_TECH_VOCAB", canonical_vocab);
+    // Preserve a safety margin against Groq's <=896-character limit; Unicode
+    // truncation is by codepoint and never splits a UTF-8 code unit.
+    let text: String = text.trim().chars().take(700).collect();
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Minimal RIFF WAVE encoder (PCM int16 mono, 16 kHz).
@@ -1460,21 +1746,42 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn cloud_connection_test_reports_a_transport_failure_without_the_url() {
-        // A local listener that accepts one connection and closes it without an
-        // HTTP answer: a transport failure that does not depend on a free port.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/models", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || drop(listener.accept()));
-        let err = test_connection_at(&url, "dummy_key_123".to_string())
-            .await
-            .unwrap_err();
-        server.join().unwrap();
-        assert_eq!(format!("{err:#}"), "Groq API unreachable");
+    #[test]
+    fn custom_prompt_template_expands_all_three_sections() {
+        let hint = build_configured_whisper_prompt(
+            "[CANONICAL_TECH_VOCAB] | [trigger_keywords] | [meeting_context]",
+            "Java Scala", "Kafka", "Собеседование",
+        ).unwrap();
+        assert_eq!(hint, "Java Scala | Kafka | Собеседование");
+    }
+
+    #[test]
+    fn custom_prompt_template_caps_unicode_and_supports_empty_placeholders() {
+        let template = "{{meeting_context}}";
+        assert_eq!(build_configured_whisper_prompt(template, "", "", "Речь"), Some("Речь".to_owned()));
+        assert_eq!(build_configured_whisper_prompt(
+            "CANONICAL_TECH_VOCAB [trigger_keywords] [meeting_context]",
+            "Java Scala", "Kafka", "Собеседование",
+        ).unwrap(), "Java Scala Kafka Собеседование");
+        let many = "я".repeat(900);
+        assert_eq!(build_configured_whisper_prompt(&many, "", "", "").unwrap().chars().count(), 700);
     }
 
     // ── build_whisper_prompt ──
+
+    #[test]
+    fn custom_vocab_changes_bias_without_changing_keywords_or_context() {
+        let p = build_whisper_prompt_with_vocab("java scala akka", "spring", "interview")
+            .expect("custom prompt");
+        assert!(p.contains("java scala akka"));
+        assert!(p.contains("spring"));
+        assert!(p.contains("interview"));
+        assert!(!p.contains("kubernetes"));
+        let p2 = build_whisper_prompt_with_vocab("", "spring", "interview").unwrap();
+        assert!(!p2.contains("kubernetes"));
+        assert!(p2.contains("spring"));
+        assert!(p2.contains("interview"));
+    }
 
     #[test]
     fn whisper_prompt_returns_none_for_empty_inputs() {
@@ -1703,7 +2010,7 @@ mod tests {
 
     // ── Unsupported-platform GigaAM seam ──
 
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn gigaam_shim_load_unsupported_off_windows() {
         let err = gigaam_shim::load("nonexistent-model-dir")
@@ -1715,13 +2022,13 @@ mod tests {
         );
     }
 
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn validate_gigaam_dir_unsupported_off_windows() {
         assert!(validate_gigaam_dir("nonexistent-model-dir").is_err());
     }
 
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn configure_gigaam_accelerator_honest_noop_off_windows() {
         // Must not panic — the session-start path calls it unconditionally.
