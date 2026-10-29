@@ -2,7 +2,6 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-#[cfg(not(feature = "remote-ui"))]
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -16,16 +15,10 @@ mod ui {
     slint::include_modules!();
 }
 
-// The Omarchy plugin build: the same window API, drawn by the Omarchy shell.
-#[cfg(feature = "remote-ui")]
-mod ui {
-    pub use slint_replay::remote_ui::generated::*;
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos"))]
 include!("overlay_host_windows.rs");
 
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err("overlay-host is not supported on this platform".into())
 }

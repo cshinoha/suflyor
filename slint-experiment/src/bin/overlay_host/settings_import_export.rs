@@ -58,41 +58,28 @@ pub(crate) fn wire_import_export(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_export_server_settings_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let snapshot = cfg_c.read().clone();
-            let dialog = rfd::AsyncFileDialog::new()
-                .set_title(if ru {
-                    "Экспорт серверных настроек (только AI/STT — содержит API-ключи)"
-                } else {
-                    "Export server settings (AI/STT only — contains API keys)"
-                })
+            let picked = rfd::FileDialog::new()
+                .set_title("Export server settings (AI/STT only — contains API keys)")
                 .set_file_name("suflyor-server-settings.json")
-                .add_filter("JSON", &["json"]);
-            let weak = weak.clone();
-            super::settings_dialogs::pick(dialog, super::settings_dialogs::Kind::Save, move |picked| {
-                let Some(w) = weak.upgrade() else { return };
-                let msg = match picked {
-                    None => if ru { "Экспорт отменён" } else { "Export cancelled" }.to_string(),
-                    Some(path) => {
-                        match overlay_backend::config::export_server_settings_to(&path, &snapshot) {
-                            Ok(()) => {
-                                if ru {
-                                    format!("Настройки сервера экспортированы в {}", path.display())
-                                } else {
-                                    format!("Server settings exported to {}", path.display())
-                                }
-                            }
-                            Err(e) => {
-                                // Generic + log: the error chain can carry a path /
-                                // internals into this screen-shared field (audit Q8).
-                                eprintln!("[overlay-host] server export failed: {e:#}");
-                                if ru { "Серверные настройки не экспортированы: в эту папку не удалось записать файл. Выберите другую папку и нажмите «Экспортировать серверные настройки» ещё раз." } else { "Server settings not exported: the file could not be written to that folder. Choose another folder, then press Export server settings again." }.to_string()
-                            }
+                .add_filter("JSON", &["json"])
+                .save_file();
+            let Some(w) = weak.upgrade() else { return };
+            let msg = match picked {
+                None => "export cancelled".to_string(),
+                Some(path) => {
+                    match overlay_backend::config::export_server_settings_to(&path, &snapshot) {
+                        Ok(()) => format!("[ok] server settings exported to {}", path.display()),
+                        Err(e) => {
+                            // Generic + log: the error chain can carry a path /
+                            // internals into this screen-shared field (audit Q8).
+                            eprintln!("[overlay-host] server export failed: {e:#}");
+                            "[err] export failed (see log)".to_string()
                         }
                     }
-                };
-                w.set_profile_io_result(SharedString::from(msg));
-            });
+                }
+            };
+            w.set_profile_io_result(SharedString::from(msg));
         });
     }
 
@@ -107,47 +94,35 @@ pub(crate) fn wire_import_export(
         let pending = pending.clone();
         win.on_import_server_settings_clicked(move || {
             let snapshot = cfg_c.read().clone();
-            let ru = snapshot.ui_is_ru();
-            let dialog = rfd::AsyncFileDialog::new()
-                .set_title(if ru {
-                    "Импорт серверных настроек (только AI/STT) из резервной копии"
-                } else {
-                    "Import server settings (AI/STT only) from a backup"
-                })
-                .add_filter("JSON", &["json"]);
-            let weak = weak.clone();
-            let pending = pending.clone();
-            super::settings_dialogs::pick(dialog, super::settings_dialogs::Kind::File, move |picked| {
-                let Some(w) = weak.upgrade() else { return };
-                let Some(path) = picked else {
-                    w.set_profile_io_result(SharedString::from(if ru { "Импорт отменён" } else { "Import cancelled" }));
-                    return;
-                };
-                // Read + parse + build the redacted preview. The parse error stays
-                // value-free (parse_config_bytes inside). No save happens yet.
-                match overlay_backend::config::preview_server_settings_from(&path, &snapshot) {
-                    Ok((preview, imported)) => {
-                        apply_server_preview(&w, &preview, ru);
-                        *pending.borrow_mut() = Some(imported);
-                        w.set_server_preview_ready(true);
-                        w.set_profile_io_result(SharedString::from(if ru {
-                            "Проверьте изменения ниже и нажмите «Применить серверные настройки»."
-                        } else {
-                            "Review the changes below, then click 'Apply server settings'."
-                        }));
-                    }
-                    Err(e) => {
-                        *pending.borrow_mut() = None;
-                        w.set_server_preview_ready(false);
-                        eprintln!("[overlay-host] server import preview failed: {e:#}");
-                        w.set_profile_io_result(SharedString::from(if ru {
-                            "Серверные настройки не прочитаны: файл не читается или это не экспорт настроек Суфлёра. Выберите экспортированный .json и нажмите «Импортировать серверные настройки» ещё раз."
-                        } else {
-                            "Server settings not read: the file cannot be read or is not a Suflyor settings export. Pick the exported .json file, then press Import server settings again."
-                        }));
-                    }
+            let picked = rfd::FileDialog::new()
+                .set_title("Import server settings (AI/STT only) from a backup")
+                .add_filter("JSON", &["json"])
+                .pick_file();
+            let Some(w) = weak.upgrade() else { return };
+            let Some(path) = picked else {
+                w.set_profile_io_result(SharedString::from("import cancelled"));
+                return;
+            };
+            // Read + parse + build the redacted preview. The parse error stays
+            // value-free (parse_config_bytes inside). No save happens yet.
+            match overlay_backend::config::preview_server_settings_from(&path, &snapshot) {
+                Ok((preview, imported)) => {
+                    apply_server_preview(&w, &preview);
+                    *pending.borrow_mut() = Some(imported);
+                    w.set_server_preview_ready(true);
+                    w.set_profile_io_result(SharedString::from(
+                        "review the changes below, then Apply",
+                    ));
                 }
-            });
+                Err(e) => {
+                    *pending.borrow_mut() = None;
+                    w.set_server_preview_ready(false);
+                    eprintln!("[overlay-host] server import preview failed: {e:#}");
+                    w.set_profile_io_result(SharedString::from(
+                        "[err] could not read file (see log)",
+                    ));
+                }
+            }
         });
     }
 
@@ -160,11 +135,10 @@ pub(crate) fn wire_import_export(
         let pending = pending.clone();
         let overlay = overlay_weak.clone();
         win.on_apply_server_settings_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else { return };
             let Some(imported) = pending.borrow_mut().take() else {
                 w.set_server_preview_ready(false);
-                w.set_profile_io_result(SharedString::from(if ru { "Применять нечего" } else { "Nothing to apply" }));
+                w.set_profile_io_result(SharedString::from("nothing to apply"));
                 return;
             };
             let merged = {
@@ -180,11 +154,11 @@ pub(crate) fn wire_import_export(
                         refresh_lock_chip(&o, &cfg_c);
                     }
                     let _ = msg_refresh_after_import(&w, &cfg_c);
-                    if ru { "Настройки сервера применены. Профили, устройства, интерфейс, фрагменты и путь к GigaAM сохранены. Для полного применения перезапустите приложение." } else { "Server settings applied. Local profiles, devices, UI, snippets and the GigaAM path were kept. Restart the app for full effect." }.to_string()
+                    "[ok] server settings applied (AI/STT providers, URLs, models, keys). Local profiles, devices, UI and snippets kept; the local GigaAM model path was kept from this PC. Restart for full effect.".to_string()
                 }
                 Err(e) => {
                     eprintln!("[overlay-host] server settings apply/save failed: {e:#}");
-                    if ru { "Серверные настройки не применены: не удалось сохранить файл настроек приложения. Проверьте свободное место на диске и нажмите «Импортировать серверные настройки» ещё раз." } else { "Server settings not applied: the app's settings file could not be saved. Check free disk space, then press Import server settings again." }.to_string()
+                    "[err] apply failed (see log)".to_string()
                 }
             };
             w.set_profile_io_result(SharedString::from(msg));
@@ -205,26 +179,15 @@ pub(crate) fn wire_import_export(
 }
 
 /// P1.7 — compose the REDACTED server-import preview into the Settings props.
-/// Each line shows localized field names and key PRESENCE only, never a secret
-/// value — `preview_server_settings` only ever fills booleans for keys.
+/// Each line is data-only (provider/url/model old->new + key PRESENCE as
+/// "set"/"—"), built the same way the diagnostics `detail` strings are (shown
+/// raw, not @tr'd). It NEVER carries a secret value — `preview_server_settings`
+/// only ever fills booleans for keys, asserted by the redaction guard test.
 pub(crate) fn apply_server_preview(
     win: &SettingsWindow,
     p: &overlay_backend::config::ServerSettingsPreview,
-    ru: bool,
 ) {
-    let [cloud, local, vision, stt, gigaam] = server_preview_lines(p, ru);
-    win.set_server_preview_cloud(SharedString::from(cloud));
-    win.set_server_preview_local(SharedString::from(local));
-    win.set_server_preview_vision(SharedString::from(vision));
-    win.set_server_preview_stt(SharedString::from(stt));
-    win.set_server_preview_gigaam(SharedString::from(gigaam));
-}
-
-fn server_preview_lines(
-    p: &overlay_backend::config::ServerSettingsPreview,
-    ru: bool,
-) -> [String; 5] {
-    // "value" or "—" for an empty string; localized presence marker for a key.
+    // "value" or "—" for an empty string; "set"/"—" for a presence bool.
     let v = |s: &str| {
         let t = s.trim();
         if t.is_empty() {
@@ -233,131 +196,58 @@ fn server_preview_lines(
             t.to_string()
         }
     };
-    let key = |present: bool| match (present, ru) {
-        (true, true) => "задан",
-        (true, false) => "set",
-        (false, _) => "—",
-    };
+    let key = |present: bool| if present { "set" } else { "—" };
     let line = |g: &overlay_backend::config::PreviewGroup| -> String {
         // Mask the host in the URL portion (copyable text) — keeps scheme/port/
         // path, blanks the private LAN IP. Provider + model are non-secret.
         let url_old = overlay_backend::config::mask_host(&g.base_url_old);
         let url_new = overlay_backend::config::mask_host(&g.base_url_new);
-        if ru {
-            let label = match g.label.as_str() {
-                "Cloud AI" => "Облачный AI",
-                "Local AI" => "Локальный AI",
-                "Vision" => "Скриншоты (F8)",
-                label => label,
-            };
-            format!(
-                "{label}: провайдер {} → {} | URL {} → {} | модель {} → {} | ключ {} → {}",
-                v(&g.provider_old),
-                v(&g.provider_new),
-                v(&url_old),
-                v(&url_new),
-                v(&g.model_old),
-                v(&g.model_new),
-                key(g.key_present_old),
-                key(g.key_present_new),
-            )
-        } else {
-            format!(
-                "{}: provider {} -> {} | url {} -> {} | model {} -> {} | key {} -> {}",
-                g.label,
-                v(&g.provider_old),
-                v(&g.provider_new),
-                v(&url_old),
-                v(&url_new),
-                v(&g.model_old),
-                v(&g.model_new),
-                key(g.key_present_old),
-                key(g.key_present_new),
-            )
-        }
+        format!(
+            "{}: provider {} -> {} | url {} -> {} | model {} -> {} | key {} -> {}",
+            g.label,
+            v(&g.provider_old),
+            v(&g.provider_new),
+            v(&url_old),
+            v(&url_new),
+            v(&g.model_old),
+            v(&g.model_new),
+            key(g.key_present_old),
+            key(g.key_present_new),
+        )
     };
+    win.set_server_preview_cloud(SharedString::from(line(&p.cloud_ai)));
+    win.set_server_preview_local(SharedString::from(line(&p.local_ai)));
+    win.set_server_preview_vision(SharedString::from(line(&p.vision)));
+    win.set_server_preview_stt(SharedString::from(line(&p.stt)));
     // GigaAM local model path: kept from THIS PC on apply. Show the incoming
     // path only when one side carries it, to keep the line useful.
-    // SECURITY: Redact user home directory paths (→ %USERPROFILE% or ~) so screen-sharing
+    // SECURITY: Redact user home directory paths (→ %USERPROFILE%) so screen-sharing
     // or copying the Settings preview never leaks the OS username (C:\Users\<name> or /Users/<name>).
     let gig = if p.gigaam_dir_incoming.trim().is_empty() && p.gigaam_dir_current.trim().is_empty() {
         String::new()
     } else {
-        let text = if ru {
-            format!(
-                "Локальный путь к модели GigaAM сохраняется с этого ПК ({}); путь из импортируемого файла ({}) НЕ применяется.",
-                v(&p.gigaam_dir_current),
-                v(&p.gigaam_dir_incoming),
-            )
-        } else {
-            format!(
-                "local GigaAM model path kept from this PC ({}); the imported file's path ({}) is NOT applied",
-                v(&p.gigaam_dir_current),
-                v(&p.gigaam_dir_incoming),
-            )
-        };
-        super::diagnostics::redact_user_home(&text)
+        super::diagnostics::redact_user_home(&format!(
+            "local GigaAM model path kept from this PC ({}); the imported file's path ({}) is NOT applied",
+            v(&p.gigaam_dir_current),
+            v(&p.gigaam_dir_incoming),
+        ))
     };
-    [
-        line(&p.cloud_ai),
-        line(&p.local_ai),
-        line(&p.vision),
-        line(&p.stt),
-        gig,
-    ]
+    win.set_server_preview_gigaam(SharedString::from(gig));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::diagnostics::HOME_PLACEHOLDER;
-    use super::server_preview_lines;
-    use overlay_backend::config::{PreviewGroup, ServerSettingsPreview};
-
-    #[test]
-    fn server_preview_localizes_fields_and_key_presence() {
-        let preview = ServerSettingsPreview {
-            cloud_ai: PreviewGroup {
-                label: "Cloud AI".into(),
-                provider_old: "cloud".into(),
-                provider_new: "local".into(),
-                key_present_new: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            server_preview_lines(&preview, false)[0],
-            "Cloud AI: provider cloud -> local | url — -> — | model — -> — | key — -> set"
-        );
-        assert_eq!(
-            server_preview_lines(&preview, true)[0],
-            "Облачный AI: провайдер cloud → local | URL — → — | модель — → — | ключ — → задан"
-        );
-        assert!(server_preview_lines(&preview, true)[4].is_empty());
-    }
+    use super::super::diagnostics::redact_user_home;
 
     #[test]
     fn gigaam_preview_path_redacts_user_home_directory() {
         let home = r"C:\Users\alice";
         std::env::set_var("USERPROFILE", home);
-        let preview = ServerSettingsPreview {
-            gigaam_dir_current: format!("{home}\\suflyor-local-ai\\gigaam-v3"),
-            gigaam_dir_incoming: format!("{home}\\imported\\gigaam-v3"),
-            ..Default::default()
-        };
-        for ru in [false, true] {
-            let redacted = &server_preview_lines(&preview, ru)[4];
-            assert!(
-                !redacted.contains("alice"),
-                "leaked OS username in preview: {redacted}"
-            );
-            assert!(redacted.contains(HOME_PLACEHOLDER));
-            let expected = if ru {
-                format!("Локальный путь к модели GigaAM сохраняется с этого ПК ({HOME_PLACEHOLDER}\\suflyor-local-ai\\gigaam-v3); путь из импортируемого файла ({HOME_PLACEHOLDER}\\imported\\gigaam-v3) НЕ применяется.")
-            } else {
-                format!("local GigaAM model path kept from this PC ({HOME_PLACEHOLDER}\\suflyor-local-ai\\gigaam-v3); the imported file's path ({HOME_PLACEHOLDER}\\imported\\gigaam-v3) is NOT applied")
-            };
-            assert_eq!(redacted, &expected);
-        }
+        let sample = format!(
+            "local GigaAM model path kept from this PC ({home}\\suflyor-local-ai\\gigaam-v3); the imported file's path ({home}\\imported\\gigaam-v3) is NOT applied"
+        );
+        let redacted = redact_user_home(&sample);
+        assert!(!redacted.contains("alice"), "leaked OS username in preview: {redacted}");
+        assert!(redacted.contains("%USERPROFILE%"));
     }
 }

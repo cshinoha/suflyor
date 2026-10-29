@@ -1,4 +1,4 @@
-//! Native audio settings. Device names remain the backend's existing contract.
+//! Windows audio settings. Device names remain the backend's existing contract.
 
 use super::SettingsWindow;
 use overlay_backend::{audio, config};
@@ -322,8 +322,6 @@ mod tests {
     fn window_state_tracks_selection_refresh_and_save_failure() {
         i_slint_backend_testing::init_no_event_loop();
         let win = SettingsWindow::new().unwrap();
-        win.global::<crate::ui::Platform>()
-            .set_is_linux(cfg!(target_os = "linux"));
         let cfg: config::SharedConfig = Default::default();
         cfg.write().system_audio_device = Some("Old headset".into());
         show_devices(
@@ -382,11 +380,7 @@ mod tests {
         show_devices(&win, &cfg, vec!["A50 Stream Out".into()], vec![]);
         assert_eq!(
             win.get_system_devices().row_data(0).unwrap(),
-            if cfg!(target_os = "linux") {
-                "Системное по умолчанию"
-            } else {
-                "По умолчанию Windows"
-            }
+            "По умолчанию Windows"
         );
         assert_eq!(
             win.get_system_devices().row_data(1).unwrap(),
@@ -402,7 +396,7 @@ mod tests {
     }
 
     /// Manual MCP audit surface. It never loads or saves the user's config.
-    #[cfg(all(windows, feature = "ui-mcp"))]
+    #[cfg(feature = "ui-mcp")]
     #[test]
     #[ignore = "interactive Slint MCP fixture; requires a Windows desktop"]
     fn live_audio_fixture() {

@@ -12,14 +12,19 @@ use super::{Arc, RuntimeEvents, SharedSlintRuntime};
 /// Re-exported so the existing binary ask paths keep their crate-root import.
 pub(crate) use slint_replay::runtime_state::cost_cap_reason;
 
-/// Label the bounded conversation context, retaining the interviewer's
-/// question even after a long run of microphone utterances.
+/// Local helper: last `max` transcript lines labeled with speaker
+/// tags `[ПОЛЬЗОВАТЕЛЬ]` / `[СОБЕСЕДНИК]`. Mirrors src-tauri's
+/// `select_recent_lines_labeled` — kept local to avoid promoting a
+/// tiny helper to overlay-backend.
 pub(crate) fn select_recent_labeled(
     transcript: &std::collections::VecDeque<overlay_backend::audio::TranscriptLine>,
     max: usize,
 ) -> Vec<String> {
-    overlay_backend::runtime::select_conversation_lines(transcript, max)
-        .into_iter()
+    let n = transcript.len();
+    let start = n.saturating_sub(max);
+    transcript
+        .iter()
+        .skip(start)
         .map(|l| {
             let src = match l.source {
                 overlay_backend::audio::AudioSource::System => "[СОБЕСЕДНИК]",

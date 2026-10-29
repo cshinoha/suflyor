@@ -8,14 +8,15 @@
 //!
 //! NOTE (§7): the crate-root symbols this module uses are imported below.
 use super::{
-    ai, apply_tile_hwnd_with_monitor, audio, classify_ai_error, fire_followup_ask, fire_regenerate,
+    active_ask_route, ai, apply_tile_hwnd_with_monitor, audio,
+    enforce_live_tile_cap_before_spawn, fire_followup_ask, fire_regenerate,
     grab_hwnd, journal, live_route, markdown, present_tile_window, refresh_open_tiles,
-    resolve_route_endpoint, route_needs_mlx, select_recent_labeled, show_mlx_runtime_error, stt,
-    toggle_tile_maximize, user_turn_markdown, warn_if_over_cost_cap, wire_copy, wire_escalate,
-    wire_speak, wire_tile_drag, wire_voice_followup, Arc, AskRoute, AtomicBool, ComponentHandle,
-    Duration, MarkdownBlock, ModelRc, Ordering, OverlayBarBridge, OverlayBarWindow, PttStreamSink,
-    RuntimeEvents, SharedSlintRuntime, SharedString, TileWindow, TileWindows, VecModel,
-    AI_STREAM_MAX_TOKENS, CONVO_SEQ, TILE_DISPLAY_SEQ,
+    resolve_route_endpoint, route_needs_mlx, show_mlx_runtime_error, stt, toggle_tile_maximize,
+    user_turn_markdown, warn_if_over_cost_cap, wire_copy, wire_escalate, wire_speak, wire_tile_drag,
+    wire_voice_followup, Arc, AskRoute, AtomicBool, ComponentHandle, Duration, MarkdownBlock,
+    ModelRc, Ordering, OverlayBarBridge, OverlayBarWindow, PttStreamSink, RuntimeEvents,
+    SharedSlintRuntime, SharedString, TileWindow, TileWindows, VecModel, AI_STREAM_MAX_TOKENS,
+    CONVO_SEQ, TILE_DISPLAY_SEQ,
 };
 /// Phase E6 v42 — hard cap on a push-to-record hold (30 s). Backstop for a
 /// lost pointer-up (alt-tab / focus loss mid-hold): without it the record
@@ -34,18 +35,55 @@ fn ptt_initial_copy(is_ru: bool) -> (&'static str, &'static str, &'static str, &
     if is_ru {
         (
             "Запись",
-            "STT · распознаю…",
+            "stt · расшифровка…",
             "Расшифровка…",
             "голосовой запрос",
         )
     } else {
         (
             "Recording",
-            "STT · transcribing…",
+            "stt · transcribing…",
             "Transcribing…",
             "push-to-talk",
         )
     }
+}
+
+/// Privacy-safe, provider-specific diagnosis for speech recognition errors.
+/// Do not feed STT errors to classify_ai_error: it always says "AI bridge".
+fn classify_stt_error(provider: &str, error: &str, is_ru: bool) -> String {
+    let name = match provider {
+        "cloud" => "Groq",
+        "speechmatics" => "Speechmatics",
+        "elevenlabs" => "ElevenLabs",
+        "deepgram" => "Deepgram",
+        "gigaam" => "GigaAM",
+        "whisper" => "Whisper",
+        _ => "STT",
+    };
+    let lower = error.to_lowercase();
+    let desc = if lower.contains("http 401") || lower.contains("unauthorized") {
+        if is_ru { "HTTP 401 — сервис отклонил API-ключ; проверь ключ и доступ Speech-to-Text" }
+        else { "HTTP 401 — API key rejected; check key and Speech-to-Text permission" }
+    } else if lower.contains("http 403") || lower.contains("forbidden") {
+        if is_ru { "HTTP 403 — нет доступа к распознаванию (права ключа или аккаунта)" }
+        else { "HTTP 403 — speech recognition access denied (key/account permissions)" }
+    } else if lower.contains("http 429") {
+        if is_ru { "HTTP 429 — лимит запросов или кредитов" }
+        else { "HTTP 429 — rate or credit limit" }
+    } else if lower.contains("http 400") || lower.contains("http 422") {
+        if is_ru { "HTTP 400/422 — аудио или модель не приняты сервисом" }
+        else { "HTTP 400/422 — invalid audio or model" }
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        if is_ru { "превышено время ожидания" } else { "request timed out" }
+    } else if lower.contains("connection") || lower.contains("network") {
+        if is_ru { "ошибка сети" } else { "network error" }
+    } else if is_ru {
+        "распознавание не удалось — подробности в overlay-host.log"
+    } else {
+        "transcription failed — see overlay-host.log"
+    };
+    format!("{name}: {desc}")
 }
 
 /// Phase E6 v42 — set a PTT tile's body to an error line. Called from the
@@ -56,9 +94,9 @@ pub(crate) fn ptt_tile_error(weak: slint::Weak<TileWindow>, msg: &str, is_ru: bo
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(t) = weak.upgrade() {
             t.set_source_label(SharedString::from(if is_ru {
-                "STT · ошибка"
+                "stt · ошибка"
             } else {
-                "STT · error"
+                "stt · error"
             }));
             t.set_blocks(ModelRc::new(VecModel::from(vec![MarkdownBlock {
                 kind: markdown::kind::PARAGRAPH,
@@ -93,6 +131,7 @@ pub(crate) fn fire_ptt_ask(
     weak_overlay: &slint::Weak<OverlayBarWindow>,
 ) {
     let (source, pcm) = recording;
+    let route = active_ask_route();
     let ui_is_ru = cfg.read().ui_is_ru();
     let icon = match source {
         audio::AudioSource::Mic => "mic",
@@ -117,13 +156,15 @@ pub(crate) fn fire_ptt_ask(
                 } else {
                     "system audio not captured"
                 }));
-                o.set_status_tone(crate::ui::StatusTone::Warning);
+                o.set_status_color(slint::Color::from_rgb_u8(0xe5, 0x9b, 0x2b));
             }
         }
         return;
     }
 
     // ===== 1. Sync placeholder tile =====
+    let max_live_tiles = cfg.read().max_live_tiles;
+    enforce_live_tile_cap_before_spawn(tiles, bridge, weak_overlay, max_live_tiles);
     let tile = match TileWindow::new() {
         Ok(t) => t,
         Err(e) => {
@@ -136,8 +177,12 @@ pub(crate) fn fire_ptt_ask(
     tile.set_sequence(seq as i32);
     tile.set_tile_title(SharedString::from(format!("{icon} {title}")));
     tile.set_source_label(SharedString::from(source_label));
-    tile.set_trigger_label(SharedString::from(format!("{icon} {trigger}")));
-    tile.set_trigger_tone(crate::ui::TileTone::Red);
+    tile.set_trigger_label(SharedString::from(if route == AskRoute::Cloud {
+        format!("{icon} {trigger} · smart")
+    } else {
+        format!("{icon} {trigger}")
+    }));
+    tile.set_trigger_color(slint::Color::from_rgb_u8(0xef, 0x44, 0x44));
     // Phase E6 v45 — PTT answers are continuable dialogs too.
     let convo_id = CONVO_SEQ.fetch_add(1, Ordering::Relaxed) as i32;
     tile.set_convo_id(convo_id);
@@ -157,18 +202,19 @@ pub(crate) fn fire_ptt_ask(
     let bridge_for_close = bridge.clone();
     tile.on_close_clicked(move || {
         if let Some(t) = weak_close.upgrade() {
-            bridge_for_close.cancel_tile_request(&t);
             // Closing the tile that's being read aloud must silence it.
             super::stop_if_speaking(t.get_convo_id());
             // FIX #8 — prune this tile's conversation (no-op if none).
             bridge_for_close.drop_conversation(t.get_convo_id());
-            let sequence = t.get_sequence();
+            let close_hwnd = grab_hwnd(t.window()).ok();
             let _ = t.hide();
             slint_replay::win32::force_hide(t.window());
-            vec_for_close
-                .borrow_mut()
-                .retain(|item| item.get_sequence() != sequence);
-            refresh_open_tiles(&weak_overlay_close, &vec_for_close);
+            if let Some(target) = close_hwnd {
+                vec_for_close
+                    .borrow_mut()
+                    .retain(|item| grab_hwnd(item.window()).ok() != Some(target));
+                refresh_open_tiles(&weak_overlay_close, &vec_for_close);
+            }
         }
     });
     let weak_pin = tile.as_weak();
@@ -187,8 +233,8 @@ pub(crate) fn fire_ptt_ask(
             toggle_tile_maximize(hwnd, &t);
         }
     });
-    // V0.8.1 — per-tile live route (sticky-cloud after 🧠). PTT starts Text.
-    let live = live_route(AskRoute::Text);
+    // PTT uses the currently selected modal answer mode. Explicit per-tile escalation remains sticky.
+    let live = live_route(route);
     // Phase E6 v45 — continue-dialog follow-ups on PTT answer tiles.
     {
         let weak_fu = tile.as_weak();
@@ -247,7 +293,6 @@ pub(crate) fn fire_ptt_ask(
     apply_tile_hwnd_with_monitor(&tile);
     let weak_for_stream = tile.as_weak();
     let weak_for_title = tile.as_weak();
-    let tile_id = tile.get_tile_id();
     tiles.borrow_mut().push(tile);
     refresh_open_tiles(weak_overlay, tiles);
 
@@ -258,37 +303,35 @@ pub(crate) fn fire_ptt_ask(
     // slot. No supersede, no abort — rapid PTTs no longer clobber each other.
 
     // ===== 3. Snapshot config + rolling transcript (context) =====
-    let (meeting_context, response_language, endpoint_hint, needs_mlx, fast) = {
+    let (meeting_context, response_language, endpoint_hint, needs_mlx) = {
         let c = cfg.read();
         (
             c.meeting_context.clone(),
             c.response_language.clone(),
-            c.ai_endpoint(false),
-            route_needs_mlx(AskRoute::Text, &c),
-            AskRoute::Text.fast_answers(&c),
+            route.endpoint(&c),
+            route_needs_mlx(route, &c),
         )
     };
-    let (stt_backend, stt_is_local, groq_key, stt_language, trigger_keywords) = {
+    let (stt_backend, missing_key, stt_language, whisper_prompt, local_whisper_prompt) = {
         let c = cfg.read();
         (
             c.stt_backend(),
-            c.stt_is_local(),
-            c.groq_api_key.clone(),
+            c.stt_missing_cloud_key(),
             c.stt_language.clone(),
-            c.trigger_keywords.clone(),
+            c.stt_prompt_for("cloud"),
+            c.stt_prompt_for("whisper"),
         )
     };
     let transcript_lines: Vec<String> = {
         let s = slint_replay::runtime_state::lock(slint_rt);
-        select_recent_labeled(&s.transcript, 8)
+        s.transcript
+            .iter()
+            .map(|l| format!("[{:?}] {}", l.source, l.text))
+            .collect()
     };
-    let (journal_for_loop, health_for_stream, scope) = {
-        let mut s = slint_replay::runtime_state::lock(slint_rt);
-        (
-            s.journal.clone(),
-            s.health.clone(),
-            s.session_request_scope(),
-        )
+    let (journal_for_loop, health_for_stream) = {
+        let s = slint_replay::runtime_state::lock(slint_rt);
+        (s.journal.clone(), s.health.clone())
     };
 
     // ===== 5. Spawn transcribe → ask (detached: never stored in ai_task, so a
@@ -297,17 +340,16 @@ pub(crate) fn fire_ptt_ask(
     let events_inner = events.clone();
     let cfg_for_task = cfg.clone();
     let slint_rt_for_task = slint_rt.clone();
-    let weak_cancelled = weak_for_title.clone();
-    let request = async move {
-        let whisper_prompt = stt::build_whisper_prompt(&trigger_keywords, &meeting_context);
-        let result = if !stt_is_local && groq_key.is_empty() {
-            Err(anyhow::anyhow!("Groq API key not set (Settings → STT)"))
+    rt_handle.spawn(async move {
+        let result = if missing_key {
+            Err(anyhow::anyhow!("Selected STT API key not set (Settings → STT)"))
         } else {
             stt::transcribe_once(
                 &stt_backend,
                 &pcm,
                 stt_language.as_deref(),
                 whisper_prompt.as_deref(),
+                local_whisper_prompt.as_deref(),
             )
             .await
         };
@@ -326,21 +368,14 @@ pub(crate) fn fire_ptt_ask(
                 return;
             }
             Err(e) => {
-                // SECURITY (review C1/nit) — a self-hosted STT backend's error
-                // can carry its endpoint URL; show a generic message (the tile
-                // is screen-shared). classify_ai_error covers timeout/refused/
-                // auth/etc. without echoing any URL.
+                // STT failures are NOT AI bridge failures. Identify the actual
+                // STT provider and HTTP category without exposing URL or key.
+                let provider = cfg_for_task.read().stt_provider.clone();
+                let safe = classify_stt_error(&provider, &format!("{e:#}"), ui_is_ru);
+                eprintln!("[overlay-host] PTT STT error: {safe}");
                 ptt_tile_error(
                     weak_for_title.clone(),
-                    &format!(
-                        "{}: {}",
-                        if ui_is_ru {
-                            "Ошибка STT"
-                        } else {
-                            "STT error"
-                        },
-                        classify_ai_error(&format!("{e:#}"))
-                    ),
+                    &format!("{}: {safe}", if ui_is_ru { "Ошибка STT" } else { "STT error" }),
                     ui_is_ru,
                 );
                 return;
@@ -349,7 +384,7 @@ pub(crate) fn fire_ptt_ask(
         let endpoint = if needs_mlx {
             let cfg_for_resolve = cfg_for_task.clone();
             match tokio::task::spawn_blocking(move || {
-                resolve_route_endpoint(AskRoute::Text, &cfg_for_resolve)
+                resolve_route_endpoint(route, &cfg_for_resolve)
             })
             .await
             {
@@ -368,6 +403,7 @@ pub(crate) fn fire_ptt_ask(
         let bearer = endpoint.bearer;
         let model = endpoint.model;
         let reasoning_effort = endpoint.reasoning_effort;
+        let service_tier = endpoint.service_tier;
         // Reflect the recognised question in the tile chrome.
         {
             let q = question.clone();
@@ -377,10 +413,7 @@ pub(crate) fn fire_ptt_ask(
                     t.set_tile_title(SharedString::from(
                         slint_replay::app_state::tile_title_line(&q),
                     ));
-                    t.set_source_label(SharedString::from(crate::tile_text::asking_label(
-                        ui_is_ru,
-                    )));
-                    t.set_plain_notice(false);
+                    t.set_source_label(SharedString::from("ai · asking…"));
                 }
             });
         }
@@ -390,13 +423,12 @@ pub(crate) fn fire_ptt_ask(
         // recognised spoken question selects the RELEVANT facts.
         let llm_context =
             overlay_backend::memory::context_for_meeting(&meeting_context, Some(&question));
-        let messages = ai::build_live_request(
+        let messages = ai::build_request(
             &llm_context,
             &response_language,
             &transcript_lines,
             None,
             Some(&question),
-            fast,
         );
         // Per-tile sink: streams this answer into THIS PTT tile and, on Done,
         // folds the turn into its conversation (for follow-ups). Carries the
@@ -460,18 +492,18 @@ pub(crate) fn fire_ptt_ask(
             overlay_backend::ai::microcents_to_usd(state.session_cost_microcents)
         });
         let t0 = std::time::Instant::now();
-        let ai_rx = ai::stream_live_chat_endpoint(
+        let ai_rx = ai::stream_chat_endpoint(
             ai::AiEndpoint {
                 protocol,
                 base_url,
                 bearer,
                 model: model.clone(),
                 reasoning_effort,
+                service_tier,
                 is_local,
             },
             messages,
             AI_STREAM_MAX_TOKENS,
-            fast,
         );
         overlay_backend::runtime::ask_stream_loop(
             sink,
@@ -487,25 +519,7 @@ pub(crate) fn fire_ptt_ask(
             cost_apply,
         )
         .await;
-    };
-    let task = rt_handle.spawn(async move {
-        if slint_replay::runtime_state::until_session_changes(scope, request)
-            .await
-            .is_none()
-        {
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(tile) = weak_cancelled.upgrade() {
-                    tile.set_source_label(SharedString::from(if ui_is_ru {
-                        "ai · прервано (сессия изменена)"
-                    } else {
-                        "ai · interrupted (session changed)"
-                    }));
-                    tile.set_followup_busy(false);
-                }
-            });
-        }
     });
-    super::register_tile_stream(tile_id, task.abort_handle());
 }
 
 #[cfg(test)]
@@ -518,7 +532,7 @@ mod tests {
             ptt_initial_copy(false),
             (
                 "Recording",
-                "STT · transcribing…",
+                "stt · transcribing…",
                 "Transcribing…",
                 "push-to-talk"
             )
@@ -527,10 +541,29 @@ mod tests {
             ptt_initial_copy(true),
             (
                 "Запись",
-                "STT · распознаю…",
+                "stt · расшифровка…",
                 "Расшифровка…",
                 "голосовой запрос"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod stt_diagnostic_tests {
+    use super::classify_stt_error;
+
+    #[test]
+    fn stt_401_is_not_an_ai_bridge_failure() {
+        let s = classify_stt_error("elevenlabs", "STT HTTP 401 Unauthorized", true);
+        assert!(s.contains("ElevenLabs"));
+        assert!(s.contains("401"));
+        assert!(!s.contains("AI bridge"));
+    }
+
+    #[test]
+    fn raw_endpoint_details_do_not_leak_to_tile() {
+        let raw = "POST https://secret.internal:8111/hi?token=EXPOSEME error";
+        assert!(!classify_stt_error("whisper", raw, true).contains("EXPOSEME"));
     }
 }

@@ -49,25 +49,28 @@ pub(crate) fn tts_test_status(accepted: bool, ru: bool) -> &'static str {
     }
 }
 
-/// Localized one-line model status for the Tera section.
+/// Localized one-line model status for the Tera section (ASCII markers only —
+/// no tofu glyphs).
 pub(crate) fn tera_status_line(
     state: overlay_backend::teratts_install::TeraInstalled,
     ru: bool,
 ) -> String {
     use overlay_backend::teratts_install::TeraInstalled;
     match (state, ru) {
-        (TeraInstalled::Ready, true) => "Голосовая модель установлена".into(),
-        (TeraInstalled::Ready, false) => "Voice model installed".into(),
+        (TeraInstalled::Ready, true) => "[ок] Модель TeraTTSv2 установлена и готова".into(),
+        (TeraInstalled::Ready, false) => "[ok] TeraTTSv2 model installed and ready".into(),
         (TeraInstalled::Missing, true) => {
-            "Модель не установлена — нажмите «Установить модель» (~370 МБ)".into()
+            "[--] Модель не установлена — нажмите «Установить модель» (~370 МБ)".into()
         }
         (TeraInstalled::Missing, false) => {
-            "Model not installed — use Install model (~370 MB)".into()
+            "[--] Model not installed — use Install model (~370 MB)".into()
         }
         (TeraInstalled::Broken, true) => {
-            "Установка повреждена — отмените и установите заново".into()
+            "[!] Установка повреждена — отмените и установите заново".into()
         }
-        (TeraInstalled::Broken, false) => "Installation broken — cancel and install again".into(),
+        (TeraInstalled::Broken, false) => {
+            "[!] Installation broken — cancel and install again".into()
+        }
     }
 }
 
@@ -435,7 +438,8 @@ mod tests {
         assert_eq!(tera_engine_label(true), "Tera (экспериментально)");
         assert_eq!(tera_engine_label(false), "Tera (experimental)");
         assert_eq!(tera_voice_label("ru_f1"), "Tera ru_f1");
-        // Plain localized status, without markers or screen-shared URLs.
+        // Status lines: localized, ASCII markers only (no tofu glyphs), no
+        // paths/urls (screen-shareable).
         use overlay_backend::teratts_install::TeraInstalled;
         for state in [
             TeraInstalled::Ready,
@@ -446,17 +450,11 @@ mod tests {
                 let line = tera_status_line(state, ru);
                 assert!(!line.is_empty());
                 assert!(!line.contains("http"), "{line}");
-                assert!(!line.starts_with('['), "{line}");
+                assert!(line.starts_with('['), "{line}");
             }
         }
-        assert_eq!(
-            tera_status_line(TeraInstalled::Ready, true),
-            "Голосовая модель установлена"
-        );
-        assert_eq!(
-            tera_status_line(TeraInstalled::Ready, false),
-            "Voice model installed"
-        );
+        assert!(tera_status_line(TeraInstalled::Ready, true).contains("установлена"));
+        assert!(tera_status_line(TeraInstalled::Ready, false).contains("installed"));
     }
 
     #[test]

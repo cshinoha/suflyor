@@ -47,32 +47,48 @@
 mod settings_mlx {
     include!("settings_mlx.rs");
 }
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 #[path = "settings_audio.rs"]
 mod settings_audio;
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 use super::open_wizard;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 use super::wire_local_ai;
-#[cfg(any(windows, target_os = "linux"))]
-use super::wire_strata;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 use super::wire_updates;
 use super::{
     active_stack_label, ai, apply_bar_stealth, apply_scheme_bar, apply_scheme_settings, audio,
-    clamp_scheme, cloud_model_index, config, drag_begin, drag_update, fetch_models,
-    global_stealth_effective, grab_hwnd, invalidate_codex_snapshot_ui, make_transparent_tile,
-    parse_tile_monitor_pin, populate_diagnostics, present_window_stealth_aware,
-    preset_for_tts_rate, refresh_codex_account_status, refresh_local_context_controls,
-    refresh_local_engine_controls, refresh_local_model_resource_warning, set_always_on_top,
-    set_global_scheme, set_global_stealth, set_global_tile_monitor, set_global_tile_opacity,
-    spawn_ptt_watchdog, stt, stt_provider_index, try_acquire_mic, ui, wire_ai_settings,
-    wire_diagnostics, wire_import_export, wire_memory, wire_stt_settings, wire_vision_settings,
-    wire_voice_settings, Arc, AtomicBool, ComponentHandle, ComponentRow, ModelRc, ModelTarget,
-    Ordering, OverlayBarWindow, Rc, RefCell, SettingsWindow, SharedString, TileWindows, VecModel,
-    WindowRegistry,
+    apply_tile_hwnd_with_monitor, clamp_scheme, cloud_model_index, config, drag_begin, drag_update,
+    fetch_models, global_stealth_effective, global_tile_opacity, grab_hwnd, hotkey_bindings_valid,
+    invalidate_codex_snapshot_ui, make_transparent_tile, parse_tile_monitor_pin, populate_diagnostics,
+    present_tile_window, present_window_stealth_aware, preset_for_tts_rate,
+    refresh_codex_account_status, refresh_local_context_controls, refresh_local_model_resource_warning,
+    set_always_on_top, set_global_scheme, set_global_stealth, set_global_tile_anchor, set_global_tile_reading_mode,
+    set_global_tile_monitor, set_global_tile_opacity, set_global_tile_text_preferences,
+    set_global_tile_zone,
+    apply_global_tile_text_preferences, spawn_ptt_watchdog, stt,
+    stt_provider_index,
+    try_acquire_mic, ui, wire_ai_settings, wire_diagnostics, wire_import_export, wire_memory,
+    wire_stt_settings, wire_vision_settings, wire_voice_settings, Arc, AtomicBool, ComponentHandle,
+    CaptureOverlay, ComponentRow, ModelRc, ModelTarget, Ordering, OverlayBarWindow, Rc, RefCell, SettingsWindow,
+    SharedString, TileWindows, VecModel, WindowRegistry,
 };
+
+// Display exactly the text constructed by the same function used for live STT.
+// Refresh on open and provider-template saves; editors keep drafts off the UI
+// state until the user explicitly saves them.
+const GROQ_DEFAULT_TEMPLATE_VIEW: &str =
+    "Технический разговор о DevOps и SRE. Англоязычные термины пишутся латиницей: [CANONICAL_TECH_VOCAB]. Дополнительно: [trigger_keywords]. Контекст: [meeting_context]";
+
+fn refresh_groq_prompt_preview(win: &SettingsWindow, c: &config::Config) {
+    win.set_stt_groq_prompt_mode_index(c.stt_groq_prompt_mode.clamp(0, 2));
+    // Show the *source template*, not its expanded/resolved STT prompt.
+    win.set_stt_groq_original_prompt_preview(SharedString::from(GROQ_DEFAULT_TEMPLATE_VIEW));
+    win.set_stt_groq_prompt_template_input(SharedString::from(
+        c.stt_groq_prompt_template.as_str(),
+    ));
+}
 
 pub(crate) fn ai_provider_index(provider: &str, is_macos: bool) -> i32 {
     match (provider, is_macos) {
@@ -86,19 +102,22 @@ pub(crate) fn ai_provider_index(provider: &str, is_macos: bool) -> i32 {
     }
 }
 
-pub(crate) fn save_tile_idle_seconds(
-    cfg: &overlay_backend::config::SharedConfig,
-    seconds: i32,
-) -> i32 {
-    let seconds = seconds.clamp(0, 600) as u32;
-    let mut c = cfg.write();
-    let previous = c.omarchy_tile_idle_seconds;
-    c.omarchy_tile_idle_seconds = seconds;
-    if let Err(error) = config::save(&c) {
-        c.omarchy_tile_idle_seconds = previous;
-        eprintln!("[overlay-host] tile inactivity setting save failed: {error:#}");
+fn tile_anchor_index(anchor: &str) -> i32 {
+    match anchor {
+        "top_left" => 1,
+        "bottom_right" => 2,
+        "bottom_left" => 3,
+        _ => 0,
     }
-    c.omarchy_tile_idle_seconds.min(600) as i32
+}
+
+fn tile_anchor_id(index: i32) -> &'static str {
+    match index {
+        1 => "top_left",
+        2 => "bottom_right",
+        3 => "bottom_left",
+        _ => "top_right",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -113,6 +132,7 @@ pub(crate) fn open_settings(
     // wizard / 🆘 help / recover-offer included), and the nested "Run setup
     // wizard" button forwards the same registry to `open_wizard`.
     registry: &WindowRegistry,
+    capture_overlay: &Rc<RefCell<Option<CaptureOverlay>>>,
 ) {
     // Light up the bar's ⚙ chip while Settings is open (user: "значок
     // настроек не загорается когда настройки открыты"). Cleared in the
@@ -125,7 +145,7 @@ pub(crate) fn open_settings(
         // Refresh token status + profiles — config might have changed since last open.
         reset_component_install_state(existing);
         populate_token_status(existing, cfg);
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(windows)]
         settings_audio::refresh(existing, cfg);
         {
             let snap = cfg.read();
@@ -139,18 +159,12 @@ pub(crate) fn open_settings(
         populate_diagnostics(existing, cfg);
         {
             let snap = cfg.read();
+            existing.set_tile_reading_mode(snap.tile_reading_mode);
             refresh_profiles(existing, &snap);
             populate_component_rows(existing, &snap);
         }
-        // Wayland hide recreates the native surface. Reapply its exclusion;
-        // other platforms only need a retry when an early close left it parked.
-        let position = existing.window().position();
-        if cfg!(target_os = "linux") || position.x <= -30000 || position.y <= -30000 {
-            present_window_stealth_aware(existing, |hwnd| {
-                let _ = make_transparent_tile(hwnd);
-                let _ = slint_replay::win32::set_skip_taskbar(hwnd, true);
-            });
-            return;
+        if matches!(cfg.read().stt_provider.as_str(), "speechmatics" | "elevenlabs" | "deepgram") {
+            super::settings_stt::refresh_active_stt_models(existing, cfg);
         }
         let _ = existing.show();
         // The F8 / capture-chip flow hides EVERY app window via Win32 SW_HIDE
@@ -173,8 +187,6 @@ pub(crate) fn open_settings(
     };
     win.global::<ui::Platform>()
         .set_is_macos(cfg!(target_os = "macos"));
-    win.global::<ui::Platform>()
-        .set_is_linux(cfg!(target_os = "linux"));
     reset_component_install_state(&win);
     {
         let st = state.lock().ok();
@@ -205,9 +217,16 @@ pub(crate) fn open_settings(
         win.set_coaching_live_tiles(snap.live_coaching_tiles_enabled);
         win.set_record_audio(snap.record_audio_enabled);
         win.set_auto_tiles_enabled(snap.auto_tiles_enabled);
-        win.set_fast_answers(snap.ai_fast_answers);
         win.set_suppress_tiles(snap.suppress_tiles);
         win.set_trigger_keywords_input(SharedString::from(snap.trigger_keywords.as_str()));
+        win.set_stt_tech_vocab_input(SharedString::from(snap.stt_tech_vocab.as_str()));
+        win.set_stt_groq_prompt_template_input(SharedString::from(snap.stt_groq_prompt_template.as_str()));
+        refresh_groq_prompt_preview(&win, &snap);
+        win.set_network_proxy_mode_index(snap.network_proxy_mode.clamp(0, 4));
+        win.set_network_proxy_url_input(SharedString::from(snap.network_proxy_url.as_str()));
+        win.set_stt_whisper_prompt_template_input(SharedString::from(snap.stt_whisper_prompt_template.as_str()));
+        win.set_stt_elevenlabs_keyterms_enabled(snap.stt_elevenlabs_keyterms_enabled);
+        win.set_stt_elevenlabs_keyterms_template_input(SharedString::from(snap.stt_elevenlabs_keyterms_template.as_str()));
         // v0.15.0 — seed the storage/retention controls. Days wins the display
         // when both bounds are set (hand-edited config); saving from the UI
         // then keeps exactly one bound active.
@@ -228,18 +247,6 @@ pub(crate) fn open_settings(
         // Onboarding «Компоненты» — readiness rows, refreshed on EVERY open
         // (see populate_component_rows; also called on the reused-window path).
         populate_component_rows(&win, &snap);
-    }
-    // Choices made in other tabs change what the hub reports; rebuild its rows
-    // whenever it is shown, unless an inline install is updating them.
-    {
-        let weak = win.as_weak();
-        let cfg_tab = cfg.clone();
-        win.on_tab_selected(move |idx| {
-            let Some(w) = weak.upgrade() else { return };
-            if idx == 15 && w.get_component_busy_index() == -1 {
-                populate_component_rows(&w, &cfg_tab.read());
-            }
-        });
     }
 
     // Onboarding «Компоненты» — inline install for the LIGHT, single-call
@@ -340,11 +347,11 @@ pub(crate) fn open_settings(
         });
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(windows)]
     settings_audio::wire(&win, cfg);
 
     // Preserve the existing macOS microphone settings behavior.
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(windows))]
     {
         // V0.8.4 — WASAPI device enumeration (cold COM + a per-endpoint
         // friendly-name RPC to the audio service) was ~30-300ms of SYNCHRONOUS
@@ -381,7 +388,7 @@ pub(crate) fn open_settings(
             });
         });
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(windows))]
     {
         let cfg_c = cfg.clone();
         win.on_mic_device_selected(move |name| {
@@ -395,9 +402,8 @@ pub(crate) fn open_settings(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_mic_test_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else { return };
-            w.set_mic_test_result(SharedString::from(if ru { "Запись 3 с…" } else { "Recording for 3s…" }));
+            w.set_mic_test_result(SharedString::from("recording 3s…"));
             let device = cfg_c.read().mic_device.clone();
             let weak_for_result = w.as_weak();
             // Blocking WASAPI record off the UI thread; post result back.
@@ -407,12 +413,12 @@ pub(crate) fn open_settings(
                 // both). Report busy instead of recording.
                 let mic_guard = try_acquire_mic();
                 let msg = if mic_guard.is_none() {
-                    if ru { "Микрофон занят — завершите голосовой ввод и повторите" } else { "Microphone busy — finish voice input and retry" }.to_string()
+                    "[!] mic busy — close PTT / dictation and retry".to_string()
                 } else {
                     let result = overlay_backend::audio::record_mic_blocking(3000, device);
                     drop(mic_guard); // release before processing (RAII: also on panic)
                     match result {
-                        Ok(samples) if samples.is_empty() => if ru { "Звук не записан" } else { "No audio captured" }.to_string(),
+                        Ok(samples) if samples.is_empty() => "no audio captured".to_string(),
                         Ok(samples) => {
                             // RMS energy + a -45 dBFS speech threshold (silent room
                             // is < -55 dBFS). Shared helper with the diagnostics tab
@@ -420,11 +426,11 @@ pub(crate) fn open_settings(
                             // was the old peak==0 check passing on any tiny noise.
                             let dbfs = overlay_backend::audio::rms_dbfs(&samples);
                             if dbfs < -45.0 {
-                                if ru { format!("Слишком тихо ({dbfs:.0} dBFS) — скажите что-нибудь или проверьте микрофон"
-                                ) } else { format!("Too quiet ({dbfs:.0} dBFS) — speak or check the microphone"
-                                ) }
+                                format!(
+                                    "[!] too quiet ({dbfs:.0} dBFS) — say something / check mic"
+                                )
                             } else {
-                                if ru { format!("Голос слышен ({dbfs:.0} dBFS RMS)") } else { format!("Heard you ({dbfs:.0} dBFS RMS)") }
+                                format!("[ok] heard you ({dbfs:.0} dBFS RMS)")
                             }
                         }
                         Err(e) => format!("error: {e}"),
@@ -485,7 +491,7 @@ pub(crate) fn open_settings(
         } else {
             false
         };
-        // I1 — the tab status line shows the EFFECTIVE state ("Capture hiding
+        // I1 — the tab status line shows the EFFECTIVE state ("[!] stealth
         // unavailable" on a failed exclusion), never the intent alone. The
         // Slint `@tr` ternary combines this flag with the toggle intent.
         if let Some(w) = weak_stealth_status.upgrade() {
@@ -497,7 +503,7 @@ pub(crate) fn open_settings(
 
     // V0.8.4 — Windows Settings → Interface setup wizard button. Re-opens the
     // guided first-run wizard on demand (it is also auto-shown on first launch).
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(windows)]
     {
         // The wizard slot lives in the registry; forward the same registry so the
         // wizard's stealth toggle reaches every open window (Phase 1 §5.1).
@@ -512,42 +518,18 @@ pub(crate) fn open_settings(
         });
     }
 
-    {
-        let cfg = cfg.clone();
-        let weak = win.as_weak();
-        win.on_backup_status_requested(move || {
-            if let Some(win) = weak.upgrade() {
-                populate_backup_status(&win, &cfg.read());
-            }
-        });
-    }
-
-    // Use the same palette and shared state as F4.
-    {
-        let palette = registry.palette.clone();
-        let tiles = tiles_ref.clone();
-        let state = state.clone();
-        let overlay = overlay_weak.clone();
-        win.on_kb_open_clicked(move || {
-            super::open_palette(&palette, &tiles, &state, &overlay);
-        });
-    }
-
     // ===== AI: cloud bridge + local server (provider switch, token/url/model
     // saves, dropdown refresh, prompt-cache toggle, bridge + local tests) =====
     // Extracted to settings_ai.rs (P1 domain split) — wired verbatim there
     // (`ModelTarget` + `fetch_models` moved with it). The install/updater
     // closures below stay in open_settings (separate later wave).
     wire_ai_settings(&win, cfg, overlay_weak);
-    super::settings_model_speed::wire(&win, cfg, state);
     settings_mlx::wire(&win, cfg);
     crate::settings_hermes::wire_hermes_settings(&win, cfg);
 
     // ===== V4 — vision (screenshot) channel: provider switch + field saves + test =====
     // Extracted to settings_vision.rs (P1 domain split) — wired verbatim there.
     wire_vision_settings(&win, cfg);
-    #[cfg(any(windows, target_os = "linux"))]
-    super::settings_strata_vision::wire(&win, cfg, state);
 
     // ===== Read-aloud (Озвучка): voice chooser + speed preset + test =====
     wire_voice_settings(&win, cfg);
@@ -556,35 +538,117 @@ pub(crate) fn open_settings(
     // Extracted to settings_local_ai.rs (P1 domain split) — wired verbatim there.
     // SECURITY: download -> verify -> spawn stays in overlay_backend::local_ai;
     // this only CALLs install(); the sequence is byte-for-byte unchanged.
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(windows)]
     wire_local_ai(&win, cfg, state, overlay_weak);
-    #[cfg(any(windows, target_os = "linux"))]
-    wire_strata(&win, cfg, state, overlay_weak);
 
-    // Phase E6 v20 — tile opacity slider. Persists to config AND
-    // applies to all currently-visible tiles via tiles_ref.
+    // Compact layout for ALL tiles, applied immediately to existing windows.
+    // New tiles inherit this value through apply_tile_hwnd_with_monitor().
+    {
+        let cfg_r = cfg.clone();
+        let tiles_r = tiles_ref.clone();
+        win.on_tile_reading_mode_changed(move |enabled| {
+            set_global_tile_reading_mode(enabled);
+            for tile in tiles_r.borrow().iter() {
+                tile.set_reading_mode(enabled);
+            }
+            let mut c = cfg_r.write();
+            c.tile_reading_mode = enabled;
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] tile reading mode save failed: {e:#}");
+            }
+            eprintln!("[overlay-host] tile reading mode (all tiles) -> {enabled}");
+        });
+    }
+
+    // Keep memory-star visibility and each font category process-global and persisted.
+    {
+        let cfg_stars = cfg.clone();
+        let tiles_stars = tiles_ref.clone();
+        win.on_tile_memory_stars_changed(move |enabled| {
+            let mut c = cfg_stars.write();
+            c.tile_memory_stars = enabled;
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] memory star preference save failed: {e:#}");
+                return;
+            }
+            set_global_tile_text_preferences(
+                [c.tile_font_body, c.tile_font_heading, c.tile_font_subheading,
+                 c.tile_font_code, c.tile_font_table, c.tile_font_alert], enabled,
+            );
+            for tile in tiles_stars.borrow().iter() {
+                apply_global_tile_text_preferences(tile);
+            }
+        });
+    }
+    {
+        let cfg_fonts = cfg.clone();
+        let tiles_fonts = tiles_ref.clone();
+        let weak_fonts = win.as_weak();
+        win.on_tile_font_sizes_save(move || {
+            let Some(w) = weak_fonts.upgrade() else { return };
+            let texts = [
+                w.get_tile_font_body(), w.get_tile_font_heading(),
+                w.get_tile_font_subheading(), w.get_tile_font_code(),
+                w.get_tile_font_table(), w.get_tile_font_alert(),
+            ];
+            let mut sizes = [0_i32; 6];
+            for (index, text) in texts.iter().enumerate() {
+                let Ok(value) = text.trim().parse::<i32>() else { return };
+                if !(9..=32).contains(&value) { return; }
+                sizes[index] = value;
+            }
+            let mut c = cfg_fonts.write();
+            c.tile_font_body = sizes[0];
+            c.tile_font_heading = sizes[1];
+            c.tile_font_subheading = sizes[2];
+            c.tile_font_code = sizes[3];
+            c.tile_font_table = sizes[4];
+            c.tile_font_alert = sizes[5];
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] tile font preference save failed: {e:#}");
+                return;
+            }
+            set_global_tile_text_preferences(sizes, c.tile_memory_stars);
+            for tile in tiles_fonts.borrow().iter() {
+                apply_global_tile_text_preferences(tile);
+            }
+        });
+    }
+
+    // Tile transparency presets: 0 = opaque, 1 = 70% transparent background,
+    // 2 = hidden. Unlike the old Slider/opacity implementation, only the tile
+    // background becomes translucent; text and controls remain fully opaque.
     {
         let cfg_c = cfg.clone();
         let tiles_c = tiles_ref.clone();
-        win.on_tile_body_opacity_changed(move |new_value| {
-            let clamped = new_value.clamp(0.5, 1.0);
+        win.on_tile_visibility_changed(move |index| {
+            let opacity = match index {
+                1 => 0.30,
+                2 => 0.0,
+                _ => 1.0,
+            };
             {
                 let mut c = cfg_c.write();
-                c.tile_body_opacity = clamped;
+                c.tile_body_opacity = opacity;
                 if let Err(e) = overlay_backend::config::save(&c) {
-                    eprintln!("[overlay-host] tile_body_opacity save failed: {e:#}");
+                    eprintln!("[overlay-host] tile transparency save failed: {e:#}");
                     return;
                 }
             }
-            // Phase E6 v36 — update the process-global so EVERY future
-            // tile (F9 / F3 / KB-palette / auto-spawn) spawns at this
-            // opacity, not just the ones currently on screen.
-            set_global_tile_opacity(clamped);
-            // Apply live to all currently-visible tiles.
+            let was_hidden = global_tile_opacity() <= f32::EPSILON;
+            set_global_tile_opacity(opacity);
             for tile in tiles_c.borrow().iter() {
-                tile.set_body_opacity(clamped);
+                tile.set_body_opacity(opacity);
+                if opacity <= f32::EPSILON {
+                    let _ = tile.hide();
+                } else if was_hidden {
+                    // A tile created while Hidden was selected has no realized
+                    // HWND yet; run the normal presentation/placement path now.
+                    present_tile_window(tile);
+                    apply_tile_hwnd_with_monitor(tile);
+                }
             }
-            eprintln!("[overlay-host] tile_body_opacity -> {clamped:.2}");
+            eprintln!("[overlay-host] tile transparency preset -> {index} ({opacity:.2})");
         });
     }
 
@@ -617,6 +681,286 @@ pub(crate) fn open_settings(
         });
     }
 
+    // Full-screen selection on the REAL chosen monitor. Reuse the existing F8
+    // CaptureOverlay (frozen desktop and pointer selection), but install a
+    // different callback: selected pixels configure tile placement, NEVER Vision.
+    // The overlay is pre-created/pre-stealthed in main; do not create new Skia
+    // or DirectComposition windows here.
+    {
+        let cfg_zone = cfg.clone();
+        let weak_settings = win.as_weak();
+        let capture = capture_overlay.clone();
+        win.on_tile_zone_select_screen(move || {
+            let Some(settings) = weak_settings.upgrade() else { return };
+            let monitors = slint_replay::win32::enum_monitors();
+            let pin = cfg_zone.read().tile_monitor_name.as_deref().and_then(parse_tile_monitor_pin);
+            let chosen = pin
+                .and_then(|(l, t)| monitors.iter().find(|m| m.left == l && m.top == t).copied())
+                .or_else(|| slint_replay::win32::pick_monitor(&monitors));
+            let Some(monitor) = chosen else {
+                settings.set_tile_zone_status(SharedString::from("No connected monitor"));
+                return;
+            };
+            if capture.borrow().as_ref().map_or(true, |overlay| overlay.get_shown()) {
+                settings.set_tile_zone_status(SharedString::from("Selection overlay unavailable or busy"));
+                return;
+            }
+            // Capture WITHOUT Suflyor tiles/settings in the frame, just as F8
+            // does, then crop it to the requested monitor (which may be at x<0).
+            let hidden = slint_replay::win32::hide_own_windows();
+            let screenshot = slint_replay::capture::capture_virtual_desktop();
+            slint_replay::win32::show_windows(&hidden);
+            let (desktop, vx, vy) = match screenshot {
+                Ok(value) => value,
+                Err(error) => {
+                    settings.set_tile_zone_status(SharedString::from(format!("Screen capture failed: {error}")));
+                    return;
+                }
+            };
+            let (mx, my) = (monitor.left.saturating_sub(vx), monitor.top.saturating_sub(vy));
+            let (mw, mh) = (monitor.width(), monitor.height());
+            if mx < 0 || my < 0 || mw < 1 || mh < 1 ||
+                i64::from(mx) + i64::from(mw) > i64::from(desktop.width) ||
+                i64::from(my) + i64::from(mh) > i64::from(desktop.height) {
+                settings.set_tile_zone_status(SharedString::from("Monitor is outside screenshot bounds"));
+                return;
+            }
+            let frame = slint_replay::capture::crop_bgra(&desktop, mx as u32, my as u32, mw as u32, mh as u32);
+            let pick = capture.borrow();
+            let Some(overlay) = pick.as_ref() else { return };
+            settings.set_tile_zone_status(SharedString::from("Drag on the monitor; Esc cancels"));
+            overlay.set_frozen(super::vision_capture::bgra_to_slint_image(&frame.bgra, frame.width, frame.height));
+            overlay.set_dragging(false);
+            overlay.set_translate_mode(false);
+            overlay.set_practice_mode(false);
+            overlay.window().set_size(slint::PhysicalSize::new(mw as u32, mh as u32));
+            overlay.window().set_position(slint::PhysicalPosition::new(monitor.left, monitor.top));
+            let scale = overlay.window().scale_factor().max(0.1);
+            let picker_weak = overlay.as_weak();
+            let settings_done = weak_settings.clone();
+            let cfg_done = cfg_zone.clone();
+            overlay.on_region_selected(move |x1, y1, x2, y2| {
+                if let Some(picker) = picker_weak.upgrade() {
+                    picker.set_shown(false);
+                    let _ = picker.hide();
+                    picker.set_frozen(slint::Image::default());
+                }
+                let Some(settings) = settings_done.upgrade() else { return };
+                // Slint selection coordinates are LOGICAL px; DXGI monitors
+                // and enum_monitors() use PHYSICAL px. Match the F8 scaling.
+                let to_pixel = |v: f32, limit: i32| {
+                    ((v * scale).round() as i32).clamp(0, limit)
+                };
+                let (ax, ay) = (to_pixel(x1, mw), to_pixel(y1, mh));
+                let (bx, by) = (to_pixel(x2, mw), to_pixel(y2, mh));
+                let [left, top, right, bottom] = [ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)];
+                if right - left < super::TILE_DEFAULT_W + 16 ||
+                    bottom - top < super::TILE_DEFAULT_H + 16 {
+                    settings.set_tile_zone_status(SharedString::from("Area too small for one tile"));
+                    show_tile_zone_settings(&settings);
+                    return;
+                }
+                let scale_axis = |p: i32, size: i32| -> u16 {
+                    ((i64::from(p) * 1000 + i64::from(size) / 2) / i64::from(size)) as u16
+                };
+                let (l, t) = (scale_axis(left, mw), scale_axis(top, mh));
+                let (r, b) = (scale_axis(right, mw), scale_axis(bottom, mh));
+                let zone = [l, t, r - l, b - t];
+                set_global_tile_monitor(Some((monitor.left, monitor.top)));
+                set_global_tile_zone(Some(zone));
+                super::tile_window::TILE_SLOT_COUNTER.store(0, Ordering::Relaxed);
+                {
+                    let mut c = cfg_done.write();
+                    c.tile_monitor_name = Some(format!("{},{}", monitor.left, monitor.top));
+                    c.tile_zone = Some(zone);
+                    if let Err(e) = overlay_backend::config::save(&c) {
+                        eprintln!("[overlay-host] tile zone screen selection save failed: {e:#}");
+                    }
+                }
+                if let Some(idx) = slint_replay::win32::enum_monitors().iter()
+                    .position(|m| m.left == monitor.left && m.top == monitor.top) {
+                    settings.set_tile_monitor_index((idx + 1) as i32);
+                }
+                set_tile_zone_preview(&settings, Some(zone));
+                show_tile_zone_settings(&settings);
+            });
+            let picker_weak = overlay.as_weak();
+            let settings_cancel = weak_settings.clone();
+            overlay.on_cancelled(move || {
+                if let Some(picker) = picker_weak.upgrade() {
+                    picker.set_shown(false);
+                    let _ = picker.hide();
+                    picker.set_frozen(slint::Image::default());
+                }
+                if let Some(settings) = settings_cancel.upgrade() {
+                    settings.set_tile_zone_status(SharedString::from("Selection cancelled"));
+                    show_tile_zone_settings(&settings);
+                }
+            });
+            let _ = settings.hide();
+            if let Err(error) = overlay.show() {
+                settings.set_tile_zone_status(SharedString::from(format!("Selector failed: {error}")));
+                show_tile_zone_settings(&settings);
+                return;
+            }
+            overlay.set_shown(true);
+            if let Ok(hwnd) = grab_hwnd(overlay.window()) {
+                let _ = slint_replay::win32::set_skip_taskbar(hwnd, true);
+                let _ = set_always_on_top(hwnd, true);
+                let _ = slint_replay::win32::set_stealth(hwnd, true);
+                slint_replay::win32::focus_window(hwnd);
+            }
+        });
+    }
+    {
+        let cfg_zone = cfg.clone();
+        let weak = win.as_weak();
+        win.on_tile_zone_reset(move || {
+            set_global_tile_zone(None);
+            super::tile_window::TILE_SLOT_COUNTER.store(0, Ordering::Relaxed);
+            let mut c = cfg_zone.write();
+            c.tile_zone = None;
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] tile_zone reset save failed: {e:#}");
+            }
+            if let Some(win) = weak.upgrade() {
+                set_tile_zone_preview(&win, None);
+            }
+        });
+    }
+
+    // Tile anchor (corner) — applies immediately to future tiles and persists.
+    {
+        let cfg_a = cfg.clone();
+        win.on_tile_anchor_changed(move |idx| {
+            let anchor = tile_anchor_id(idx);
+            set_global_tile_anchor(anchor);
+            super::tile_window::TILE_SLOT_COUNTER.store(
+                0,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let mut c = cfg_a.write();
+            c.tile_anchor = anchor.to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] tile_anchor save failed: {e:#}");
+            }
+        });
+    }
+
+    // Maximum simultaneously open tiles. Valid edits apply immediately; the
+    // spawn loop reads this config value on every new tile.
+    {
+        let cfg_limit = cfg.clone();
+        win.on_tile_max_live_changed(move |value| {
+            let Ok(parsed) = value.trim().parse::<usize>() else {
+                return;
+            };
+            let limit = parsed.clamp(1, 64);
+            let mut c = cfg_limit.write();
+            if c.max_live_tiles == limit {
+                return;
+            }
+            c.max_live_tiles = limit;
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] max_live_tiles save failed: {e:#}");
+            }
+        });
+    }
+
+    // User-editable hotkeys. Registration is intentionally a startup-only
+    // operation; save validates syntax + duplicate physical bindings, then the
+    // next launch registers the new set atomically.
+    {
+        let cfg_hotkeys = cfg.clone();
+        let weak_hotkeys = win.as_weak();
+        win.on_hotkeys_save_clicked(move || {
+            let Some(window) = weak_hotkeys.upgrade() else {
+                return;
+            };
+            let candidate = overlay_backend::config::HotkeyBindings {
+                help: window.get_hotkey_help().trim().to_string(),
+                reask: window.get_hotkey_reask().trim().to_string(),
+                knowledge: window.get_hotkey_knowledge().trim().to_string(),
+                new_tile: window.get_hotkey_new_tile().trim().to_string(),
+                close_all_tiles: window.get_hotkey_close_all().trim().to_string(),
+                archive: window.get_hotkey_archive().trim().to_string(),
+                vision: window.get_hotkey_vision().trim().to_string(),
+                vision_translate: window.get_hotkey_vision_translate().trim().to_string(),
+                vision_ocr: window.get_hotkey_vision_ocr().trim().to_string(),
+                ask: window.get_hotkey_ask().trim().to_string(),
+                ask_deep: window.get_hotkey_ask_deep().trim().to_string(),
+                read_selected: window.get_hotkey_read_selected().trim().to_string(),
+                read_ocr: window.get_hotkey_read_ocr().trim().to_string(),
+                read_pause: window.get_hotkey_read_pause().trim().to_string(),
+            };
+            let is_ru = cfg_hotkeys.read().ui_is_ru();
+            if !hotkey_bindings_valid(&candidate) {
+                window.set_hotkeys_save_status(SharedString::from(if is_ru {
+                    "Ошибка: неверная или повторяющаяся комбинация"
+                } else {
+                    "Error: invalid or duplicate binding"
+                }));
+                return;
+            }
+            {
+                let mut c = cfg_hotkeys.write();
+                c.hotkeys = candidate;
+                if let Err(e) = overlay_backend::config::save(&c) {
+                    eprintln!("[overlay-host] hotkeys save failed: {e:#}");
+                    window.set_hotkeys_save_status(SharedString::from(if is_ru {
+                        "Ошибка сохранения"
+                    } else {
+                        "Save failed"
+                    }));
+                    return;
+                }
+            }
+            window.set_hotkeys_save_status(SharedString::from(if is_ru {
+                "Сохранено — перезапустите Suflyor"
+            } else {
+                "Saved — restart Suflyor"
+            }));
+        });
+    }
+    {
+        let cfg_hotkeys = cfg.clone();
+        let weak_hotkeys = win.as_weak();
+        win.on_hotkeys_reset_clicked(move || {
+            let Some(window) = weak_hotkeys.upgrade() else {
+                return;
+            };
+            let defaults = overlay_backend::config::HotkeyBindings::default();
+            window.set_hotkey_help(SharedString::from(defaults.help.clone()));
+            window.set_hotkey_reask(SharedString::from(defaults.reask.clone()));
+            window.set_hotkey_knowledge(SharedString::from(defaults.knowledge.clone()));
+            window.set_hotkey_new_tile(SharedString::from(defaults.new_tile.clone()));
+            window.set_hotkey_close_all(SharedString::from(defaults.close_all_tiles.clone()));
+            window.set_hotkey_archive(SharedString::from(defaults.archive.clone()));
+            window.set_hotkey_vision(SharedString::from(defaults.vision.clone()));
+            window.set_hotkey_vision_translate(SharedString::from(defaults.vision_translate.clone()));
+            window.set_hotkey_vision_ocr(SharedString::from(defaults.vision_ocr.clone()));
+            window.set_hotkey_ask(SharedString::from(defaults.ask.clone()));
+            window.set_hotkey_ask_deep(SharedString::from(defaults.ask_deep.clone()));
+            window.set_hotkey_read_selected(SharedString::from(defaults.read_selected.clone()));
+            window.set_hotkey_read_ocr(SharedString::from(defaults.read_ocr.clone()));
+            window.set_hotkey_read_pause(SharedString::from(defaults.read_pause.clone()));
+            let is_ru = cfg_hotkeys.read().ui_is_ru();
+            {
+                let mut c = cfg_hotkeys.write();
+                c.hotkeys = defaults;
+                if let Err(e) = overlay_backend::config::save(&c) {
+                    eprintln!("[overlay-host] hotkeys reset save failed: {e:#}");
+                    return;
+                }
+            }
+            window.set_hotkeys_save_status(SharedString::from(if is_ru {
+                "Сброшено — перезапустите Suflyor"
+            } else {
+                "Reset — restart Suflyor"
+            }));
+        });
+    }
+
     // Phase E6 v38 — interface-language switch. Selecting Русский/English
     // in the Interface tab switches the bundled translation LIVE (Slint
     // re-evaluates every @tr() binding) and persists ui_language so the
@@ -633,8 +977,6 @@ pub(crate) fn open_settings(
                 Ok(()) => eprintln!("[overlay-host] UI language -> {lang}"),
                 Err(e) => eprintln!("[overlay-host] language {lang} not available: {e}"),
             }
-            #[cfg(feature = "remote-ui")]
-            slint_replay::remote_ui::set_locale(lang);
             {
                 let mut c = cfg_lang.write();
                 c.ui_language = lang.to_string();
@@ -653,22 +995,7 @@ pub(crate) fn open_settings(
                 populate_tile_monitors(&w, &snap);
                 populate_component_rows(&w, &snap);
                 populate_tts_voices(&w, &snap);
-                w.set_diag_summary(SharedString::from(
-                    super::diagnostics::settings_readiness_summary(&snap),
-                ));
-                let [ai, groq, openai, anthropic] = key_presence_statuses(&snap);
-                w.set_ai_bearer_status(SharedString::from(ai));
-                w.set_groq_api_key_status(SharedString::from(groq));
-                w.set_openai_key_status(SharedString::from(openai));
-                w.set_anthropic_key_status(SharedString::from(anthropic));
-                w.set_hermes_bridge_status(SharedString::from(
-                    crate::settings_hermes::current_bridge_status(
-                        &snap.hermes_bridge_host,
-                        snap.hermes_bridge_port,
-                        snap.ui_language == "ru",
-                    ),
-                ));
-                #[cfg(any(windows, target_os = "linux"))]
+                #[cfg(windows)]
                 settings_audio::refresh(&w, &cfg_lang);
                 w.set_tts_install_label(SharedString::from(
                     overlay_backend::tts_install::relocalize_voice_labels(
@@ -734,18 +1061,37 @@ pub(crate) fn open_settings(
     // P0 — Diagnostics tab owns its callbacks (diagnostics.rs); Settings only wires.
     wire_diagnostics(&win, cfg);
 
+    // Explicit cloud AI/STT proxy route and automatic fallback.
+    {
+        let cfg_proxy = cfg.clone();
+        let weak = win.as_weak();
+        win.on_network_proxy_save(move |url, mode| {
+            let url = url.trim().to_string();
+            let outcome = overlay_backend::network::validate(mode, &url).and_then(|_| {
+                let mut cfg = cfg_proxy.write();
+                cfg.network_proxy_mode = mode;
+                cfg.network_proxy_url = url;
+                overlay_backend::config::save(&cfg)
+            });
+            if let Some(w) = weak.upgrade() {
+                w.set_network_proxy_status(SharedString::from(
+                    if outcome.is_ok() {"Network route saved"} else {"Invalid proxy settings or save failed"}
+                ));
+            }
+        });
+    }
+
     // ===== STT (speech-to-text): provider switch + GigaAM GPU + field saves + test =====
     // Extracted to settings_stt.rs (P1 domain split) — wired verbatim there.
     // (`on_stt_gigaam_gpu_changed` moved out of the AI-local block region above
     // into wire_stt_settings; the mic device/test callbacks stay in open_settings.)
     wire_stt_settings(&win, cfg);
-    super::settings_dialogs::wire_storage(&win);
 
     // ===== 💭 Memory (Phase 3b.3): curated personal memory review =====
     // Pending candidates (approve/reject) + approved items (delete) over the
     // SQLite memory tables, + Extract (heuristic over recent sessions).
     // Extracted to settings_memory.rs.
-    wire_memory(&win, cfg);
+    wire_memory(&win);
 
     // P1.7 — config parsed from a picked server-settings file, awaiting the
     // user's explicit Apply (set by the import-preview handler, taken by Apply,
@@ -759,48 +1105,21 @@ pub(crate) fn open_settings(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_export_profile_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let snapshot = cfg_c.read().clone();
-            let dialog = rfd::AsyncFileDialog::new()
-                .set_title(if ru {
-                    "Экспорт настроек Суфлёра (содержит API-ключи)"
-                } else {
-                    "Export suflyor settings (contains API keys)"
-                })
+            let picked = rfd::FileDialog::new()
+                .set_title("Export suflyor settings (contains API keys)")
                 .set_file_name("suflyor-settings.json")
-                .add_filter("JSON", &["json"]);
-            let weak = weak.clone();
-            super::settings_dialogs::pick(dialog, super::settings_dialogs::Kind::Save, move |picked| {
-                let Some(w) = weak.upgrade() else { return };
-                let msg = match picked {
-                    None => if ru {
-                        "Экспорт отменён"
-                    } else {
-                        "Export cancelled"
-                    }
-                    .to_string(),
-                    Some(path) => match overlay_backend::config::export_to(&path, &snapshot) {
-                        Ok(()) => {
-                            if ru {
-                                format!("Настройки экспортированы в {}", path.display())
-                            } else {
-                                format!("Settings exported to {}", path.display())
-                            }
-                        }
-                        Err(e) => {
-                            // Generic + log: the chain can carry a path (audit Q8).
-                            eprintln!("[overlay-host] settings export failed: {e:#}");
-                            if ru {
-                                "Настройки не экспортированы: в эту папку не удалось записать файл. Выберите другую папку и нажмите «Экспорт настроек (с ключами)» ещё раз."
-                            } else {
-                                "Settings not exported: the file could not be written to that folder. Choose another folder, then press Export settings again."
-                            }
-                            .to_string()
-                        }
-                    },
-                };
-                w.set_profile_io_result(SharedString::from(msg));
-            });
+                .add_filter("JSON", &["json"])
+                .save_file();
+            let Some(w) = weak.upgrade() else { return };
+            let msg = match picked {
+                None => "export cancelled".to_string(),
+                Some(path) => match overlay_backend::config::export_to(&path, &snapshot) {
+                    Ok(()) => format!("[ok] exported to {}", path.display()),
+                    Err(e) => format!("[err] {e:#}"),
+                },
+            };
+            w.set_profile_io_result(SharedString::from(msg));
         });
     }
 
@@ -813,49 +1132,31 @@ pub(crate) fn open_settings(
         let weak = win.as_weak();
         let overlay = overlay_weak.clone();
         win.on_import_profile_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
-            let dialog = rfd::AsyncFileDialog::new()
-                .set_title(if ru { "Импорт настроек Суфлёра" } else { "Import suflyor settings" })
-                .add_filter("JSON", &["json"]);
-            let cfg_c = cfg_c.clone();
-            let weak = weak.clone();
-            let overlay = overlay.clone();
-            super::settings_dialogs::pick(dialog, super::settings_dialogs::Kind::File, move |picked| {
-                let Some(w) = weak.upgrade() else { return };
-                let msg = match picked {
-                    None => if ru {
-                        "Импорт отменён"
-                    } else {
-                        "Import cancelled"
-                    }
-                    .to_string(),
-                    Some(path) => {
-                        let local_deep_lock = cfg_c.read().deep_lock;
-                        match overlay_backend::config::import_from(&path, local_deep_lock) {
-                            Ok(imported) => {
-                                // Push the freshly-loaded values into the shared
-                                // config so the running session sees them, then
-                                // refresh the token-status display.
-                                *cfg_c.write() = imported;
-                                if let Some(o) = overlay.upgrade() {
-                                    crate::refresh_lock_chip(&o, &cfg_c);
-                                }
-                                msg_refresh_after_import(&w, &cfg_c)
+            let picked = rfd::FileDialog::new()
+                .set_title("Import suflyor settings")
+                .add_filter("JSON", &["json"])
+                .pick_file();
+            let Some(w) = weak.upgrade() else { return };
+            let msg = match picked {
+                None => "import cancelled".to_string(),
+                Some(path) => {
+                    let local_deep_lock = cfg_c.read().deep_lock;
+                    match overlay_backend::config::import_from(&path, local_deep_lock) {
+                        Ok(imported) => {
+                            // Push the freshly-loaded values into the shared
+                            // config so the running session sees them, then
+                            // refresh the token-status display.
+                            *cfg_c.write() = imported;
+                            if let Some(o) = overlay.upgrade() {
+                                crate::refresh_lock_chip(&o, &cfg_c);
                             }
-                            Err(e) => {
-                                eprintln!("[overlay-host] settings import failed: {e:#}");
-                                if ru {
-                                    "Настройки не импортированы: файл не читается или это не экспорт настроек Суфлёра. Выберите экспортированный .json и нажмите «Импорт настроек» ещё раз."
-                                } else {
-                                    "Settings not imported: the file cannot be read or is not a Suflyor settings export. Pick the exported .json file, then press Import settings again."
-                                }
-                                .to_string()
-                            }
+                            msg_refresh_after_import(&w, &cfg_c)
                         }
+                        Err(e) => format!("[err] {e:#}"),
                     }
-                };
-                w.set_profile_io_result(SharedString::from(msg));
-            });
+                }
+            };
+            w.set_profile_io_result(SharedString::from(msg));
         });
     }
 
@@ -874,7 +1175,6 @@ pub(crate) fn open_settings(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_meeting_context_save(move |text| {
-            let ru = cfg_c.read().ui_is_ru();
             {
                 let mut c = cfg_c.write();
                 // Phase F — also mirror into the active profile so the picker
@@ -883,11 +1183,7 @@ pub(crate) fn open_settings(
                 if let Err(e) = overlay_backend::config::save(&c) {
                     eprintln!("[overlay-host] meeting_context save failed: {e:#}");
                     if let Some(w) = weak.upgrade() {
-                        w.set_meeting_context_result(SharedString::from(if ru {
-                            "Не удалось сохранить"
-                        } else {
-                            "Could not save"
-                        }));
+                        w.set_meeting_context_result(SharedString::from("[err] save failed"));
                     }
                     return;
                 }
@@ -895,11 +1191,10 @@ pub(crate) fn open_settings(
             let chars = text.chars().count();
             eprintln!("[overlay-host] meeting_context saved ({chars} chars)");
             if let Some(w) = weak.upgrade() {
-                w.set_meeting_context_result(SharedString::from(if ru {
-                    format!("Сохранено ({chars} символов)")
-                } else {
-                    format!("Saved ({chars} characters)")
-                }));
+                w.set_meeting_context_result(SharedString::from(format!(
+                    "[ok] saved ({chars} chars)"
+                )));
+                refresh_groq_prompt_preview(&w, &cfg_c.read());
             }
         });
     }
@@ -927,7 +1222,6 @@ pub(crate) fn open_settings(
         let weak = win.as_weak();
         win.on_profile_add(move |name| {
             let mut c = cfg_c.write();
-            let ru = c.ui_is_ru();
             let added = c.add_profile(name.as_str()).is_some();
             let saved = if added {
                 overlay_backend::config::save(&c)
@@ -937,24 +1231,12 @@ pub(crate) fn open_settings(
             if let Some(w) = weak.upgrade() {
                 refresh_profiles(&w, &c);
                 w.set_meeting_context_result(SharedString::from(if !added {
-                    if ru {
-                        "Имя пустое или уже занято"
-                    } else {
-                        "Name is empty or already in use"
-                    }
+                    "[--] пустое или занятое имя"
                 } else if let Err(e) = &saved {
                     eprintln!("[overlay-host] profile add save failed: {e:#}");
-                    if ru {
-                        "Не удалось сохранить — проверьте диск"
-                    } else {
-                        "Could not save — check the disk"
-                    }
+                    "[err] не удалось сохранить — проверьте диск"
                 } else {
-                    if ru {
-                        "Профиль добавлен"
-                    } else {
-                        "Profile added"
-                    }
+                    "[ok] профиль добавлен"
                 }));
             }
         });
@@ -964,7 +1246,6 @@ pub(crate) fn open_settings(
         let weak = win.as_weak();
         win.on_profile_rename(move |name| {
             let mut c = cfg_c.write();
-            let ru = c.ui_is_ru();
             let ok = c.rename_active_profile(name.as_str());
             let saved = if ok {
                 overlay_backend::config::save(&c)
@@ -974,24 +1255,12 @@ pub(crate) fn open_settings(
             if let Some(w) = weak.upgrade() {
                 refresh_profiles(&w, &c);
                 w.set_meeting_context_result(SharedString::from(if !ok {
-                    if ru {
-                        "Имя пустое или уже занято"
-                    } else {
-                        "Name is empty or already in use"
-                    }
+                    "[--] пустое или занятое имя"
                 } else if let Err(e) = &saved {
                     eprintln!("[overlay-host] profile rename save failed: {e:#}");
-                    if ru {
-                        "Не удалось сохранить — проверьте диск"
-                    } else {
-                        "Could not save — check the disk"
-                    }
+                    "[err] не удалось сохранить — проверьте диск"
                 } else {
-                    if ru {
-                        "Профиль переименован"
-                    } else {
-                        "Profile renamed"
-                    }
+                    "[ok] переименовано"
                 }));
             }
         });
@@ -1001,7 +1270,6 @@ pub(crate) fn open_settings(
         let weak = win.as_weak();
         win.on_profile_delete(move || {
             let mut c = cfg_c.write();
-            let ru = c.ui_is_ru();
             c.delete_active_profile();
             // Confirm-without-verify was the v0.18 "Готово when not done" class:
             // report success ONLY if the save actually persisted, else the profile
@@ -1010,20 +1278,10 @@ pub(crate) fn open_settings(
             if let Some(w) = weak.upgrade() {
                 refresh_profiles(&w, &c);
                 w.set_meeting_context_result(SharedString::from(match &saved {
-                    Ok(()) => {
-                        if ru {
-                            "Профиль удалён"
-                        } else {
-                            "Profile deleted"
-                        }
-                    }
+                    Ok(()) => "[ok] профиль удалён",
                     Err(e) => {
                         eprintln!("[overlay-host] profile delete save failed: {e:#}");
-                        if ru {
-                            "Не удалось сохранить — проверьте диск"
-                        } else {
-                            "Could not save — check the disk"
-                        }
+                        "[err] не удалось сохранить — проверьте диск"
                     }
                 }));
             }
@@ -1117,8 +1375,6 @@ pub(crate) fn open_settings(
                     let _ = std::process::Command::new("open").arg(&dir).spawn();
                     #[cfg(windows)]
                     let _ = std::process::Command::new("explorer").arg(&dir).spawn();
-                    #[cfg(target_os = "linux")]
-                    let _ = slint_replay::native::desktop::open(dir.as_os_str());
                 }
                 Err(e) => eprintln!("[overlay-host] cannot resolve recordings dir: {e:#}"),
             }
@@ -1136,8 +1392,6 @@ pub(crate) fn open_settings(
                 let _ = std::process::Command::new("open").arg(&dir).spawn();
                 #[cfg(windows)]
                 let _ = std::process::Command::new("explorer").arg(&dir).spawn();
-                #[cfg(target_os = "linux")]
-                let _ = slint_replay::native::desktop::open(dir.as_os_str());
             }
             None => eprintln!("[overlay-host] cannot resolve data folder"),
         });
@@ -1149,8 +1403,6 @@ pub(crate) fn open_settings(
             let _ = std::process::Command::new("open").arg(url).spawn();
             #[cfg(windows)]
             let _ = std::process::Command::new("explorer").arg(url).spawn();
-            #[cfg(target_os = "linux")]
-            let _ = slint_replay::native::desktop::open(std::ffi::OsStr::new(url));
         });
     }
     {
@@ -1158,28 +1410,6 @@ pub(crate) fn open_settings(
         win.on_auto_tiles_enabled_changed(move |on| {
             let mut c = cfg_c.write();
             c.auto_tiles_enabled = on;
-            let _ = overlay_backend::config::save(&c);
-        });
-    }
-    {
-        let cfg_c = cfg.clone();
-        let weak_settings = win.as_weak();
-        let weak_bar = overlay_weak.clone();
-        win.on_tile_idle_seconds_changed(move |seconds| {
-            let saved = save_tile_idle_seconds(&cfg_c, seconds);
-            if let Some(w) = weak_settings.upgrade() {
-                w.set_tile_idle_seconds(saved);
-            }
-            if let Some(bar) = weak_bar.upgrade() {
-                bar.set_tile_idle_seconds(saved);
-            }
-        });
-    }
-    {
-        let cfg_c = cfg.clone();
-        win.on_fast_answers_changed(move |on| {
-            let mut c = cfg_c.write();
-            c.ai_fast_answers = on;
             let _ = overlay_backend::config::save(&c);
         });
     }
@@ -1207,6 +1437,7 @@ pub(crate) fn open_settings(
     }
     {
         let cfg_c = cfg.clone();
+        let weak = win.as_weak();
         win.on_trigger_keywords_save(move |text| {
             // Clamp: these keywords prepend to EVERY STT prompt, so a huge paste
             // would balloon every transcription. Trim + cap (cf. kb::search's
@@ -1215,6 +1446,98 @@ pub(crate) fn open_settings(
             let mut c = cfg_c.write();
             c.trigger_keywords = clamped;
             let _ = overlay_backend::config::save(&c);
+            if let Some(w) = weak.upgrade() {
+                refresh_groq_prompt_preview(&w, &c);
+            }
+        });
+    }
+
+    // Canonical Whisper/Groq technical vocabulary is configurable independently
+    // of auto-tile trigger keywords and the currently selected meeting profile.
+    {
+        let cfg_c = cfg.clone();
+        let weak = win.as_weak();
+        win.on_stt_tech_vocab_save(move |text| {
+            let next = text.trim().to_string();
+            let mut c = cfg_c.write();
+            c.stt_tech_vocab = next.clone();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] stt vocab save failed: {e:#}");
+                return;
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_stt_tech_vocab_input(SharedString::from(next));
+                refresh_groq_prompt_preview(&w, &c);
+            }
+        });
+    }
+
+    // Per-provider free-form hint templates; no binding on every keystroke.
+    // Empty template = legacy composition, so old settings retain their behaviour.
+    {
+        let cfg_c = cfg.clone();
+        let weak = win.as_weak();
+        win.on_stt_groq_prompt_template_save(move |text| {
+            let mut c = cfg_c.write();
+            c.stt_groq_prompt_template = text.to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] Groq prompt template save failed: {e:#}");
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_groq_prompt_preview(&w, &c);
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_stt_whisper_prompt_template_save(move |text| {
+            let mut c = cfg_c.write();
+            c.stt_whisper_prompt_template = text.to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] Whisper prompt template save failed: {e:#}");
+            }
+        });
+    }
+
+    // ElevenLabs Scribe v2 keyterm prompting is opt-in due to the +20% surcharge.
+    {
+        let cfg_c = cfg.clone();
+        win.on_stt_elevenlabs_keyterms_enabled_save(move |enabled| {
+            let mut c = cfg_c.write();
+            c.stt_elevenlabs_keyterms_enabled = enabled;
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] ElevenLabs keyterms toggle save failed: {e:#}");
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_stt_elevenlabs_keyterms_template_save(move |value| {
+            let mut c = cfg_c.write();
+            c.stt_elevenlabs_keyterms_template = value.to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] ElevenLabs keyterms template save failed: {e:#}");
+            }
+        });
+    }
+
+    // Switching Groq modes never changes the template text. The explicitly
+    // disabled state really omits the `prompt` field from the next request.
+    {
+        let cfg_c = cfg.clone();
+        let weak = win.as_weak();
+        win.on_stt_groq_prompt_mode_save(move |mode| {
+            let mut c = cfg_c.write();
+            c.stt_groq_prompt_mode = mode.clamp(0, 2);
+            if c.stt_groq_prompt_mode == 1 && c.stt_groq_prompt_template.trim().is_empty() {
+                c.stt_groq_prompt_template = GROQ_DEFAULT_TEMPLATE_VIEW.to_owned();
+            }
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] Groq prompt mode save failed: {e:#}");
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_groq_prompt_preview(&w, &c);
+            }
         });
     }
 
@@ -1226,17 +1549,14 @@ pub(crate) fn open_settings(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_context_process_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else {
                 return;
             };
             let current = w.get_meeting_context_input().to_string();
             if current.trim().is_empty() {
-                w.set_meeting_context_result(SharedString::from(if ru {
-                    "Пусто — нечего обрабатывать"
-                } else {
-                    "Nothing to process yet"
-                }));
+                w.set_meeting_context_result(SharedString::from(
+                    "[--] пусто — нечего обрабатывать",
+                ));
                 return;
             }
             let endpoint = {
@@ -1247,23 +1567,18 @@ pub(crate) fn open_settings(
             if (!matches!(
                 endpoint.protocol,
                 overlay_backend::ai::AiProtocol::CodexSubscription
+                    | overlay_backend::ai::AiProtocol::CodexDirect
             ) && endpoint.base_url.is_empty())
                 || endpoint.model.is_empty()
                 || (endpoint.requires_bearer() && endpoint.bearer.is_empty())
             {
-                w.set_meeting_context_result(SharedString::from(if ru {
-                    "AI не настроен — откройте AI-провайдеры"
-                } else {
-                    "AI is not set up — open AI providers"
-                }));
+                w.set_meeting_context_result(SharedString::from(
+                    "[--] AI мост не настроен (вкладка AI мост)",
+                ));
                 return;
             }
             w.set_context_processing(true);
-            w.set_meeting_context_result(SharedString::from(if ru {
-                "Обработка через AI…"
-            } else {
-                "Processing with AI…"
-            }));
+            w.set_meeting_context_result(SharedString::from("обработка через AI…"));
             let weak2 = w.as_weak();
             let cfg_err = cfg_c.clone();
             // Off-thread with a local current-thread runtime (reqwest is
@@ -1306,28 +1621,23 @@ pub(crate) fn open_settings(
                             w.set_meeting_context_input(SharedString::from(
                                 text.trim().to_string(),
                             ));
-                            w.set_meeting_context_result(SharedString::from(if ru {
-                                "Обработано — проверьте и нажмите «Сохранить контекст»"
-                            } else {
-                                "Processed — review and press Save context"
-                            }));
+                            w.set_meeting_context_result(SharedString::from(
+                                "[ok] обработано — проверь и нажми «Сохранить контекст»",
+                            ));
                         }
-                        Ok(_) => w.set_meeting_context_result(SharedString::from(if ru {
-                            "AI вернул пустой ответ"
-                        } else {
-                            "AI returned an empty answer"
-                        })),
+                        Ok(_) => w.set_meeting_context_result(SharedString::from(
+                            "[--] AI вернул пустой ответ",
+                        )),
                         Err(e) => {
                             let msg =
                                 if overlay_backend::deep_lock::is_blocked_error(&e.to_string()) {
                                     let ru = cfg_err.read().ui_is_ru();
-                                    overlay_backend::deep_lock::blocked_notice(ru).to_string()
+                                    format!(
+                                        "[--] {}",
+                                        overlay_backend::deep_lock::blocked_notice(ru)
+                                    )
                                 } else {
-                                    if ru {
-                                        format!("Ошибка AI: {e}")
-                                    } else {
-                                        format!("AI error: {e}")
-                                    }
+                                    format!("[--] ошибка AI: {e}")
                                 };
                             w.set_meeting_context_result(SharedString::from(msg));
                         }
@@ -1348,7 +1658,6 @@ pub(crate) fn open_settings(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_context_dictate_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else {
                 return;
             };
@@ -1356,60 +1665,44 @@ pub(crate) fn open_settings(
             if let Some(stop) = dictate_stop.borrow_mut().take() {
                 stop.store(true, Ordering::Release);
                 w.set_context_dictating(false);
-                w.set_meeting_context_result(SharedString::from(if ru {
-                    "Расшифровка…"
-                } else {
-                    "Transcribing…"
-                }));
+                w.set_meeting_context_result(SharedString::from("расшифровка…"));
                 return;
             }
             // Toggle ON: start a new recording.
             let (
                 mic_dev,
                 stt_backend,
-                stt_is_local,
-                groq_key,
+                missing_key,
                 stt_language,
-                trigger_keywords,
-                meeting_context,
+                whisper_prompt,
+                local_whisper_prompt,
             ) = {
                 let c = cfg_c.read();
                 (
                     c.mic_device.clone(),
                     c.stt_backend(),
-                    c.stt_is_local(),
-                    c.groq_api_key.clone(),
+                    c.stt_missing_cloud_key(),
                     c.stt_language.clone(),
-                    c.trigger_keywords.clone(),
-                    c.meeting_context.clone(),
+                    c.stt_prompt_for("cloud"),
+                    c.stt_prompt_for("whisper"),
                 )
             };
-            if !stt_is_local && groq_key.is_empty() {
-                w.set_meeting_context_result(SharedString::from(if ru {
-                    "Ключ Groq не задан — откройте STT"
-                } else {
-                    "No Groq key yet — open STT"
-                }));
+            if missing_key {
+                w.set_meeting_context_result(SharedString::from(
+                    "[--] API-ключ выбранного STT не задан (вкладка STT)",
+                ));
                 return;
             }
             // M2 — single-mic guard (shared with PTT-mic + voice follow-up).
             let Some(mic_guard) = try_acquire_mic() else {
-                w.set_meeting_context_result(SharedString::from(if ru {
-                    "Микрофон занят"
-                } else {
-                    "Microphone busy"
-                }));
+                w.set_meeting_context_result(SharedString::from("[--] микрофон занят"));
                 return;
             };
             let stop = Arc::new(AtomicBool::new(false));
             *dictate_stop.borrow_mut() = Some(stop.clone());
             spawn_ptt_watchdog(stop.clone());
             w.set_context_dictating(true);
-            w.set_meeting_context_result(SharedString::from(if ru {
-                "Запись… (нажмите «Остановить запись»)"
-            } else {
-                "Recording… (press Stop recording)"
-            }));
+            w.set_meeting_context_result(SharedString::from("запись… (нажми «Остановить»)"));
             let weak_res = w.as_weak();
             std::thread::spawn(move || {
                 let pcm =
@@ -1422,8 +1715,6 @@ pub(crate) fn open_settings(
                 let text = if pcm.len() < 4800 {
                     String::new()
                 } else {
-                    let whisper_prompt =
-                        stt::build_whisper_prompt(&trigger_keywords, &meeting_context);
                     match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1434,6 +1725,7 @@ pub(crate) fn open_settings(
                                 &pcm,
                                 stt_language.as_deref(),
                                 whisper_prompt.as_deref(),
+                                local_whisper_prompt.as_deref(),
                             ))
                             .unwrap_or_default(),
                         Err(_) => String::new(),
@@ -1446,11 +1738,9 @@ pub(crate) fn open_settings(
                     w.set_context_dictating(false);
                     let trimmed = text.trim();
                     if trimmed.is_empty() {
-                        w.set_meeting_context_result(SharedString::from(if ru {
-                            "Ничего не распознано"
-                        } else {
-                            "No speech recognized"
-                        }));
+                        w.set_meeting_context_result(SharedString::from(
+                            "[--] ничего не распознано",
+                        ));
                         return;
                     }
                     let cur = w.get_meeting_context_input().to_string();
@@ -1460,11 +1750,9 @@ pub(crate) fn open_settings(
                         format!("{cur} {trimmed}")
                     };
                     w.set_meeting_context_input(SharedString::from(joined));
-                    w.set_meeting_context_result(SharedString::from(if ru {
-                        "Добавлено — проверьте и нажмите «Сохранить контекст»"
-                    } else {
-                        "Added — review and press Save context"
-                    }));
+                    w.set_meeting_context_result(SharedString::from(
+                        "[ok] добавлено — проверь и нажми «Сохранить контекст»",
+                    ));
                 });
             });
         });
@@ -1497,19 +1785,18 @@ pub(crate) fn open_settings(
     // Extracted to settings_updates.rs (P1 domain split) — wired verbatim there.
     // SECURITY: download -> verify -> spawn stays in overlay_backend::update;
     // this only CALLs it; the sequence is byte-for-byte unchanged.
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(windows)]
     wire_updates(&win);
 
     let weak_close = win.as_weak();
+    let settings_close = settings_ref.clone();
     let overlay_for_close = overlay_weak.clone();
     let cfg_for_close = cfg.clone();
     win.on_close_clicked(move || {
         if let Some(w) = weak_close.upgrade() {
             let _ = w.hide();
-            slint_replay::win32::force_hide(w.window());
         }
-        // Keep the instance alive: async jobs report progress and cancellation
-        // through its weak handle, including while Settings is hidden.
+        *settings_close.borrow_mut() = None;
         // Un-light the bar's ⚙ chip + refresh the active-stack readout (the
         // user may have switched STT/AI provider while Settings was open).
         if let Some(o) = overlay_for_close.upgrade() {
@@ -1530,6 +1817,9 @@ pub(crate) fn open_settings(
         let _ = make_transparent_tile(hwnd);
         let _ = slint_replay::win32::set_skip_taskbar(hwnd, true);
     });
+    if matches!(cfg.read().stt_provider.as_str(), "speechmatics" | "elevenlabs" | "deepgram") {
+        super::settings_stt::refresh_active_stt_models(&win, cfg);
+    }
     *settings_slot = Some(win);
 }
 
@@ -1541,14 +1831,7 @@ pub(crate) fn msg_refresh_after_import(
     cfg: &overlay_backend::config::SharedConfig,
 ) -> String {
     populate_token_status(win, cfg);
-    // Imported profiles may carry other addresses or reasoning levels.
-    overlay_backend::ai::set_reasoning_efforts(cfg.read().reasoning_efforts());
-    if cfg.read().ui_is_ru() {
-        "Настройки импортированы — перезапустите приложение для полного применения"
-    } else {
-        "Settings imported — restart the app for full effect"
-    }
-    .to_string()
+    "[ok] imported — restart binary for full effect".to_string()
 }
 
 /// EN/RU copy for the Components hub rows (name + where-to-install hint).
@@ -1564,50 +1847,53 @@ pub(crate) fn component_row_copy(
             if ru {
                 (
                     "Движок (llama.cpp)",
-                    "Настройки → AI-провайдеры → Тонкая настройка",
+                    "Настройки → AI → AI мост → «Обновить движок»",
                 )
             } else {
                 (
                     "Engine (llama.cpp)",
-                    "Settings → AI providers → Fine tuning",
+                    "Settings → AI → AI bridge → Update engine",
                 )
             }
         }
         ComponentKind::LocalModel => {
             if ru {
                 (
-                    "Локальная модель AI",
-                    "Настройки → AI-провайдеры → Выберите модель",
+                    "Локальная модель ИИ",
+                    "Настройки → AI → AI мост → «Установить локальный ИИ»",
                 )
             } else {
-                ("Local AI model", "Settings → AI providers → Choose a model")
+                (
+                    "Local AI model",
+                    "Settings → AI → AI bridge → Install local AI",
+                )
             }
         }
         ComponentKind::Stt => {
             if ru {
-                ("Распознавание речи (STT)", "Настройки → STT")
+                ("Распознавание речи (STT)", "Настройки → AI → STT")
             } else {
-                ("Speech recognition (STT)", "Settings → STT")
+                ("Speech recognition (STT)", "Settings → AI → STT")
             }
         }
         ComponentKind::Voices => {
             if ru {
-                (
-                    "Голоса (TTS)",
-                    "Устанавливаются здесь или в Настройки → TTS",
-                )
+                ("Голоса (TTS)", "Настройки → AI → TTS → «Установить голоса»")
             } else {
-                ("Voices (TTS)", "Install here or in Settings → TTS")
+                ("Voices (TTS)", "Settings → AI → TTS → Install voices")
             }
         }
         ComponentKind::Ocr => {
             if ru {
                 (
                     "Распознавание текста (OCR)",
-                    "Устанавливается здесь, около 53 МБ",
+                    "Настройки → AI → AI мост → Vision → «Установить OCR»",
                 )
             } else {
-                ("Text recognition (OCR)", "Installs here, about 53 MB")
+                (
+                    "Text recognition (OCR)",
+                    "Settings → AI → AI bridge → Vision → Install OCR",
+                )
             }
         }
     }
@@ -1639,16 +1925,22 @@ pub(crate) fn populate_component_rows(
                     ComponentKind::Stt => {
                         c.installed = match snap.stt_provider.as_str() {
                             "cloud" => !snap.groq_api_key.trim().is_empty(),
-                            "gigaam" => {
-                                super::settings_stt::installed_gigaam_dir(&snap.stt_gigaam_dir)
-                                    .is_some()
-                            }
+                            "speechmatics" => !snap.stt_speechmatics_key.trim().is_empty(),
+                            "elevenlabs" => !snap.stt_elevenlabs_key.trim().is_empty(),
+                            "deepgram" => !snap.stt_deepgram_key.trim().is_empty(),
+                            "gigaam" => super::settings_stt::installed_gigaam_dir(
+                                &snap.stt_gigaam_dir,
+                            )
+                            .is_some(),
                             "whisper" => !snap.stt_whisper_url.trim().is_empty(),
                             _ => false,
                         };
                         c.detail = if c.installed {
                             match snap.stt_provider.as_str() {
                                 "cloud" => "Groq Whisper".into(),
+                                "speechmatics" => "Speechmatics".into(),
+                                "elevenlabs" => "ElevenLabs".into(),
+                                "deepgram" => "Deepgram".into(),
                                 "gigaam" => "GigaAM".into(),
                                 "whisper" => "External Whisper".into(),
                                 _ => String::new(),
@@ -1670,7 +1962,7 @@ pub(crate) fn populate_component_rows(
             // «Открыть» jump target for the heavy components (their full installer
             // with progress + cancel lives in a dedicated panel); -1 = inline.
             let jump_tab: i32 = match c.kind {
-                ComponentKind::Engine | ComponentKind::LocalModel => 11, // AI providers
+                ComponentKind::Engine | ComponentKind::LocalModel => 11, // AI мост
                 ComponentKind::Stt => 12,                                // STT
                 ComponentKind::Voices | ComponentKind::Ocr => -1,
             };
@@ -1678,37 +1970,16 @@ pub(crate) fn populate_component_rows(
                 if ru {
                     (
                         "Распознавание речи (STT)",
-                        "Настройки → STT → Облако (Groq Whisper), Локально GigaAM-v3 (русский) или Внешний Whisper (whisper-server)",
+                        "Настройки → STT → Cloud, GigaAM или External Whisper",
                     )
                 } else {
                     (
                         "Speech recognition (STT)",
-                        "Settings → STT → Cloud (Groq Whisper), Local GigaAM-v3 (Russian), or External Whisper (whisper-server)",
+                        "Settings → STT → Cloud, GigaAM or External Whisper",
                     )
                 }
             } else {
                 component_row_copy(c.kind, ru)
-            };
-            // Local assets can be downloaded ahead of time from AI providers;
-            // keep their Open action available even while answers use the cloud.
-            let optional_local =
-                matches!(c.kind, ComponentKind::Engine | ComponentKind::LocalModel)
-                    && snap.ai_provider != "local"
-                    && snap.vision_provider != "local";
-            let needed = match c.kind {
-                ComponentKind::Stt => is_macos || snap.stt_provider == "gigaam",
-                _ => true,
-            };
-            let hint = if optional_local {
-                if ru {
-                    "Необязательно: можно скачать заранее в AI-провайдерах".to_string()
-                } else {
-                    "Optional: download ahead of time in AI providers".to_string()
-                }
-            } else if needed {
-                hint.to_string()
-            } else {
-                not_needed_hint(c.kind, snap, ru)
             };
             ComponentRow {
                 name: SharedString::from(name),
@@ -1717,170 +1988,10 @@ pub(crate) fn populate_component_rows(
                 hint: SharedString::from(hint),
                 installable,
                 jump_tab,
-                needed,
             }
         })
         .collect();
     win.set_component_rows(ModelRc::new(VecModel::from(rows)));
-    win.set_active_rows(ModelRc::new(VecModel::from(active_rows(snap))));
-}
-
-/// Display name of a text or screenshot provider id from the Settings lists.
-fn provider_name(provider: &str, ru: bool) -> &'static str {
-    match (provider, ru) {
-        ("local", true) => "Модель на этом ПК",
-        ("local", false) => "Model on this PC",
-        ("openai", _) => "OpenAI API",
-        ("anthropic", _) => "Anthropic API",
-        ("codex", true) => "ChatGPT через Codex",
-        ("codex", false) => "ChatGPT via Codex",
-        ("mlx", _) => "MLX",
-        (_, true) => "Ваш сервер или мост",
-        (_, false) => "Your server or bridge",
-    }
-}
-
-fn not_needed_hint(
-    kind: overlay_backend::components::ComponentKind,
-    snap: &overlay_backend::config::Config,
-    ru: bool,
-) -> String {
-    use overlay_backend::components::ComponentKind;
-    if kind == ComponentKind::Stt {
-        let engine = match snap.stt_provider.as_str() {
-            "whisper" => "Whisper",
-            _ => "Groq",
-        };
-        return if ru {
-            format!("Не нужно: речь распознаёт {engine}")
-        } else {
-            format!("Not needed: {engine} recognises speech")
-        };
-    }
-    let provider = provider_name(&snap.ai_provider, ru);
-    if ru {
-        format!("Не нужно: ответы идут через «{provider}»")
-    } else {
-        format!("Not needed: answers go through {provider}")
-    }
-}
-
-/// Pure: whether a resolved endpoint has what a request needs. A bridge with
-/// no key counts only when its address was entered for screenshots.
-fn endpoint_ready(ep: &overlay_backend::ai::AiEndpoint, address_entered: bool) -> bool {
-    if ep.protocol == overlay_backend::ai::AiProtocol::CodexSubscription {
-        return !ep.model.trim().is_empty();
-    }
-    !ep.base_url.trim().is_empty()
-        && !ep.model.trim().is_empty()
-        && (ep.is_local || !ep.bearer.trim().is_empty() || address_entered)
-}
-
-fn endpoint_detail(provider: &str, ep: &overlay_backend::ai::AiEndpoint, ru: bool) -> String {
-    let model = ep.model.rsplit(['/', '\\']).next().unwrap_or_default();
-    let model = if model.to_ascii_lowercase().ends_with(".gguf") {
-        overlay_backend::local_ai::local_model_label(model)
-    } else {
-        model.to_string()
-    };
-    format!("{} · {model}", provider_name(provider, ru))
-}
-
-/// The «In use now» rows: what answers, screenshots and speech use and whether
-/// each is set up. Shows provider and model names only, never an address or key.
-pub(crate) fn active_rows(snap: &overlay_backend::config::Config) -> Vec<ComponentRow> {
-    let ru = snap.ui_is_ru();
-    let row = |name: &str, ready: bool, detail: String, hint: &str, jump_tab: i32| ComponentRow {
-        name: SharedString::from(name),
-        detail: SharedString::from(detail),
-        installed: ready,
-        hint: SharedString::from(hint),
-        installable: false,
-        jump_tab,
-        needed: true,
-    };
-
-    let answers = snap.ai_endpoint(false);
-    let answers_row = row(
-        if ru { "Ответы AI" } else { "AI answers" },
-        endpoint_ready(&answers, false),
-        endpoint_detail(&snap.ai_provider, &answers, ru),
-        if ru {
-            "Не настроено: укажите ключ и модель в AI-провайдерах"
-        } else {
-            "Not set up: enter the key and model in AI providers"
-        },
-        11,
-    );
-
-    let vision = snap.vision_endpoint();
-    let vision_provider = if snap.vision_provider == "same" {
-        snap.ai_provider.as_str()
-    } else {
-        snap.vision_provider.as_str()
-    };
-    let vision_row = row(
-        if ru {
-            "Скриншоты (F8)"
-        } else {
-            "Screenshots (F8)"
-        },
-        vision.as_ref().is_some_and(|ep| {
-            endpoint_ready(
-                ep,
-                snap.vision_provider == "cloud" && !snap.vision_base_url.trim().is_empty(),
-            )
-        }),
-        vision
-            .as_ref()
-            .map(|ep| endpoint_detail(vision_provider, ep, ru))
-            .unwrap_or_default(),
-        match (snap.vision_provider.as_str(), ru) {
-            ("off", true) => "Выключено: выберите модель для скриншотов",
-            ("off", false) => "Off: choose a model for screenshots",
-            (_, true) => "Не настроено: выберите «Та же, что отвечает» или другую модель",
-            (_, false) => "Not set up: choose Same as the answer model or another model",
-        },
-        17,
-    );
-
-    let (speech_ready, speech_detail) = match snap.stt_provider.as_str() {
-        // The folder the STT check and the session load (not a fallback),
-        // judged like the STT row below so the two never disagree.
-        "gigaam" => (
-            !snap.stt_gigaam_dir.trim().is_empty()
-                && overlay_backend::local_ai::gigaam_model_present(std::path::Path::new(
-                    snap.stt_gigaam_dir.trim(),
-                )),
-            if ru {
-                "GigaAM, на этом ПК"
-            } else {
-                "GigaAM, on this PC"
-            },
-        ),
-        "whisper" => (!snap.stt_whisper_url.trim().is_empty(), "Whisper"),
-        _ => (!snap.groq_api_key.trim().is_empty(), "Groq Whisper"),
-    };
-    let speech_row = row(
-        if ru {
-            "Распознавание речи"
-        } else {
-            "Speech recognition"
-        },
-        speech_ready,
-        speech_detail.to_string(),
-        match (snap.stt_provider.as_str(), ru) {
-            ("gigaam", true) => "Модель GigaAM не скачана: загрузите её во вкладке STT",
-            ("gigaam", false) => "The GigaAM model is not downloaded: get it in the STT tab",
-            ("whisper", true) => "Не указан адрес сервера Whisper",
-            ("whisper", false) => "No Whisper server address",
-            (_, true) => "Нет ключа Groq: добавьте его во вкладке STT",
-            (_, false) => "No Groq key: add it in the STT tab",
-        },
-        12,
-    );
-
-    vec![answers_row, vision_row, speech_row]
 }
 
 fn reset_component_install_state(win: &SettingsWindow) {
@@ -1909,6 +2020,27 @@ pub(crate) fn refresh_profiles(win: &SettingsWindow, c: &overlay_backend::config
         None => -1,
     });
     win.set_meeting_context_input(SharedString::from(c.meeting_context.as_str()));
+}
+
+fn show_tile_zone_settings(win: &SettingsWindow) {
+    let _ = win.show();
+    if let Ok(hwnd) = grab_hwnd(win.window()) {
+        slint_replay::win32::reveal_window(hwnd);
+    }
+}
+
+fn set_tile_zone_preview(win: &SettingsWindow, zone: Option<[u16; 4]>) {
+    let [x, y, w, h] = zone.unwrap_or([0, 0, 1000, 1000]);
+    win.set_tile_zone_x(i32::from(x));
+    win.set_tile_zone_y(i32::from(y));
+    win.set_tile_zone_w(i32::from(w));
+    win.set_tile_zone_h(i32::from(h));
+    win.set_tile_zone_enabled(zone.is_some());
+    win.set_tile_zone_status(SharedString::from(if zone.is_some() {
+        "Custom area"
+    } else {
+        "Whole monitor"
+    }));
 }
 
 /// Build the tile-placement monitor dropdown from the LIVE displays. Item 0 =
@@ -1951,6 +2083,7 @@ pub(crate) fn populate_tile_monitors(win: &SettingsWindow, c: &overlay_backend::
     }
     win.set_tile_monitors(ModelRc::new(VecModel::from(labels)));
     win.set_tile_monitor_index(sel);
+    set_tile_zone_preview(win, c.tile_zone);
 }
 
 /// Seed the Read-aloud tab's engine chooser + voice dropdown for the SELECTED
@@ -2021,87 +2154,58 @@ pub(crate) fn populate_tts_voices(win: &SettingsWindow, c: &overlay_backend::con
     win.set_tts_rate_index(preset_for_tts_rate(c.tts_rate));
 }
 
-fn key_presence_statuses(c: &overlay_backend::config::Config) -> [&'static str; 4] {
-    let ru = c.ui_is_ru();
-    // Show key presence only; Settings can be screen-shared.
-    let ai_status = match (c.ai_bearer.is_empty(), ru) {
-        (true, true) => "Токен не задан",
-        (true, false) => "No token yet",
-        (false, true) => "Токен сохранён",
-        (false, false) => "Token saved",
-    };
-    let groq_status = match (c.groq_api_key.is_empty(), ru) {
-        (true, true) => "Ключ Groq не задан",
-        (true, false) => "No Groq key yet",
-        (false, true) => "Ключ Groq сохранён",
-        (false, false) => "Groq key saved",
-    };
-    let protected_status = |slot| match overlay_backend::credentials::read(slot) {
-        Ok(Some(secret)) if !secret.is_empty() => {
-            if ru {
-                "Ключ сохранён в защищённом хранилище"
-            } else {
-                "Key stored securely"
-            }
-        }
-        _ => {
-            if ru {
-                "Ключ не задан"
-            } else {
-                "No key yet"
-            }
-        }
-    };
-    [
-        ai_status,
-        groq_status,
-        protected_status(overlay_backend::credentials::SecretSlot::OpenAi),
-        protected_status(overlay_backend::credentials::SecretSlot::Anthropic),
-    ]
-}
-
-// Only secrets included in the portable config, not OS-protected credentials.
-fn populate_backup_status(win: &SettingsWindow, c: &overlay_backend::config::Config) {
-    win.set_backup_has_secrets(
-        [
-            &c.ai_bearer,
-            &c.ai_local_bearer,
-            &c.vision_bearer,
-            &c.vision_local_bearer,
-            &c.groq_api_key,
-            &c.stt_whisper_bearer,
-            &c.hermes_bridge_token,
-            &c.hermes_api_key,
-        ]
-        .iter()
-        .any(|value| !value.trim().is_empty()),
-    );
-}
-
 /// Populate the Settings window's token-status display properties
 /// from the current `cfg`. Phase E6 — gives the user a way to SEE
 /// whether ai_bearer / groq_api_key are configured without leaking
-/// the values themselves (shows presence only).
+/// the values themselves (shows length + first 3 chars as fingerprint).
 pub(crate) fn populate_token_status(
     win: &SettingsWindow,
     cfg: &overlay_backend::config::SharedConfig,
 ) {
     settings_mlx::populate(win);
-    super::settings_dialogs::populate_storage(win);
-    win.set_hermes_more_open(false);
-    win.set_kb_entry_count(overlay_backend::kb::all().len() as i32);
     win.set_tts_test_status(SharedString::from(""));
     let codex_login_busy = win.get_codex_auth_busy();
     invalidate_codex_snapshot_ui();
+    // Phase E6 v18 — ASCII status prefixes ("[ok]" / "[--]") instead of
+    // Unicode ✓ / ❌ which Slint+skia rendered as missing-glyph boxes
+    // on the user's font fallback. Same root cause as the Close button
+    // fix in settings_panel.slint and the quit chip fix in cycle 15.
     let c = cfg.read();
-    populate_backup_status(win, &c);
-    let [ai_status, groq_status, openai_status, anthropic_status] = key_presence_statuses(&c);
+    let ai_status = if c.ai_bearer.is_empty() {
+        "[--] not set".to_string()
+    } else {
+        let len = c.ai_bearer.chars().count();
+        // #134: do NOT echo the key's leading chars into the UI — Settings is
+        // captured on screen-share unless stealth is on. Show presence only.
+        format!("[ok] set ({len} chars)")
+    };
+    let groq_status = if c.groq_api_key.is_empty() {
+        "[--] not set".to_string()
+    } else {
+        let len = c.groq_api_key.chars().count();
+        format!("[ok] set ({len} chars)")
+    };
     win.set_ai_bearer_status(SharedString::from(ai_status));
     win.set_groq_api_key_status(SharedString::from(groq_status));
-    win.set_openai_key_status(SharedString::from(openai_status));
-    win.set_anthropic_key_status(SharedString::from(anthropic_status));
+    let protected_status = |slot| match overlay_backend::credentials::read(slot) {
+        Ok(Some(secret)) if !secret.is_empty() => "[ok] stored securely",
+        _ => "[--] not set",
+    };
+    win.set_openai_key_status(SharedString::from(protected_status(
+        overlay_backend::credentials::SecretSlot::OpenAi,
+    )));
+    win.set_anthropic_key_status(SharedString::from(protected_status(
+        overlay_backend::credentials::SecretSlot::Anthropic,
+    )));
+    win.set_codex_transport_index(if c.codex_transport == "direct" { 1 } else { 0 });
     if !codex_login_busy {
-        win.set_codex_auth_status(SharedString::from(if c.ui_is_ru() {
+        win.set_codex_auth_status(SharedString::from(if c.codex_transport == "direct" {
+            if c.ui_is_ru() {
+                "Проверка прямого входа ChatGPT OAuth..."
+            } else {
+                "Checking direct ChatGPT OAuth..."
+            }
+        } else if c.ui_is_ru() {
             "Проверка официального Codex app-server..."
         } else {
             "Checking official Codex app-server..."
@@ -2112,17 +2216,35 @@ pub(crate) fn populate_token_status(
         win.set_codex_user_code(SharedString::default());
         win.set_codex_copy_status(SharedString::default());
     }
-    let codex_ids = if c.codex_model.is_empty() {
-        Vec::new()
-    } else {
-        vec![SharedString::from(c.codex_model.clone())]
-    };
+    let mut codex_ids = Vec::new();
+    if !c.codex_model.is_empty() {
+        codex_ids.push(SharedString::from(c.codex_model.clone()));
+    }
+    if !c.codex_smart_model.is_empty() && c.codex_smart_model != c.codex_model {
+        codex_ids.push(SharedString::from(c.codex_smart_model.clone()));
+    }
+    let codex_model_index = codex_ids
+        .iter()
+        .position(|id| id.as_str() == c.codex_model.as_str())
+        .map_or(-1, |index| index as i32);
+    let codex_smart_model_index = codex_ids
+        .iter()
+        .position(|id| id.as_str() == c.codex_smart_model.as_str())
+        .map_or(codex_model_index, |index| index as i32);
     win.set_codex_model_ids(ModelRc::new(VecModel::from(codex_ids.clone())));
     win.set_codex_model_labels(ModelRc::new(VecModel::from(codex_ids)));
-    win.set_codex_model_index(if c.codex_model.is_empty() { -1 } else { 0 });
+    win.set_codex_model_index(codex_model_index);
+    win.set_codex_smart_model_index(codex_smart_model_index);
     win.set_codex_reasoning_ids(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
     win.set_codex_reasoning_labels(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
     win.set_codex_reasoning_index(-1);
+    win.set_codex_fast_mode(c.codex_fast_mode);
+    win.set_codex_fast_available(false);
+    win.set_codex_smart_reasoning_ids(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    win.set_codex_smart_reasoning_labels(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    win.set_codex_smart_reasoning_index(-1);
+    win.set_codex_smart_fast_mode(c.codex_smart_fast_mode);
+    win.set_codex_smart_fast_available(false);
     let codex_vision_ids = if c.codex_vision_model.is_empty() {
         Vec::new()
     } else {
@@ -2130,11 +2252,20 @@ pub(crate) fn populate_token_status(
     };
     win.set_codex_vision_model_ids(ModelRc::new(VecModel::from(codex_vision_ids.clone())));
     win.set_codex_vision_model_labels(ModelRc::new(VecModel::from(codex_vision_ids)));
-    win.set_codex_vision_model_index(if c.codex_vision_model.is_empty() {
-        -1
-    } else {
-        0
-    });
+    win.set_codex_vision_model_index(if c.codex_vision_model.is_empty() { -1 } else { 0 });
+    win.set_codex_vision_smart_model_index(if c.codex_vision_smart_model.is_empty() {
+        if c.codex_vision_model.is_empty() { -1 } else { 0 }
+    } else if c.codex_vision_smart_model == c.codex_vision_model { 0 } else { -1 });
+    win.set_codex_vision_reasoning_ids(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    win.set_codex_vision_reasoning_labels(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    win.set_codex_vision_reasoning_index(-1);
+    win.set_codex_vision_smart_reasoning_ids(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    win.set_codex_vision_smart_reasoning_labels(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    win.set_codex_vision_smart_reasoning_index(-1);
+    win.set_codex_vision_fast_mode(c.codex_vision_fast_mode);
+    win.set_codex_vision_fast_available(false);
+    win.set_codex_vision_smart_fast_mode(c.codex_vision_smart_fast_mode);
+    win.set_codex_vision_smart_fast_available(false);
     win.set_codex_rate_status(SharedString::default());
     win.set_codex_models_busy(false);
     win.set_openai_key_input(SharedString::default());
@@ -2147,19 +2278,47 @@ pub(crate) fn populate_token_status(
     win.set_hermes_profile_status(SharedString::default());
     win.set_hermes_plugin_install_status(SharedString::default());
     win.set_hermes_bridge_status(SharedString::from(
-        crate::settings_hermes::current_bridge_status(
-            &c.hermes_bridge_host,
-            c.hermes_bridge_port,
-            c.ui_language == "ru",
-        ),
+        crate::settings_hermes::current_bridge_status(&c.hermes_bridge_host, c.hermes_bridge_port),
     ));
     win.set_hermes_bridge_remote(!overlay_backend::bridge::is_loopback_host(
         &c.hermes_bridge_host,
     ));
-    // Phase E6 v20 — load tile opacity from config so the slider
-    // reflects the saved value on Settings re-open.
-    win.set_tile_body_opacity(c.tile_body_opacity);
-    win.set_tile_idle_seconds(c.omarchy_tile_idle_seconds.min(600) as i32);
+    // Load the discrete transparency preset. Legacy slider values map to the
+    // nearest useful preset without rewriting the config until the user changes it.
+    let tile_visibility_index = if c.tile_body_opacity <= 0.01 {
+        2
+    } else if c.tile_body_opacity <= 0.65 {
+        1
+    } else {
+        0
+    };
+    win.set_tile_visibility_index(tile_visibility_index);
+    win.set_tile_reading_mode(c.tile_reading_mode);
+    win.set_tile_memory_stars(c.tile_memory_stars);
+    win.set_tile_font_body(SharedString::from(c.tile_font_body.to_string()));
+    win.set_tile_font_heading(SharedString::from(c.tile_font_heading.to_string()));
+    win.set_tile_font_subheading(SharedString::from(c.tile_font_subheading.to_string()));
+    win.set_tile_font_code(SharedString::from(c.tile_font_code.to_string()));
+    win.set_tile_font_table(SharedString::from(c.tile_font_table.to_string()));
+    win.set_tile_font_alert(SharedString::from(c.tile_font_alert.to_string()));
+
+    win.set_tile_anchor_index(tile_anchor_index(&c.tile_anchor));
+    win.set_tile_max_live_value(SharedString::from(c.max_live_tiles.clamp(1, 64).to_string()));
+    win.set_hotkey_help(SharedString::from(c.hotkeys.help.clone()));
+    win.set_hotkey_reask(SharedString::from(c.hotkeys.reask.clone()));
+    win.set_hotkey_knowledge(SharedString::from(c.hotkeys.knowledge.clone()));
+    win.set_hotkey_new_tile(SharedString::from(c.hotkeys.new_tile.clone()));
+    win.set_hotkey_close_all(SharedString::from(c.hotkeys.close_all_tiles.clone()));
+    win.set_hotkey_archive(SharedString::from(c.hotkeys.archive.clone()));
+    win.set_hotkey_vision(SharedString::from(c.hotkeys.vision.clone()));
+    win.set_hotkey_vision_translate(SharedString::from(c.hotkeys.vision_translate.clone()));
+    win.set_hotkey_vision_ocr(SharedString::from(c.hotkeys.vision_ocr.clone()));
+    win.set_hotkey_ask(SharedString::from(c.hotkeys.ask.clone()));
+    win.set_hotkey_ask_deep(SharedString::from(c.hotkeys.ask_deep.clone()));
+    win.set_hotkey_read_selected(SharedString::from(c.hotkeys.read_selected.clone()));
+    win.set_hotkey_read_ocr(SharedString::from(c.hotkeys.read_ocr.clone()));
+    win.set_hotkey_read_pause(SharedString::from(c.hotkeys.read_pause.clone()));
+    win.set_hotkeys_save_status(SharedString::default());
     // I1 — Stealth-tab EFFECTIVE-state line, reseeded on every open (reused-
     // window rule): a stale failure / active state from a previous session
     // must not survive the reopen. The Slint `@tr` ternary renders the line
@@ -2174,24 +2333,30 @@ pub(crate) fn populate_token_status(
     win.set_ai_base_url_input(SharedString::from(c.ai_base_url.clone()));
     win.set_openai_base_url_input(SharedString::from(c.openai_base_url.clone()));
     win.set_openai_model_input(SharedString::from(c.openai_model.clone()));
-    win.set_ai_reasoning_index(super::settings_ai::reasoning_level_index(
-        &c.ai_reasoning_effort,
-    ));
-    win.set_openai_reasoning_index(super::settings_ai::reasoning_level_index(
-        &c.openai_reasoning_effort,
-    ));
+    win.set_openai_smart_model_input(SharedString::from(c.openai_smart_model.clone()));
     win.set_anthropic_base_url_input(SharedString::from(c.anthropic_base_url.clone()));
     win.set_anthropic_model_input(SharedString::from(c.anthropic_model.clone()));
+    win.set_anthropic_smart_model_input(SharedString::from(c.anthropic_smart_model.clone()));
     // V4 — vision section: provider index + non-secret fields (bearers stay blank
     // on screen; saving a blank field is a no-op the user controls).
     win.set_vision_provider_index(super::settings_vision::vision_provider_index_from_id(
         &c.vision_provider,
     ));
-    win.set_vision_same_available(super::settings_vision::same_choice_available(&c));
+    win.set_vision_same_available(c.same_text_model_accepts_images_declared());
     win.set_vision_base_url_input(SharedString::from(c.vision_base_url.clone()));
     win.set_vision_model_input(SharedString::from(c.vision_model.clone()));
+    win.set_vision_smart_model_input(SharedString::from(c.vision_smart_model.clone()));
     win.set_vision_local_base_url_input(SharedString::from(c.vision_local_base_url.clone()));
     win.set_vision_local_model_input(SharedString::from(c.vision_local_model.clone()));
+    win.set_vision_local_smart_model_input(SharedString::from(c.vision_local_smart_model.clone()));
+    win.set_vision_openai_model_input(SharedString::from(c.openai_vision_model.clone()));
+    win.set_vision_openai_smart_model_input(SharedString::from(c.openai_vision_smart_model.clone()));
+    win.set_vision_anthropic_model_input(SharedString::from(c.anthropic_vision_model.clone()));
+    win.set_vision_anthropic_smart_model_input(SharedString::from(c.anthropic_vision_smart_model.clone()));
+    win.set_vision_capture_mode_index(if c.vision_capture_mode == "manual" { 1 } else { 0 });
+    win.set_vision_capture_source_index(if c.vision_capture_source == "window" && cfg!(windows) { 1 } else { 0 });
+    win.set_vision_capture_region_configured(c.vision_capture_region.is_some());
+    win.set_vision_capture_window_title(SharedString::from(c.vision_capture_window_title.clone()));
     win.set_vision_test_result(SharedString::from(""));
     // Clear the DB-maintenance result so a prior ✓/⚠ doesn't linger on reopen
     // (reused-window transient-status rule; settings_reset_guard enforces this).
@@ -2211,10 +2376,7 @@ pub(crate) fn populate_token_status(
     win.set_ocr_install_phase(0);
     // Speaker-diarization models — same reset-on-reopen discipline (the window is
     // reused; a stale install status must not survive).
-    win.set_diar_nemotron_supported(overlay_backend::nemotron_diar::supported());
-    let engine = overlay_backend::diarize::selected_engine();
-    win.set_diar_use_nemotron(engine == overlay_backend::diarize::DiarEngine::Nemotron3);
-    win.set_diar_models_installed(overlay_backend::diarize::engine_ready(engine));
+    win.set_diar_models_installed(overlay_backend::diar_install::models_installed());
     win.set_diar_installing(false);
     win.set_diar_install_status(slint::SharedString::default());
     // UI-audit 2026-06-13 (CRITICAL): the Settings window is REUSED, not
@@ -2225,47 +2387,11 @@ pub(crate) fn populate_token_status(
     // `vision_test_result` was reset before. Persistent state (key presence,
     // dropdowns, toggles, ai_local_quality) is reseeded below and is NOT touched.
     let blank = || SharedString::from("");
-    if win.get_strata_vision_job() == 0 {
-        win.set_strata_vision_status(blank());
-    }
-    if win.get_strata_update_job() == 0 {
-        win.set_strata_update_status(blank());
-    }
-    super::settings_model_speed::refresh(win, &c);
-    let local_job_active = win.get_model_speed_running()
-        || win.get_local_ai_installing()
-        || win.get_quality_downloading()
-        || win.get_model_switching()
-        || win.get_vision12b_downloading()
-        || win.get_engine_updating()
-        || win.get_strata_busy();
-    if !local_job_active {
-        win.set_quality_status(blank());
-        win.set_local_ai_status(blank());
-        win.set_local_ai_gpu(blank());
-        win.set_local_ai_on_gpu(false);
-    }
+    win.set_quality_status(blank());
+    win.set_local_ai_status(blank());
+    win.set_local_ai_gpu(blank());
+    win.set_local_ai_on_gpu(false);
     win.set_ai_local_test_result(blank());
-    if !local_job_active {
-        win.set_strata_status(blank());
-    }
-    win.set_local_more_open(false);
-    win.set_now_title(blank());
-    win.set_now_detail(blank());
-    win.set_now_notice(blank());
-    win.set_now_state(4);
-    win.set_local_hardware_line(blank());
-    win.set_local_connect_open(false);
-    win.set_local_connect_auto(true);
-    if !win.get_quality_downloading() {
-        win.set_local_download_profile(-1);
-    }
-    if !win.get_strata_busy() {
-        win.set_local_strata_job(-1);
-    }
-    if !local_job_active && !win.get_strata_busy() {
-        win.set_local_choice_status(blank());
-    }
     win.set_ai_bridge_test_result(blank());
     win.set_stt_test_result(blank());
     win.set_mic_test_result(blank());
@@ -2293,40 +2419,9 @@ pub(crate) fn populate_token_status(
     win.set_ai_prompt_cache(c.ai_prompt_cache);
     win.set_ai_provider_index(ai_provider_index(&c.ai_provider, cfg!(target_os = "macos")));
     win.set_ai_local_base_url_input(SharedString::from(c.ai_local_base_url.clone()));
-    win.set_strata_directory_input(SharedString::from(c.ai_strata_dir.clone()));
     let managed_local_server =
         overlay_backend::local_ai::is_managed_llama_endpoint(&c.ai_local_base_url);
     win.set_managed_local_server(managed_local_server);
-    refresh_local_engine_controls(win, &c);
-    #[cfg(any(windows, target_os = "linux"))]
-    super::search_found_models(win, cfg);
-    // RAM/VRAM discovery runs PowerShell and nvidia-smi: off the UI thread.
-    win.set_strata_hardware_note(SharedString::from(""));
-    #[cfg(any(windows, target_os = "linux"))]
-    {
-        let ru = c.ui_is_ru();
-        let hardware_weak = win.as_weak();
-        std::thread::spawn(move || {
-            let running = overlay_backend::local_ai::strata_reachable();
-            let running_weak = hardware_weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(w) = running_weak.upgrade() {
-                    w.set_strata_running(running);
-                }
-            });
-            let hw = overlay_backend::local_ai::StrataHardware::detect();
-            let note = hw.describe(ru);
-            let short = hw.describe_short(ru);
-            let fits = hw.meets_recommendation();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(w) = hardware_weak.upgrade() {
-                    w.set_local_hardware_line(SharedString::from(short));
-                    w.set_strata_hardware_note(SharedString::from(note));
-                    w.set_strata_hardware_fits(fits);
-                }
-            });
-        });
-    }
     // VRAM/RAM discovery can use WMI/DXGI, so never do it on the UI thread.
     // Keep 26B controls disabled until the exact owner-approved pair is known.
     win.set_quality_selection_allowed(false);
@@ -2370,6 +2465,7 @@ pub(crate) fn populate_token_status(
     };
     win.set_ai_models(seed_one(&c.ai_model));
     win.set_ai_model_index(0);
+    win.set_ai_smart_model_index(-1);
     win.set_ai_local_models(seed_one(&effective_local_model));
     win.set_ai_local_model_index(0);
     refresh_local_model_resource_warning(
@@ -2379,8 +2475,6 @@ pub(crate) fn populate_token_status(
         effective_local_model.clone(),
     );
     win.set_ai_local_vision(c.ai_local_vision);
-    #[cfg(any(windows, target_os = "linux"))]
-    super::settings_strata_vision::refresh(win, &c);
     win.set_vision_phonetics(c.vision_phonetics);
     win.set_vision_test_practice(c.vision_test_practice);
     // Read-aloud (Озвучка): build the installed-voice dropdown + reflect the
@@ -2401,8 +2495,6 @@ pub(crate) fn populate_token_status(
         win.set_tera_install_label(SharedString::from(""));
     }
     win.set_ai_local_thinking(c.ai_local_thinking);
-    win.set_ai_agent_tools(c.ai_agent_tools);
-    win.set_ai_web_search(c.ai_web_search);
     // Local model choice + whether the optional 26B-A4B is downloaded.
     win.set_ai_local_quality(effective_quality);
     refresh_local_context_controls(win, &c);
@@ -2419,13 +2511,12 @@ pub(crate) fn populate_token_status(
                 .map(|b| format!("b{b}"))
                 .unwrap_or_default(),
         ));
-        if !local_job_active {
-            win.set_vision12b_status(blank());
-            win.set_engine_update_status(blank());
-        }
+        win.set_vision12b_status(blank());
+        win.set_engine_update_status(blank());
     }
     // Phase E10 — STT provider selector + local-engine fields.
     win.set_stt_provider_index(stt_provider_index(&c.stt_provider));
+    super::settings_stt::show_stt_fallbacks(&win, &c);
     // Recognition language (stt_language): None=auto → 0, "ru" → 1, "en" → 2.
     win.set_stt_language_index(match c.stt_language.as_deref() {
         Some("ru") => 1,
@@ -2437,11 +2528,6 @@ pub(crate) fn populate_token_status(
     if !win.get_stt_gigaam_installing() {
         let installed = super::settings_stt::installed_gigaam_dir(&c.stt_gigaam_dir);
         win.set_stt_gigaam_installed(installed.is_some());
-        win.set_stt_gigaam_custom(
-            installed
-                .as_deref()
-                .is_some_and(super::settings_stt::is_custom_gigaam_dir),
-        );
         win.set_stt_gigaam_install_failed(false);
         win.set_stt_gigaam_install_cancelled(false);
         win.set_stt_gigaam_install_progress(0.0);
@@ -2457,6 +2543,22 @@ pub(crate) fn populate_token_status(
     win.set_stt_whisper_url_input(SharedString::from(c.stt_whisper_url.clone()));
     win.set_stt_whisper_bearer_input(SharedString::from(c.stt_whisper_bearer.clone()));
     win.set_stt_whisper_model_input(SharedString::from(c.stt_whisper_model.clone()));
+    win.set_stt_speechmatics_model_input(SharedString::from(c.stt_speechmatics_model.clone()));
+    win.set_stt_speechmatics_models(seed_one(&c.stt_speechmatics_model));
+    win.set_stt_speechmatics_model_index(0);
+    win.set_stt_speechmatics_models_status(SharedString::from("Нажмите «Обновить» для загрузки моделей"));
+    win.set_stt_elevenlabs_model_input(SharedString::from(c.stt_elevenlabs_model.clone()));
+    win.set_stt_elevenlabs_models(seed_one(&c.stt_elevenlabs_model));
+    win.set_stt_elevenlabs_model_index(0);
+    win.set_stt_elevenlabs_models_status(SharedString::from("Нажмите «Обновить» для загрузки моделей"));
+    win.set_stt_deepgram_model_input(SharedString::from(c.stt_deepgram_model.clone()));
+    win.set_stt_deepgram_models(seed_one(&c.stt_deepgram_model));
+    win.set_stt_deepgram_model_index(0);
+    win.set_stt_deepgram_models_status(SharedString::from("Нажмите «Обновить» для загрузки моделей"));
+    // Never put credential values into a Slint-visible property.
+    win.set_stt_speechmatics_key_status(SharedString::from(if c.stt_speechmatics_key.is_empty() { "[--] not set" } else { "[ok] stored" }));
+    win.set_stt_elevenlabs_key_status(SharedString::from(if c.stt_elevenlabs_key.is_empty() { "[--] not set" } else { "[ok] stored" }));
+    win.set_stt_deepgram_key_status(SharedString::from(if c.stt_deepgram_key.is_empty() { "[--] not set" } else { "[ok] stored" }));
     // Phase E6 v38 — reflect the saved interface language in the
     // Interface-tab dropdown (0=Русский, 1=English).
     win.set_ui_language_index(if c.ui_language == "en" { 1 } else { 0 });
@@ -2480,52 +2582,8 @@ pub(crate) fn populate_token_status(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    use super::{active_rows, ai_provider_index, component_row_copy};
+    use super::{ai_provider_index, component_row_copy};
     use overlay_backend::components::ComponentKind;
-
-    #[test]
-    fn active_rows_name_the_providers_and_hide_addresses() {
-        let mut c = overlay_backend::config::Config::defaults();
-        c.ui_language = "ru".into();
-        c.ai_provider = "cloud".into();
-        c.ai_bearer = "secret-key".into();
-        c.ai_model = "answer-model".into();
-        c.vision_provider = "cloud".into();
-        c.stt_provider = "cloud".into();
-        c.groq_api_key = String::new();
-        let rows = active_rows(&c);
-        assert_eq!(rows.len(), 3);
-        assert!(rows[0].installed, "answers with key + model are set up");
-        assert!(
-            rows[0].detail.contains("answer-model"),
-            "{}",
-            rows[0].detail
-        );
-        assert!(
-            rows[1].installed,
-            "screenshot bridge reuses the answers key"
-        );
-        assert!(!rows[2].installed, "Groq without a key is not set up");
-        assert!(!rows[2].hint.is_empty());
-        for row in &rows {
-            assert!(!row.detail.contains("secret-key"));
-            assert!(!row.detail.contains(c.ai_base_url.as_str()) || c.ai_base_url.is_empty());
-        }
-
-        c.ai_bearer = String::new();
-        c.vision_bearer = String::new();
-        c.vision_base_url = String::new();
-        let rows = active_rows(&c);
-        assert!(!rows[0].installed, "a bridge without a key is not set up");
-        assert!(
-            !rows[1].installed,
-            "screenshots without a key or address are not set up"
-        );
-        assert_eq!(rows[1].jump_tab, 17);
-
-        c.vision_provider = "off".into();
-        assert!(active_rows(&c)[1].hint.starts_with("Выключено"));
-    }
 
     /// The Components hub rows follow the interface language in BOTH
     /// directions — the old rows were unconditionally Cyrillic, so an English
@@ -2547,14 +2605,6 @@ mod tests {
             assert_ne!(hint_ru, hint_en, "kind {kind:?} hint must be localized");
         }
         // Spot-check the wording the tester sees.
-        assert_eq!(
-            component_row_copy(ComponentKind::LocalModel, true).1,
-            "Настройки → AI-провайдеры → Выберите модель"
-        );
-        assert_eq!(
-            component_row_copy(ComponentKind::LocalModel, false).1,
-            "Settings → AI providers → Choose a model"
-        );
         assert_eq!(
             component_row_copy(ComponentKind::Engine, false).0,
             "Engine (llama.cpp)"

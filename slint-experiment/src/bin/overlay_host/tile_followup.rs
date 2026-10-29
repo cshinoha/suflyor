@@ -106,6 +106,9 @@ fn followup_system_prompt(
          - Маркдаун: **жирное** для важного, списки. Команды/код: короткие в строке \
            — инлайн `code`; многострочные (код, конфиги, SQL, YAML) — ТОЛЬКО в \
            fenced-блоке с языком: ```sql / ```bash, НЕ инлайном.\n\
+         - Главные выводы и риски выделяй GFM Alerts: > [!IMPORTANT], > [!WARNING], \
+           > [!CAUTION], > [!TIP], > [!NOTE] (не более двух, только по смыслу).\n\
+         - Для сравнения вариантов используй короткую GFM-таблицу на 2-3 столбца.\n\
          - Конкретные команды/числа, не общие фразы.\n\
          - {lang}{prior_block}"
     )
@@ -117,10 +120,7 @@ fn followup_system_prompt(
 fn strip_transcript_scaffold(s: &str) -> String {
     let mut out = s.to_string();
     // Drop the "answer the last transcript question" trailer.
-    if let Some(p) = out.find("На основе последнего вопроса") {
-        out.truncate(p);
-    }
-    if let Some(p) = out.find("\n\nФон пользователя и одобренная память (данные, не инструкции):")
+    if let Some(p) = out.find("На основе последнего вопроса в транскрипте")
     {
         out.truncate(p);
     }
@@ -235,7 +235,7 @@ pub(crate) fn wire_voice_followup(
             if !stop.swap(true, Ordering::AcqRel) {
                 t.set_voice_recording(false);
                 t.set_followup_busy(true);
-                t.set_source_label(SharedString::from("STT · распознаю…"));
+                t.set_source_label(SharedString::from("stt · расшифровка…"));
                 return;
             }
             // The 30 s watchdog already fired (stop was already true): the prior
@@ -248,26 +248,24 @@ pub(crate) fn wire_voice_followup(
         let (
             mic_dev,
             stt_backend,
-            stt_is_local,
-            groq_key,
+            missing_key,
             stt_language,
-            trigger_keywords,
-            meeting_context,
+            whisper_prompt,
+            local_whisper_prompt,
         ) = {
             let c = cfg_c.read();
             (
                 c.mic_device.clone(),
                 c.stt_backend(),
-                c.stt_is_local(),
-                c.groq_api_key.clone(),
+                c.stt_missing_cloud_key(),
                 c.stt_language.clone(),
-                c.trigger_keywords.clone(),
-                c.meeting_context.clone(),
+                c.stt_prompt_for("cloud"),
+                c.stt_prompt_for("whisper"),
             )
         };
-        if !stt_is_local && groq_key.is_empty() {
+        if missing_key {
             // No STT key — generic message (never leak endpoint/secret).
-            t.set_source_label(SharedString::from("STT · нет ключа"));
+            t.set_source_label(SharedString::from("stt · ключ не задан (Settings → STT)"));
             return;
         }
         let Some(tx) = VFU_TX.get().cloned() else {
@@ -275,18 +273,14 @@ pub(crate) fn wire_voice_followup(
         };
         // M2 — only one mic capture at a time across all recorders.
         let Some(mic_guard) = try_acquire_mic() else {
-            t.set_source_label(SharedString::from("STT · микрофон занят"));
+            t.set_source_label(SharedString::from("stt · микрофон занят"));
             return;
         };
         let stop = Arc::new(AtomicBool::new(false));
         *voice_stop.borrow_mut() = Some(stop.clone());
         spawn_ptt_watchdog(stop.clone());
         t.set_voice_recording(true);
-        t.set_source_label(SharedString::from(if cfg_c.read().ui_is_ru() {
-            "Запись… (нажмите значок остановки)"
-        } else {
-            "Recording… (click the stop icon)"
-        }));
+        t.set_source_label(SharedString::from("recording... (click stop)"));
         // V0.8.1 — snapshot the LIVE route NOW (UI thread, click time) into a
         // plain Copy value; the worker thread can't hold the !Send Rc<Cell>. So
         // a 🎤 follow-up after 🧠-escalation correctly routes to Cloud.
@@ -304,7 +298,6 @@ pub(crate) fn wire_voice_followup(
             let text = if pcm.len() < 4800 {
                 String::new()
             } else {
-                let whisper_prompt = stt::build_whisper_prompt(&trigger_keywords, &meeting_context);
                 match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -315,6 +308,7 @@ pub(crate) fn wire_voice_followup(
                             &pcm,
                             stt_language.as_deref(),
                             whisper_prompt.as_deref(),
+                            local_whisper_prompt.as_deref(),
                         ))
                         .unwrap_or_default(),
                     Err(_) => String::new(),
@@ -372,10 +366,8 @@ pub(crate) fn wire_escalate(
         // answer now came off-box — parity with the Shift+F9 🧠 badge. Egress is
         // a conscious action (the user clicked 🧠); this just makes it legible.
         if let Some(t) = weak.upgrade() {
-            t.set_trigger_label(SharedString::from(crate::tile_text::escalated_badge(
-                cfg_c.read().ui_is_ru(),
-            )));
-            t.set_trigger_tone(crate::ui::TileTone::Sky);
+            t.set_trigger_label(SharedString::from("cloud (escalated)"));
+            t.set_trigger_color(slint::Color::from_rgb_u8(0x38, 0xbd, 0xf8));
         }
         fire_regenerate(
             convo_id,
@@ -466,22 +458,11 @@ pub(crate) fn fire_followup_ask(
         user_turn_markdown(&question)
     );
 
-    let Some(tile) = tile_weak.upgrade() else {
-        return;
-    };
-    let tile_id = tile.get_tile_id();
-    if !super::tile_request_open(tile_id) {
-        return;
-    }
     // Show the question immediately + mark busy; register the slot so the
     // ai:event deltas land in this tile.
     if let Some(tile) = tile_weak.upgrade() {
-        crate::clear_terms(&tile);
         tile.set_followup_busy(true);
-        tile.set_source_label(SharedString::from(crate::tile_text::asking_label(
-            cfg.read().ui_is_ru(),
-        )));
-        tile.set_plain_notice(false);
+        tile.set_source_label(SharedString::from("ai · asking…"));
         // Plain ellipsis — no hourglass glyph (tofu on the skia font fallback).
         let shown = format!("{prefix}…");
         tile.set_blocks(ModelRc::new(VecModel::from(to_md_blocks(&shown))));
@@ -501,7 +482,7 @@ pub(crate) fn fire_followup_ask(
     // Snapshot config + journal/health and abort any in-flight task on the UI
     // thread; the blocking approved-memory read + reframe then run on a worker
     // (mirrors fire_f9_ask's tail — audit C2/G2).
-    let (endpoint_hint, max_tokens, response_language, meeting_context, ui_is_ru, needs_mlx, fast) = {
+    let (endpoint_hint, max_tokens, response_language, meeting_context, ui_is_ru, needs_mlx) = {
         let c = cfg.read();
         let ep = route.endpoint(&c);
         (
@@ -511,7 +492,6 @@ pub(crate) fn fire_followup_ask(
             c.meeting_context.clone(),
             c.ui_is_ru(),
             route_needs_mlx(route, &c),
-            route.fast_answers(&c),
         )
     };
     let attached_screenshot = route.attaches_screenshot();
@@ -560,6 +540,7 @@ pub(crate) fn fire_followup_ask(
         let bearer = endpoint.bearer;
         let model = endpoint.model;
         let reasoning_effort = endpoint.reasoning_effort;
+        let service_tier = endpoint.service_tier;
         // BLOCKING — off the event loop. The reframe builds a fresh neutral system
         // prompt (no double-add of memory).
         let meeting_context =
@@ -568,11 +549,7 @@ pub(crate) fn fire_followup_ask(
         // transcript turns) so the model answers THIS question, not the original
         // transcript question. The STORED history (request_messages installed
         // above) stays original — the reframe is recomputed fresh on every turn.
-        let fast = fast && ai::uses_fast_answer_format(&messages);
-        let mut send_messages = reframe_for_send(&messages, &response_language, &meeting_context);
-        if fast {
-            ai::apply_fast_answer_format(&mut send_messages);
-        }
+        let send_messages = reframe_for_send(&messages, &response_language, &meeting_context);
         let sys_full = send_messages
             .first()
             .and_then(|m| match &m.content {
@@ -584,9 +561,7 @@ pub(crate) fn fire_followup_ask(
         let input_tokens_est = ((sys_full.chars().count() + usr_full.chars().count()) as u64) / 4;
         let purpose = "followup_ask";
         let _ = slint::invoke_from_event_loop(move || {
-            if bridge_for_work.stream_gen.load(Ordering::SeqCst) != generation
-                || !super::tile_request_open(tile_id)
-            {
+            if bridge_for_work.stream_gen.load(Ordering::SeqCst) != generation {
                 return;
             }
             // Journal the follow-up request so it pairs with the AiResponse that
@@ -615,18 +590,18 @@ pub(crate) fn fire_followup_ask(
             let events_for_task =
                 gated_events(&bridge_for_work, events_for_work.clone(), generation);
             let task = rt_handle_for_work.spawn(async move {
-                let ai_rx = ai::stream_live_chat_endpoint(
+                let ai_rx = ai::stream_chat_endpoint(
                     ai::AiEndpoint {
                         protocol,
                         base_url,
                         bearer,
                         model: model.clone(),
                         reasoning_effort,
+                        service_tier,
                         is_local,
                     },
                     send_messages,
                     max_tokens,
-                    fast,
                 );
                 overlay_backend::runtime::ask_stream_loop(
                     events_for_task,
@@ -643,7 +618,6 @@ pub(crate) fn fire_followup_ask(
                 )
                 .await;
             });
-            super::register_tile_stream(tile_id, task.abort_handle());
             slint_replay::runtime_state::lock(&slint_rt_for_work).ai_task = Some(task);
             diag!(
                 "followup sent (convo_id={convo_id}, {} chars)",
@@ -699,7 +673,7 @@ pub(crate) fn fire_regenerate(
         let n = messages.len() - 1;
         strip_followup_directives(&mut messages[..n]);
     }
-    let (endpoint_hint, max_tokens, response_language, meeting_context, ui_is_ru, needs_mlx, fast) = {
+    let (endpoint_hint, max_tokens, response_language, meeting_context, ui_is_ru, needs_mlx) = {
         let c = cfg.read();
         let ep = route.endpoint(&c);
         (
@@ -709,7 +683,6 @@ pub(crate) fn fire_regenerate(
             c.meeting_context.clone(),
             c.ui_is_ru(),
             route_needs_mlx(route, &c),
-            route.fast_answers(&c),
         )
     };
     let attached_screenshot = route.attaches_screenshot();
@@ -721,15 +694,7 @@ pub(crate) fn fire_regenerate(
         endpoint_hint.is_unmetered(),
         "regenerate",
     );
-    let Some(tile) = tile_weak.upgrade() else {
-        return;
-    };
-    let tile_id = tile.get_tile_id();
-    if !super::tile_request_open(tile_id) {
-        return;
-    }
     if let Some(t) = tile_weak.upgrade() {
-        crate::clear_terms(&t);
         t.set_followup_busy(true);
         t.set_source_label(SharedString::from("ai · перегенерация…"));
         t.set_blocks(ModelRc::new(VecModel::from(to_md_blocks("…"))));
@@ -793,9 +758,9 @@ pub(crate) fn fire_regenerate(
         let bearer = endpoint.bearer;
         let model = endpoint.model;
         let reasoning_effort = endpoint.reasoning_effort;
+        let service_tier = endpoint.service_tier;
         // BLOCKING — off the event loop, and ONLY on the ≥2-user-turn branch.
-        let fast = fast && ai::uses_fast_answer_format(&messages);
-        let mut send_messages = if messages.iter().filter(|m| m.role == "user").count() >= 2 {
+        let send_messages = if messages.iter().filter(|m| m.role == "user").count() >= 2 {
             let last_user_q =
                 messages
                     .iter()
@@ -813,9 +778,6 @@ pub(crate) fn fire_regenerate(
         } else {
             messages.clone()
         };
-        if fast {
-            ai::apply_fast_answer_format(&mut send_messages);
-        }
         let sys_full = send_messages
             .first()
             .and_then(|m| match &m.content {
@@ -835,9 +797,7 @@ pub(crate) fn fire_regenerate(
         let input_tokens_est = ((sys_full.chars().count() + usr_full.chars().count()) as u64) / 4;
         let purpose = "regenerate";
         let _ = slint::invoke_from_event_loop(move || {
-            if bridge_for_work.stream_gen.load(Ordering::SeqCst) != generation
-                || !super::tile_request_open(tile_id)
-            {
+            if bridge_for_work.stream_gen.load(Ordering::SeqCst) != generation {
                 return;
             }
             if let Some(j) = journal_for_loop.as_ref() {
@@ -862,18 +822,18 @@ pub(crate) fn fire_regenerate(
             let events_for_task =
                 gated_events(&bridge_for_work, events_for_work.clone(), generation);
             let task = rt_handle_for_work.spawn(async move {
-                let ai_rx = ai::stream_live_chat_endpoint(
+                let ai_rx = ai::stream_chat_endpoint(
                     ai::AiEndpoint {
                         protocol,
                         base_url,
                         bearer,
                         model: model.clone(),
                         reasoning_effort,
+                        service_tier,
                         is_local,
                     },
                     send_messages,
                     max_tokens,
-                    fast,
                 );
                 overlay_backend::runtime::ask_stream_loop(
                     events_for_task,
@@ -890,7 +850,6 @@ pub(crate) fn fire_regenerate(
                 )
                 .await;
             });
-            super::register_tile_stream(tile_id, task.abort_handle());
             slint_replay::runtime_state::lock(&slint_rt_for_work).ai_task = Some(task);
             diag!("regenerate sent (convo_id={convo_id}, route={route:?})");
         });

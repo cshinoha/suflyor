@@ -16,7 +16,6 @@
 // full-width action at the bottom of the nav, not a corner). Those two stay in
 // their own contexts but share the same x.svg + danger-hover language.
 import { Theme } from "theme.slint";
-import { Metrics } from "metrics.slint";
 
 export component CloseButton inherits Rectangle {
     in property <length> box: 30px;
@@ -36,7 +35,7 @@ export component CloseButton inherits Rectangle {
     border-width: 1px;
     border-color: cbta.has-hover ? Theme.danger.with-alpha(0.55) : Theme.border-strong;
     background: cbta.has-hover ? Theme.danger.with-alpha(0.16) : transparent;
-    animate background, border-color { duration: Metrics.motion-fast; }
+    animate background, border-color { duration: 120ms; }
 
     Image {
         source: @image-url("../assets/icons/x.svg");
@@ -114,69 +113,13 @@ export component DragGrip inherits Rectangle {
 // `ti.preferred-height` = wrapped height at the assigned width, and we bind the root
 // to it. This is exactly how std-widgets' TextEditBase sizes its viewport
 // (`text-input.preferred-height`). No cycle: preferred-height depends on width only.
-// WindowHeader — the title row every standalone window shares, so their
-// headers line up pixel for pixel: brand mark, drag grip, title, an optional
-// muted note at the right, and the CloseButton. Everything except Close drags.
-export component WindowHeader inherits HorizontalLayout {
-    in property <string> title;
-    in property <string> note: "";
-    callback drag-start();
-    callback drag-move();
-    callback close();
-    spacing: Metrics.space-sm;
-    Rectangle {
-        horizontal-stretch: 1;
-        height: 30px;
-        TouchArea {
-            mouse-cursor: grab;
-            pointer-event(ev) => {
-                if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
-                    root.drag-start();
-                }
-            }
-            moved => { if (self.pressed) { root.drag-move(); } }
-        }
-        HorizontalLayout {
-            spacing: 7px;
-            Rectangle {
-                width: 22px;
-                height: 30px;
-                BrandHeaderMark { y: 4px; mark-size: 22px; }
-            }
-            Rectangle {
-                width: 13px;
-                height: 30px;
-                DragGrip { y: 2px; }
-            }
-            Text {
-                text: root.title;
-                font-size: Metrics.font-title;
-                font-weight: 700;
-                color: Theme.text-primary;
-                vertical-alignment: center;
-                overflow: elide;
-            }
-            Text {
-                text: root.note;
-                font-size: Metrics.font-label;
-                color: Theme.text-muted;
-                vertical-alignment: center;
-                horizontal-alignment: right;
-                horizontal-stretch: 1;
-                overflow: elide;
-            }
-        }
-    }
-    CloseButton { clicked => { root.close(); } }
-}
-
 export component SelectableText inherits Rectangle {
     height: ti.preferred-height;
     in property <string> text;
     // When display text differs from source text, show it without a selectable
     // TextInput so clipboard/memory can never receive the display-only rewrite.
     in property <string> source-text: root.text;
-    in property <length> font-size: Metrics.font-body;
+    in property <length> font-size: 12px;
     in property <int> font-weight: 400;
     in property <brush> text-color;
     in property <TextWrap> wrap: word-wrap;

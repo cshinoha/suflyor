@@ -15,7 +15,6 @@
 
 use super::{ComponentHandle, SettingsWindow, SharedString};
 use overlay_backend::bridge::{self, BridgeHandle};
-use overlay_backend::hermes_install::{HermesError, PluginInstalled};
 use std::cell::RefCell;
 
 thread_local! {
@@ -24,113 +23,25 @@ thread_local! {
     static BRIDGE: RefCell<Option<BridgeHandle>> = const { RefCell::new(None) };
 }
 
-/// Localized status line reflecting the LIVE bridge state (thread-local handle), for the
+/// RU status line reflecting the LIVE bridge state (thread-local handle), for the
 /// Settings label. Used by `populate_token_status` on every (re)open so the label
 /// is never stale, and by the seed in `wire_hermes_settings`.
-pub(crate) fn current_bridge_status(host: &str, port: u16, ru: bool) -> String {
-    bridge_status_label(BRIDGE.with(|b| b.borrow().is_some()), host, port, ru)
-}
-
-fn bridge_status_label(running: bool, host: &str, port: u16, ru: bool) -> String {
-    if running {
+pub(crate) fn current_bridge_status(host: &str, port: u16) -> String {
+    if BRIDGE.with(|b| b.borrow().is_some()) {
         let h = if host.trim().is_empty() {
             "127.0.0.1"
         } else {
             host.trim()
         };
-        let on = if ru { "включён" } else { "on" };
-        format!("{on} · {h}:{port}")
-    } else if ru {
+        format!("включён · {h}:{port}")
+    } else {
         "выключен".to_string()
-    } else {
-        "off".to_string()
-    }
-}
-
-fn bridge_error_label(error: &str, ru: bool) -> String {
-    let prefix = if ru { "ошибка" } else { "error" };
-    format!("{prefix}: {error}")
-}
-
-fn bridge_port_error_label(ru: bool) -> &'static str {
-    if ru {
-        "порт: нужно число 1–65535"
-    } else {
-        "port: enter a number 1–65535"
-    }
-}
-
-/// Button labels as `settings_panel.slint` and `ru.po` show them, for "press … again".
-const INSTALL_PLUGIN_BUTTON: (&str, &str) =
-    ("Install plugin in Hermes", "Установить плагин в Hermes");
-const API_SETUP_BUTTON: (&str, &str) = ("Get key from local Hermes", "Ключ из локального Hermes");
-
-/// Status after "Install plugin in Hermes"; without the bridge it also asks to turn it on.
-fn plugin_installed_label(done: &PluginInstalled, bridge_on: bool, ru: bool) -> String {
-    let status = match (done, ru) {
-        (PluginInstalled::Enabled, true) => {
-            "Готово: плагин установлен и включён — перезапустите Hermes"
-        }
-        (PluginInstalled::Enabled, false) => "Plugin installed and enabled — restart Hermes",
-        (PluginInstalled::Updated, true) => {
-            "Готово: плагин обновлён (уже включён) — перезапустите Hermes"
-        }
-        (PluginInstalled::Updated, false) => "Plugin updated (already enabled) — restart Hermes",
-        (PluginInstalled::FilesOnly, true) => {
-            "Файлы плагина установлены. Выполните hermes plugins enable suflyor или добавьте suflyor в plugins.enabled в файле config.yaml Hermes, затем перезапустите Hermes."
-        }
-        (PluginInstalled::FilesOnly, false) => {
-            "Plugin files installed. Run hermes plugins enable suflyor or add suflyor to plugins.enabled in Hermes config.yaml, then restart Hermes."
-        }
-    };
-    match (bridge_on, ru) {
-        (true, _) => status.to_string(),
-        (false, true) => format!("{status} · включите «Мост для Hermes» выше"),
-        (false, false) => format!("{status} · enable the Hermes bridge above"),
-    }
-}
-
-/// A Hermes file error: the cause, then the button (`(en, ru)` label) to press again.
-fn hermes_error_label(error: &HermesError, button: (&str, &str), ru: bool) -> String {
-    let (en_b, ru_b) = button;
-    // Settings can be screen-shared: show the home folder masked, as Diagnostics does.
-    let shown =
-        |p: &std::path::Path| super::diagnostics::redact_user_home(&p.display().to_string());
-    match (error, ru) {
-        (HermesError::NotFound(Some(home)), true) => format!(
-            "Hermes не найден: нет папки {}. Установите Hermes и нажмите «{ru_b}» ещё раз.",
-            shown(home)
-        ),
-        (HermesError::NotFound(Some(home)), false) => format!(
-            "Hermes not found: there is no {} folder. Install Hermes, then press {en_b} again.",
-            shown(home)
-        ),
-        (HermesError::NotFound(None), true) => format!(
-            "Hermes не найден: не задан домашний каталог. Укажите HERMES_HOME и нажмите «{ru_b}» ещё раз."
-        ),
-        (HermesError::NotFound(None), false) => format!(
-            "Hermes not found: no home folder is set. Set HERMES_HOME, then press {en_b} again."
-        ),
-        (HermesError::Io(path, e), true) => format!(
-            "Нет доступа к {}: {e}. Проверьте права на файл и нажмите «{ru_b}» ещё раз.",
-            shown(path)
-        ),
-        (HermesError::Io(path, e), false) => format!(
-            "Cannot access {}: {e}. Check the file permissions, then press {en_b} again.",
-            shown(path)
-        ),
-        (HermesError::UnsupportedConfig, true) => format!(
-            "config.yaml в Hermes нестандартный: впишите platforms.api_server.extra.key вручную и нажмите «{ru_b}» ещё раз."
-        ),
-        (HermesError::UnsupportedConfig, false) => format!(
-            "Hermes config.yaml has an unusual layout: add platforms.api_server.extra.key by hand, then press {en_b} again."
-        ),
     }
 }
 
 /// Start or stop the bridge to match `cfg.hermes_bridge_enabled`. Idempotent:
 /// stops any running instance first, then (re)starts when enabled. Returns a
-/// short localized status line for the Settings label (safe to show; no secrets).
+/// short RU status line for the Settings label (safe to show; no secrets).
 /// Call at boot and whenever the toggle / port / token changes.
 pub(crate) fn apply_bridge_state(cfg: &overlay_backend::config::SharedConfig) -> String {
     // Always stop the current one first (so a port/token edit re-binds cleanly).
@@ -139,12 +50,9 @@ pub(crate) fn apply_bridge_state(cfg: &overlay_backend::config::SharedConfig) ->
             h.stop();
         }
     });
-    let (enabled, ru) = {
-        let c = cfg.read();
-        (c.hermes_bridge_enabled, c.ui_language == "ru")
-    };
+    let enabled = cfg.read().hermes_bridge_enabled;
     if !enabled {
-        return bridge_status_label(false, "", 0, ru);
+        return "выключен".to_string();
     }
     match bridge::start(cfg.clone()) {
         Ok(handle) => {
@@ -153,9 +61,9 @@ pub(crate) fn apply_bridge_state(cfg: &overlay_backend::config::SharedConfig) ->
                 (c.hermes_bridge_host.clone(), c.hermes_bridge_port)
             };
             BRIDGE.with(|b| *b.borrow_mut() = Some(handle));
-            current_bridge_status(&host, port, ru)
+            current_bridge_status(&host, port)
         }
-        Err(e) => bridge_error_label(&e, ru),
+        Err(e) => format!("ошибка: {e}"),
     }
 }
 
@@ -178,15 +86,11 @@ pub(crate) fn wire_hermes_settings(
         win.set_hermes_api_key(SharedString::from(c.hermes_api_key.clone()));
     }
     // Reflect the CURRENT live state (boot may have started it already).
-    let (host, port, ru) = {
+    let (host, port) = {
         let c = cfg.read();
-        (
-            c.hermes_bridge_host.clone(),
-            c.hermes_bridge_port,
-            c.ui_language == "ru",
-        )
+        (c.hermes_bridge_host.clone(), c.hermes_bridge_port)
     };
-    win.set_hermes_bridge_status(SharedString::from(current_bridge_status(&host, port, ru)));
+    win.set_hermes_bridge_status(SharedString::from(current_bridge_status(&host, port)));
 
     // -- toggle: persist + start/stop live --
     {
@@ -220,9 +124,7 @@ pub(crate) fn wire_hermes_settings(
         win.on_hermes_bridge_port_save(move |txt| {
             let Ok(port) = txt.trim().parse::<u16>() else {
                 if let Some(w) = weak.upgrade() {
-                    w.set_hermes_bridge_status(SharedString::from(bridge_port_error_label(
-                        cfg_c.read().ui_language == "ru",
-                    )));
+                    w.set_hermes_bridge_status(SharedString::from("порт: нужно число 1–65535"));
                 }
                 return;
             };
@@ -263,13 +165,8 @@ pub(crate) fn wire_hermes_settings(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_hermes_plugin_install(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else { return };
-            w.set_hermes_plugin_install_status(SharedString::from(if ru {
-                "Установка…"
-            } else {
-                "Installing…"
-            }));
+            w.set_hermes_plugin_install_status(SharedString::from("устанавливаю…"));
             // The .env write needs a real token — mint on first use, exactly
             // like the enable-toggle does.
             let (host, port, token, bridge_on) = {
@@ -290,8 +187,9 @@ pub(crate) fn wire_hermes_settings(
             let weak_res = w.as_weak();
             std::thread::spawn(move || {
                 let msg = match overlay_backend::hermes_install::install_plugin(&url, &token) {
-                    Ok(done) => plugin_installed_label(&done, bridge_on, ru),
-                    Err(e) => hermes_error_label(&e, INSTALL_PLUGIN_BUTTON, ru),
+                    Ok(s) if bridge_on => s,
+                    Ok(s) => format!("{s} · и включи «Мост для Hermes» выше"),
+                    Err(e) => format!("ошибка: {e}"),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak_res.upgrade() {
@@ -339,20 +237,15 @@ pub(crate) fn wire_hermes_settings(
         });
     }
 
-    // -- «Ключ из локального Hermes» (тестер не обязан знать, что такое
+    // -- «Взять ключ из локального Hermes» (тестер не обязан знать, что такое
     // API_SERVER_KEY): включает platforms.api_server в конфиге ЛОКАЛЬНОГО
     // Hermes, создаёт/читает ключ и вписывает его в suflyor. --
     {
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_hermes_api_setup(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else { return };
-            w.set_hermes_api_setup_status(SharedString::from(if ru {
-                "Настройка…"
-            } else {
-                "Setting up…"
-            }));
+            w.set_hermes_api_setup_status(SharedString::from("настраиваю…"));
             let cfg_save = cfg_c.clone();
             let weak_res = w.as_weak();
             std::thread::spawn(move || {
@@ -367,24 +260,16 @@ pub(crate) fn wire_hermes_settings(
                                 let _ = overlay_backend::config::save(&c);
                             }
                             w.set_hermes_api_key(SharedString::from(key));
-                            w.invoke_backup_status_requested();
                             w.set_hermes_api_setup_status(SharedString::from(if changed {
-                                if ru {
-                                    "API-сервер включён, ключ сохранён — перезапустите Hermes"
-                                } else {
-                                    "API server enabled, key saved — restart Hermes"
-                                }
+                                "готово: API-сервер включён, ключ создан и вписан — перезапусти Hermes"
                             } else {
-                                if ru {
-                                    "Ключ из Hermes сохранён"
-                                } else {
-                                    "Key from Hermes saved"
-                                }
+                                "готово: ключ взят из Hermes и вписан сюда"
                             }));
                         }
                         Err(e) => {
-                            let text = hermes_error_label(&e, API_SETUP_BUTTON, ru);
-                            w.set_hermes_api_setup_status(SharedString::from(text));
+                            w.set_hermes_api_setup_status(SharedString::from(format!(
+                                "ошибка: {e}"
+                            )));
                         }
                     }
                 });
@@ -400,13 +285,10 @@ pub(crate) fn wire_hermes_settings(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_hermes_api_test(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else { return };
-            w.set_hermes_api_test_result(SharedString::from(if ru {
-                "Проверка… (может занять пару минут)"
-            } else {
-                "Checking… (may take a couple of minutes)"
-            }));
+            w.set_hermes_api_test_result(SharedString::from(
+                "проверка… (агентный вызов — до пары минут)",
+            ));
             let (url, key) = {
                 let c = cfg_c.read();
                 (c.hermes_api_url.clone(), c.hermes_api_key.clone())
@@ -430,15 +312,10 @@ pub(crate) fn wire_hermes_settings(
                         messages,
                         16,
                     )) {
-                        Ok(_) => if ru {
-                            "Агент ответил"
-                        } else {
-                            "Agent replied"
-                        }
-                        .to_string(),
-                        Err(e) => super::status_copy::connection_failed(ru, &format!("{e:#}")),
+                        Ok(_) => "[ok] агент ответил".to_string(),
+                        Err(e) => format!("[err] {e:#}").chars().take(90).collect(),
                     },
-                    Err(e) => super::status_copy::check_not_started(ru, &e),
+                    Err(e) => format!("[err] runtime: {e}"),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak_res.upgrade() {
@@ -454,22 +331,13 @@ pub(crate) fn wire_hermes_settings(
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_hermes_prepare_profile(move |seed| {
-            let ru = cfg_c.read().ui_is_ru();
             let seed = seed.trim().to_string();
             let Some(w) = weak.upgrade() else { return };
             if seed.is_empty() {
-                w.set_hermes_profile_status(SharedString::from(if ru {
-                    "Введите компанию и роль"
-                } else {
-                    "Enter the company and role"
-                }));
+                w.set_hermes_profile_status(SharedString::from("впиши вводную (компания/роль)"));
                 return;
             }
-            w.set_hermes_profile_status(SharedString::from(if ru {
-                "Hermes готовит профиль… (это может занять время)"
-            } else {
-                "Hermes is preparing a profile… (this may take a while)"
-            }));
+            w.set_hermes_profile_status(SharedString::from("Hermes готовит профиль… (это долго)"));
             let (url, key) = {
                 let c = cfg_c.read();
                 (c.hermes_api_url.clone(), c.hermes_api_key.clone())
@@ -494,7 +362,7 @@ pub(crate) fn wire_hermes_settings(
 }
 
 /// Off-thread: ask Hermes to research `seed` into a call-profile context, then
-/// upsert it as a new ACTIVE profile in config. Returns a localized status line.
+/// upsert it as a new ACTIVE profile in config. Returns an RU status line.
 /// `profile_name` is derived from the seed's first line (capped), so re-prepping
 /// the same seed updates the same profile instead of piling up duplicates.
 fn run_prepare_profile(
@@ -503,7 +371,6 @@ fn run_prepare_profile(
     seed: &str,
     cfg: &overlay_backend::config::SharedConfig,
 ) -> String {
-    let ru = cfg.read().ui_is_ru();
     let prompt = format!(
         "Ты помогаешь подготовиться к рабочему созвону/собеседованию. По вводной ниже \
          собери КОМПАКТНУЮ справку-контекст (на русском), которую ассистент будет \
@@ -519,13 +386,7 @@ fn run_prepare_profile(
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => {
-            return if ru {
-                format!("Не удалось запустить обработку: {e}")
-            } else {
-                format!("Could not start processing: {e}")
-            }
-        }
+        Err(e) => return format!("ошибка runtime: {e}"),
     };
     // Non-streaming collect; big token budget (the qwen-kit handoff: a thinking
     // model needs ≥3000 or content comes back empty). Generous — this is slow.
@@ -548,26 +409,10 @@ fn run_prepare_profile(
             c.active_profile = Some(name.clone());
             c.meeting_context = text;
             let _ = overlay_backend::config::save(&c);
-            if ru {
-                format!("Профиль «{name}» создан и активен")
-            } else {
-                format!("Profile {name} created and active")
-            }
+            format!("готово: профиль «{name}» создан и активен")
         }
-        Ok(_) => if ru {
-            "Hermes вернул пустой ответ"
-        } else {
-            "Hermes returned an empty answer"
-        }
-        .to_string(),
-        Err(e) => if ru {
-            format!("Ошибка Hermes: {e:#}")
-        } else {
-            format!("Hermes error: {e:#}")
-        }
-        .chars()
-        .take(120)
-        .collect(),
+        Ok(_) => "Hermes вернул пустой ответ (модель не дала контент)".to_string(),
+        Err(e) => format!("ошибка Hermes: {e:#}").chars().take(120).collect(),
     }
 }
 
@@ -584,98 +429,7 @@ fn profile_name_from_seed(seed: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        bridge_error_label, bridge_port_error_label, bridge_status_label, current_bridge_status,
-        hermes_error_label, plugin_installed_label, profile_name_from_seed, HermesError,
-        PluginInstalled, API_SETUP_BUTTON, INSTALL_PLUGIN_BUTTON,
-    };
-
-    #[test]
-    fn hermes_errors_name_the_cause_and_the_button() {
-        let missing = HermesError::NotFound(Some(std::path::PathBuf::from("/home/u/.hermes")));
-        assert_eq!(
-            hermes_error_label(&missing, INSTALL_PLUGIN_BUTTON, false),
-            "Hermes not found: there is no /home/u/.hermes folder. Install Hermes, then press Install plugin in Hermes again."
-        );
-        assert_eq!(
-            hermes_error_label(&missing, INSTALL_PLUGIN_BUTTON, true),
-            "Hermes не найден: нет папки /home/u/.hermes. Установите Hermes и нажмите «Установить плагин в Hermes» ещё раз."
-        );
-        let odd = HermesError::UnsupportedConfig;
-        assert!(hermes_error_label(&odd, API_SETUP_BUTTON, true)
-            .ends_with("нажмите «Ключ из локального Hermes» ещё раз."));
-        assert!(hermes_error_label(&odd, API_SETUP_BUTTON, false)
-            .ends_with("press Get key from local Hermes again."));
-    }
-
-    #[test]
-    fn plugin_status_follows_ui_language() {
-        assert_eq!(
-            plugin_installed_label(&PluginInstalled::Updated, true, false),
-            "Plugin updated (already enabled) — restart Hermes"
-        );
-        assert_eq!(
-            plugin_installed_label(&PluginInstalled::Enabled, false, true),
-            "Готово: плагин установлен и включён — перезапустите Hermes · включите «Мост для Hermes» выше"
-        );
-    }
-
-    #[test]
-    fn files_only_plugin_status_gives_the_same_enable_steps_in_both_languages() {
-        for ru in [false, true] {
-            let text = plugin_installed_label(&PluginInstalled::FilesOnly, true, ru);
-            assert!(text.contains("hermes plugins enable suflyor"));
-            assert!(text.contains("suflyor") && text.contains("plugins.enabled"));
-            assert!(text.contains("config.yaml"));
-            assert!(text.ends_with(if ru {
-                "перезапустите Hermes."
-            } else {
-                "restart Hermes."
-            }));
-        }
-    }
-
-    #[test]
-    fn bridge_status_follows_ui_language() {
-        assert_eq!(
-            bridge_status_label(true, "localhost", 9123, true),
-            "включён · localhost:9123"
-        );
-        assert_eq!(
-            bridge_status_label(true, "localhost", 9123, false),
-            "on · localhost:9123"
-        );
-        assert_eq!(
-            bridge_status_label(false, "localhost", 9123, true),
-            "выключен"
-        );
-        assert_eq!(bridge_status_label(false, "localhost", 9123, false), "off");
-        assert_eq!(
-            bridge_status_label(true, "  ", 9123, true),
-            "включён · 127.0.0.1:9123"
-        );
-        assert_eq!(
-            bridge_status_label(true, "  ", 9123, false),
-            "on · 127.0.0.1:9123"
-        );
-        assert_eq!(
-            bridge_status_label(true, " localhost ", 9123, false),
-            "on · localhost:9123"
-        );
-        assert_eq!(current_bridge_status("localhost", 9123, true), "выключен");
-        assert_eq!(current_bridge_status("localhost", 9123, false), "off");
-    }
-
-    #[test]
-    fn bridge_errors_have_both_ui_languages() {
-        assert_eq!(bridge_error_label("test", true), "ошибка: test");
-        assert_eq!(bridge_error_label("test", false), "error: test");
-        assert_eq!(bridge_port_error_label(true), "порт: нужно число 1–65535");
-        assert_eq!(
-            bridge_port_error_label(false),
-            "port: enter a number 1–65535"
-        );
-    }
+    use super::profile_name_from_seed;
 
     #[test]
     fn profile_name_derivation() {

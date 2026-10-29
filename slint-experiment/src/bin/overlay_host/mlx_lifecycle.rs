@@ -14,10 +14,10 @@ fn lifecycle_lock() -> &'static std::sync::Mutex<()> {
 fn selected_mlx_model(route: AskRoute, config: &overlay_backend::config::Config) -> Option<String> {
     match route {
         AskRoute::Text if config.ai_provider == "mlx" => Some(config.ai_mlx_model.clone()),
-        AskRoute::Vision if config.vision_provider == "mlx" => {
+        AskRoute::Vision | AskRoute::VisionSmart if config.vision_provider == "mlx" => {
             Some(config.vision_mlx_model.clone())
         }
-        AskRoute::Vision
+        AskRoute::Vision | AskRoute::VisionSmart
             if config.vision_provider == "same"
                 && config.ai_provider == "mlx"
                 && overlay_backend::mlx_install::catalog_model(&config.ai_mlx_model)
@@ -25,7 +25,7 @@ fn selected_mlx_model(route: AskRoute, config: &overlay_backend::config::Config)
         {
             Some(config.ai_mlx_model.clone())
         }
-        AskRoute::Text | AskRoute::Vision | AskRoute::Cloud => None,
+        AskRoute::Text | AskRoute::Vision | AskRoute::VisionSmart | AskRoute::Cloud => None,
     }
 }
 
@@ -140,7 +140,7 @@ pub(crate) fn start_mlx_for_unlock(
 
 pub(crate) fn show_mlx_runtime_error(weak: slint::Weak<TileWindow>, is_ru: bool) {
     let message = if is_ru {
-        "Не удалось запустить локальный AI. Проверьте установленную модель в Настройках."
+        "Не удалось запустить локальный ИИ. Проверьте установленную модель в Настройках."
     } else {
         "Couldn't start local AI. Check the installed model in Settings."
     };
@@ -182,12 +182,12 @@ pub(crate) fn spawn_mlx_runtime_error(
     let _ = events.spawn_tile_full(
         TileSpec {
             question: if is_ru {
-                "Локальный AI".into()
+                "Локальный ИИ".into()
             } else {
                 "Local AI".into()
             },
             answer: if is_ru {
-                "Не удалось запустить локальный AI. Проверьте установленную модель в Настройках."
+                "Не удалось запустить локальный ИИ. Проверьте установленную модель в Настройках."
                     .into()
             } else {
                 "Couldn't start local AI. Check the installed model in Settings.".into()

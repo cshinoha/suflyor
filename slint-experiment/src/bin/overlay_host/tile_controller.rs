@@ -54,9 +54,9 @@
 //! guard, and `classify_ai_error` through it). That is intentional for the
 //! extraction; the imports get narrowed in a later pass.
 use super::{
-    ai, classify_ai_error, to_md_blocks, to_md_blocks_streaming, tokio_mpsc, Arc, AtomicBool,
-    AtomicU64, ModelRc, MonitorHint, Ordering, OverlayBarWindow, RuntimeEvents, SharedString,
-    SlintUiBridge, TileKind, TileSpec, TileWindow, VecModel,
+    ai, classify_ai_error, to_md_blocks, to_md_blocks_streaming, tokio_mpsc, Arc, AtomicU64,
+    ModelRc, MonitorHint, Ordering, OverlayBarWindow, RuntimeEvents, SharedString, SlintUiBridge,
+    TileKind, TileSpec, TileWindow, VecModel,
 };
 
 /// Phase E6 v45 — monotonic conversation id for the in-tile continue-dialog
@@ -120,6 +120,10 @@ pub(crate) fn install_streaming_tile(
     bridge: &Arc<OverlayBarBridge>,
     new_tile: StreamingTile,
 ) -> u64 {
+    // A new stream supersedes any prior one; reset the in-flight pulse
+    // count so an aborted prior stream (which never emits Done/Error)
+    // can't leak its Start increment and pin the bar pulse ON forever.
+    bridge.reset_ai_in_flight();
     // Bump the stream generation: any still-running prior stream is now
     // "stale" and its GenGatedEvents wrapper will drop further emits.
     let generation = bridge.stream_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -134,9 +138,7 @@ pub(crate) fn install_streaming_tile(
         if old.convo_id != new_convo {
             if let Some(t) = old.weak.upgrade() {
                 t.set_followup_busy(false);
-                t.set_source_label(SharedString::from(crate::tile_text::superseded_label(
-                    bridge.cfg.read().ui_is_ru(),
-                )));
+                t.set_source_label(SharedString::from("ai · superseded"));
             }
         }
     }
@@ -154,44 +156,15 @@ pub(crate) fn install_streaming_tile(
 struct GenGatedEvents {
     inner: Arc<dyn RuntimeEvents>,
     my_gen: u64,
-    bridge: Arc<OverlayBarBridge>,
-    in_flight: AtomicBool,
-}
-
-impl GenGatedEvents {
-    fn finish(&self) {
-        if self.in_flight.swap(false, Ordering::SeqCst) {
-            self.bridge.dec_ai_in_flight();
-        }
-    }
-}
-
-impl Drop for GenGatedEvents {
-    fn drop(&mut self) {
-        self.finish();
-    }
+    current: Arc<AtomicU64>,
 }
 
 impl RuntimeEvents for GenGatedEvents {
-    fn tile_request_open(&self, label: &str) -> bool {
-        self.inner.tile_request_open(label)
-    }
-
     fn emit(&self, channel: &str, payload: serde_json::Value) {
-        if self.my_gen != self.bridge.stream_gen.load(Ordering::SeqCst) {
-            self.finish();
-            return;
+        if self.my_gen == self.current.load(Ordering::SeqCst) {
+            self.inner.emit(channel, payload);
         }
-        if channel == "ai:event" {
-            match payload.get("type").and_then(serde_json::Value::as_str) {
-                Some("start") if !self.in_flight.swap(true, Ordering::SeqCst) => {
-                    self.bridge.inc_ai_in_flight();
-                }
-                Some("done" | "error") => self.finish(),
-                _ => {}
-            }
-        }
-        self.inner.emit(channel, payload);
+        // else: stale stream — drop the event.
     }
     fn spawn_tile_full(
         &self,
@@ -214,8 +187,7 @@ pub(crate) fn gated_events(
     Arc::new(GenGatedEvents {
         inner,
         my_gen: generation,
-        bridge: bridge.clone(),
-        in_flight: AtomicBool::new(false),
+        current: bridge.stream_gen.clone(),
     })
 }
 
@@ -234,7 +206,6 @@ pub(crate) struct PttStreamSink {
     convo_id: i32,
     state: std::sync::Mutex<PttSinkState>,
     last_render: std::sync::Mutex<std::time::Instant>,
-    in_flight: std::sync::atomic::AtomicBool,
 }
 
 struct PttSinkState {
@@ -267,28 +238,11 @@ impl PttStreamSink {
                 request_messages,
             }),
             last_render: std::sync::Mutex::new(seeded),
-            in_flight: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    fn finish_in_flight(&self) {
-        if self.in_flight.swap(false, Ordering::SeqCst) {
-            self.bridge.dec_ai_in_flight();
-        }
-    }
-}
-
-impl Drop for PttStreamSink {
-    fn drop(&mut self) {
-        self.finish_in_flight();
     }
 }
 
 impl RuntimeEvents for PttStreamSink {
-    fn tile_request_open(&self, label: &str) -> bool {
-        self.inner.tile_request_open(label)
-    }
-
     fn emit(&self, channel: &str, payload: serde_json::Value) {
         if channel != "ai:event" {
             self.inner.emit(channel, payload);
@@ -298,25 +252,7 @@ impl RuntimeEvents for PttStreamSink {
             return;
         };
         match evt {
-            ai::AiEvent::Start { .. } => {
-                if !self.in_flight.swap(true, Ordering::SeqCst) {
-                    self.bridge.inc_ai_in_flight();
-                }
-            }
-            ai::AiEvent::Tool { name, detail } => {
-                let ru = self.bridge.cfg.read().ui_is_ru();
-                let body = {
-                    let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    tool_status_body(&st.prefix, &st.accumulated, &name, &detail, ru)
-                };
-                let weak = self.tile.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(t) = weak.upgrade() {
-                        t.set_source_label(SharedString::from(crate::tile_text::tool_label(ru)));
-                        t.set_blocks(ModelRc::new(VecModel::from(to_md_blocks_streaming(&body))));
-                    }
-                });
-            }
+            ai::AiEvent::Start { .. } => self.bridge.inc_ai_in_flight(),
             ai::AiEvent::Delta { text } => {
                 // Accumulate the (cheap) push FIRST, then throttle, then clone the
                 // O(n) body ONLY when we're actually going to render (audit P2).
@@ -336,12 +272,7 @@ impl RuntimeEvents for PttStreamSink {
                 }
                 let body = {
                     let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    let answer = if ai::uses_fast_answer_format(&st.request_messages) {
-                        overlay_backend::runtime::hide_terms_line_while_streaming(&st.accumulated)
-                    } else {
-                        st.accumulated.clone()
-                    };
-                    format!("{}{answer}", st.prefix)
+                    format!("{}{}", st.prefix, st.accumulated)
                 };
                 let weak = self.tile.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -351,7 +282,7 @@ impl RuntimeEvents for PttStreamSink {
                 });
             }
             ai::AiEvent::Done { reason } => {
-                self.finish_in_flight();
+                self.bridge.dec_ai_in_flight();
                 let (answer, prefix, messages) = {
                     let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     (
@@ -360,18 +291,7 @@ impl RuntimeEvents for PttStreamSink {
                         st.request_messages.clone(),
                     )
                 };
-                let (shown, terms) = if ai::uses_fast_answer_format(&messages) {
-                    overlay_backend::runtime::split_terms_line(&answer)
-                } else {
-                    (answer.clone(), Vec::new())
-                };
-                let question = messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == "user")
-                    .map(|message| super::message_text(&message.content))
-                    .unwrap_or_default();
-                let rendered = format!("{prefix}{shown}");
+                let rendered = format!("{prefix}{answer}");
                 if self.convo_id >= 0 {
                     let mut messages = messages;
                     messages.push(ai::ChatMessage {
@@ -390,30 +310,22 @@ impl RuntimeEvents for PttStreamSink {
                 // A zero-token Done (some vision servers do this on an
                 // unsupported image, or a content filter) would replace the
                 // placeholder with an empty body — show a note, not a blank tile.
-                let ru = self.bridge.cfg.read().ui_is_ru();
                 let final_body = if answer.trim().is_empty() {
-                    format!("{prefix}{}", crate::tile_text::empty_answer_note(ru))
+                    format!("{prefix}_(модель не вернула ответ)_")
                 } else {
                     rendered
                 };
                 let weak = self.tile.clone();
-                let cfg = self.bridge.cfg.clone();
-                let rt_handle = tokio::runtime::Handle::try_current().ok();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(t) = weak.upgrade() {
                         t.set_blocks(ModelRc::new(VecModel::from(to_md_blocks(&final_body))));
-                        if let Some(rt_handle) = rt_handle {
-                            super::tile_terms::wire_terms(&t, &terms, question, &cfg, &rt_handle);
-                        }
-                        t.set_source_label(SharedString::from(crate::tile_text::done_label(
-                            &reason, ru,
-                        )));
+                        t.set_source_label(SharedString::from(format!("ai · done ({reason})")));
                         t.set_followup_busy(false);
                     }
                 });
             }
             ai::AiEvent::Error { message } => {
-                self.finish_in_flight();
+                self.bridge.dec_ai_in_flight();
                 // SECURITY (review C1) — the raw error chain embeds the AI
                 // base_url (the LOCAL server's LAN IP:port), which would leak
                 // into the screen-shared tile. classify_ai_error maps it to a
@@ -422,23 +334,22 @@ impl RuntimeEvents for PttStreamSink {
                 // regenerate + push-to-talk asks. A deep-locked managed server
                 // gets the specific localized notice.
                 let blocked = overlay_backend::deep_lock::is_blocked_error(&message);
-                let ru = self.bridge.cfg.read().ui_is_ru();
                 let safe = if blocked {
+                    let ru = self.bridge.cfg.read().ui_is_ru();
                     overlay_backend::deep_lock::blocked_notice(ru)
                 } else {
-                    slint_replay::app_state::ai_error_text(classify_ai_error(&message), ru)
+                    classify_ai_error(&message)
                 };
                 let body = if blocked {
                     safe.to_string()
                 } else {
-                    crate::tile_text::error_body(safe, ru)
+                    format!("AI error: {safe}")
                 };
                 let weak = self.tile.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(t) = weak.upgrade() {
                         t.set_blocks(ModelRc::new(VecModel::from(to_md_blocks(&body))));
-                        t.set_source_label(SharedString::from(crate::tile_text::error_label(ru)));
-                        t.set_plain_notice(true);
+                        t.set_source_label(SharedString::from("error"));
                         t.set_followup_busy(false);
                     }
                 });
@@ -471,8 +382,6 @@ pub(crate) struct OverlayBarBridge {
     pub(crate) cfg: overlay_backend::config::SharedConfig,
     pub(crate) spawn_tx: tokio_mpsc::UnboundedSender<SpawnTileRequest>,
     pub(crate) tile_seq: AtomicU64,
-    pub(crate) spawn_generation: AtomicU64,
-    pub(crate) auto_requests: Arc<std::sync::Mutex<std::collections::HashMap<String, i32>>>,
     /// Phase E6 v18 — last time we pushed a transcript:line update
     /// to the bar UI. Throttle to MIN_TRANSCRIPT_PUSH_INTERVAL so
     /// fast STT chunks (one every ~200ms in aggressive Whisper mode)
@@ -493,7 +402,7 @@ pub(crate) struct OverlayBarBridge {
     /// in parallel even though F9 is exclusive). Bar's ai-streaming
     /// flag mirrors `counter > 0`. Incremented on AiEvent::Start,
     /// decremented on AiEvent::Done/Error.
-    pub(crate) ai_in_flight: Arc<std::sync::atomic::AtomicI32>,
+    pub(crate) ai_in_flight: std::sync::atomic::AtomicI32,
     /// Phase E6 v45 — per-tile conversations for the in-tile "continue
     /// dialog" feature, keyed by the tile's `convo-id`. Seeded when an
     /// F9/PTT answer completes; read+extended on each follow-up.
@@ -513,17 +422,6 @@ pub(crate) struct OverlayBarBridge {
     pub(crate) last_tile_render: std::sync::Mutex<std::time::Instant>,
     /// Last time a cap event spawned a visible notice tile.
     pub(crate) last_cap_notice: std::sync::Mutex<std::time::Instant>,
-}
-
-/// The streaming body with a line saying which lookup runs; the next delta
-/// re-renders `prefix + accumulated` and the line goes away.
-fn tool_status_body(prefix: &str, accumulated: &str, name: &str, detail: &str, ru: bool) -> String {
-    let line = crate::tile_text::tool_body(name, detail, ru);
-    if accumulated.trim().is_empty() {
-        format!("{prefix}{line}")
-    } else {
-        format!("{prefix}{accumulated}\n\n{line}")
-    }
 }
 
 /// Per-streaming-tile state: weak handle + accumulated answer text.
@@ -558,42 +456,11 @@ pub(crate) struct ConvoState {
     pub(crate) rendered: String,
 }
 
-/// What a spawn request does with its label.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SpawnAction {
-    /// Create a tile.
-    New,
-    /// Put the complete answer into the streaming auto tile and wire its
-    /// dialog the way a finished auto tile is wired.
-    Fill,
-    /// Close the streaming auto tile: its answer failed or was empty.
-    Drop,
-}
-
-thread_local! {
-    /// Streaming auto tiles by bridge label, until their Fill or Drop.
-    /// UI thread only.
-    pub(crate) static AUTO_STREAM_TILES: std::cell::RefCell<
-        std::collections::HashMap<String, slint::Weak<TileWindow>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-    /// Answer text that arrived before its tile was created (latest wins).
-    pub(crate) static AUTO_STREAM_EARLY: std::cell::RefCell<
-        std::collections::HashMap<String, String>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Most early answers kept for tiles not created yet.
-const AUTO_STREAM_EARLY_MAX: usize = 8;
-
 /// Tile-spawn request sent from the bridge (any thread) to the UI
 /// poll-Timer running on the Slint main thread. Carries everything
 /// needed to construct a TileWindow + render the markdown body.
 pub(crate) struct SpawnTileRequest {
     pub(crate) label: String,
-    pub(crate) tile_id: i32,
-    pub(crate) generation: u64,
-    /// New tile, or the end of a streaming auto tile with this label.
-    pub(crate) action: SpawnAction,
     pub(crate) spec: TileSpec,
     /// Reserved for Phase E3 follow-up — pass through to a tile-
     /// placement helper that honors MonitorHint::Named (cfg.tile_
@@ -607,38 +474,6 @@ pub(crate) struct SpawnTileRequest {
 }
 
 impl OverlayBarBridge {
-    /// UI close, bulk close and cap eviction all retire the same request owner.
-    pub(crate) fn cancel_tile_request(&self, tile: &TileWindow) {
-        let id = tile.get_tile_id();
-        super::abort_tile_stream(id);
-        self.auto_requests
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|_, owner| *owner != id);
-        AUTO_STREAM_TILES.with(|m| {
-            m.borrow_mut()
-                .retain(|_, weak| weak.upgrade().is_some_and(|t| t.get_tile_id() != id))
-        });
-        let mut slot = self
-            .current_streaming
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if slot
-            .as_ref()
-            .and_then(|s| s.weak.upgrade())
-            .is_some_and(|t| t.get_tile_id() == id)
-        {
-            self.stream_gen.fetch_add(1, Ordering::SeqCst);
-            slot.take();
-        }
-    }
-
-    pub(crate) fn cancel_pending_tiles(&self) {
-        let mut requests = self.auto_requests.lock().unwrap_or_else(|p| p.into_inner());
-        self.spawn_generation.fetch_add(1, Ordering::SeqCst);
-        requests.clear();
-    }
-
     /// FIX #8 — store a tile's conversation, keeping the map bounded. When at
     /// the cap, evict the oldest half by `convo_id` (monotonic → lowest = oldest)
     /// BEFORE inserting, mirroring `qa_cache`'s half-eviction. The eviction is a
@@ -699,116 +534,6 @@ impl OverlayBarBridge {
     /// scheduling the UI mutation. Mutex is released BEFORE the
     /// invoke_from_event_loop call so the UI thread isn't blocked
     /// on the lock if the same code path re-enters.
-    /// Draw the answer so far into a streaming auto tile.
-    fn handle_auto_tile_stream(&self, payload: serde_json::Value) {
-        let label = payload
-            .get("label")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let text = payload
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if !SlintUiBridge::tile_request_open(self, &label) {
-            return;
-        }
-        let text = if let Some(name) = payload.get("tool").and_then(|v| v.as_str()) {
-            let detail = payload
-                .get("detail")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            tool_status_body("", &text, name, detail, self.cfg.read().ui_is_ru())
-        } else {
-            text
-        };
-        let requests = self.auto_requests.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if !requests
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&label)
-            {
-                return;
-            }
-            let tile = AUTO_STREAM_TILES.with(|m| m.borrow().get(&label).map(slint::Weak::upgrade));
-            match tile {
-                Some(Some(t)) => {
-                    let shown = overlay_backend::runtime::hide_terms_line_while_streaming(&text);
-                    t.set_blocks(ModelRc::new(VecModel::from(to_md_blocks_streaming(&shown))));
-                }
-                // Closed by the user: nothing to draw.
-                Some(None) => {}
-                // Not created yet: the spawn timer draws it on creation.
-                None => AUTO_STREAM_EARLY.with(|m| {
-                    let mut m = m.borrow_mut();
-                    if m.len() >= AUTO_STREAM_EARLY_MAX && !m.contains_key(&label) {
-                        m.clear();
-                    }
-                    m.insert(label, text);
-                }),
-            }
-        });
-    }
-
-    /// Queue the end of a streaming auto tile behind its creation: both go
-    /// through the spawn channel, so a Fill or Drop never overtakes its tile.
-    fn handle_auto_tile_end(&self, channel: &str, payload: serde_json::Value) {
-        let text = |key: &str| {
-            payload
-                .get(key)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string()
-        };
-        let action = if channel == slint_replay::slint_session::AUTO_TILE_FILL_CHANNEL {
-            SpawnAction::Fill
-        } else {
-            SpawnAction::Drop
-        };
-        let highlights = payload
-            .get("highlights")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let label = text("label");
-        let (tile_id, generation) = {
-            let requests = self.auto_requests.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(tile_id) = requests.get(&label).copied() else {
-                return;
-            };
-            (tile_id, self.spawn_generation.load(Ordering::SeqCst))
-        };
-        let req = SpawnTileRequest {
-            label,
-            tile_id,
-            generation,
-            action,
-            spec: TileSpec {
-                question: text("question"),
-                answer: text("answer"),
-                source: "auto_tile".into(),
-                is_translation: false,
-                highlights,
-                summary_session: None,
-            },
-            monitor: MonitorHint::Auto,
-            stealth: payload
-                .get("stealth")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            kind: TileKind::Auto,
-        };
-        if let Err(e) = self.spawn_tx.send(req) {
-            eprintln!("[overlay-bridge] auto tile {channel} not queued: {e}");
-        }
-    }
-
     fn handle_ai_event(&self, payload: serde_json::Value) {
         let Ok(evt) = serde_json::from_value::<ai::AiEvent>(payload) else {
             return;
@@ -859,17 +584,7 @@ impl OverlayBarBridge {
                     };
                     (
                         stream.weak.clone(),
-                        format!(
-                            "{}{}",
-                            stream.prefix,
-                            if ai::uses_fast_answer_format(&stream.request_messages) {
-                                overlay_backend::runtime::hide_terms_line_while_streaming(
-                                    &stream.accumulated,
-                                )
-                            } else {
-                                stream.accumulated.clone()
-                            }
-                        ),
+                        format!("{}{}", stream.prefix, stream.accumulated),
                     )
                 };
                 let _ = slint::invoke_from_event_loop(move || {
@@ -880,6 +595,7 @@ impl OverlayBarBridge {
                 });
             }
             ai::AiEvent::Done { reason } => {
+                self.dec_ai_in_flight();
                 // Take the finished stream out of the slot, then fold its
                 // answer into the tile's conversation so the next follow-up
                 // carries full context.
@@ -897,39 +613,20 @@ impl OverlayBarBridge {
                     // would otherwise render blank ("найди в интернете…" → nothing).
                     // Show a generic note (no endpoint/tool internals) and do NOT
                     // fold an empty assistant turn into the conversation.
-                    let ru = self.cfg.read().ui_is_ru();
                     let answer_empty = stream.accumulated.trim().is_empty();
-                    let (shown, terms) = if ai::uses_fast_answer_format(&stream.request_messages) {
-                        overlay_backend::runtime::split_terms_line(&stream.accumulated)
-                    } else {
-                        (stream.accumulated.clone(), Vec::new())
-                    };
-                    let question = stream
-                        .request_messages
-                        .iter()
-                        .rev()
-                        .find(|message| message.role == "user")
-                        .map(|message| super::message_text(&message.content))
-                        .unwrap_or_default();
                     // Final body — used for the conversation snapshot AND the
                     // terminal render below (which is never throttled).
                     let final_body = if answer_empty {
-                        let note = if ru {
-                            "_(Модель не вернула текст — вероятно, запросила \
+                        let note = "_(Модель не вернула текст — вероятно, запросила \
                             инструмент вроде веб-поиска, который в этом режиме не \
-                            поддерживается. Переформулируйте вопрос без «найди/загугли».)_"
-                        } else {
-                            "_(The model returned no text. It probably asked for a tool \
-                            such as web search, which this mode does not support. \
-                            Rephrase the question without asking it to search.)_"
-                        };
+                            поддерживается. Переформулируй вопрос без «найди/загугли».)_";
                         if stream.prefix.is_empty() {
                             note.to_string()
                         } else {
                             format!("{}\n\n{note}", stream.prefix)
                         }
                     } else {
-                        format!("{}{shown}", stream.prefix)
+                        format!("{}{}", stream.prefix, stream.accumulated)
                     };
                     if stream.convo_id >= 0 && !answer_empty {
                         let mut messages = stream.request_messages;
@@ -947,8 +644,6 @@ impl OverlayBarBridge {
                         );
                     }
                     let weak = stream.weak;
-                    let cfg = self.cfg.clone();
-                    let rt_handle = tokio::runtime::Handle::try_current().ok();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(tile) = weak.upgrade() {
                             // Terminal render — NOT throttled, so the complete
@@ -957,20 +652,16 @@ impl OverlayBarBridge {
                             tile.set_blocks(ModelRc::new(VecModel::from(to_md_blocks(
                                 &final_body,
                             ))));
-                            if let Some(rt_handle) = rt_handle {
-                                super::tile_terms::wire_terms(
-                                    &tile, &terms, question, &cfg, &rt_handle,
-                                );
-                            }
-                            tile.set_source_label(SharedString::from(
-                                crate::tile_text::done_label(&reason, ru),
-                            ));
+                            tile.set_source_label(SharedString::from(format!(
+                                "ai · done ({reason})"
+                            )));
                             tile.set_followup_busy(false);
                         }
                     });
                 }
             }
             ai::AiEvent::Error { message } => {
+                self.dec_ai_in_flight();
                 let captured = {
                     let mut slot = match self.current_streaming.lock() {
                         Ok(g) => g,
@@ -986,22 +677,20 @@ impl OverlayBarBridge {
                     // voice follow-up (🎤). classify_ai_error → generic message;
                     // a deep-locked managed server gets the localized notice.
                     let blocked = overlay_backend::deep_lock::is_blocked_error(&message);
-                    let ru = self.cfg.read().ui_is_ru();
                     let safe = if blocked {
+                        let ru = self.cfg.read().ui_is_ru();
                         overlay_backend::deep_lock::blocked_notice(ru)
                     } else {
-                        slint_replay::app_state::ai_error_text(classify_ai_error(&message), ru)
+                        classify_ai_error(&message)
                     };
                     // Keep any prior thread; append the error below it so a
                     // follow-up failure doesn't wipe the conversation.
                     let err_line = if blocked {
                         safe.to_string()
                     } else {
-                        crate::tile_text::error_body(safe, ru)
+                        format!("AI error: {safe}")
                     };
-                    // Only the error itself: no earlier answer worth a memory star.
-                    let only_error = stream.prefix.is_empty();
-                    let body = if only_error {
+                    let body = if stream.prefix.is_empty() {
                         err_line
                     } else {
                         format!("{}\n\n{err_line}", stream.prefix)
@@ -1009,82 +698,78 @@ impl OverlayBarBridge {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(tile) = weak.upgrade() {
                             tile.set_blocks(ModelRc::new(VecModel::from(to_md_blocks(&body))));
-                            tile.set_source_label(SharedString::from(
-                                crate::tile_text::error_label(ru),
-                            ));
-                            tile.set_plain_notice(only_error);
+                            tile.set_source_label(SharedString::from("error"));
                             tile.set_followup_busy(false);
                         }
                     });
                 }
             }
-            ai::AiEvent::Tool { name, detail } => {
-                let ru = self.cfg.read().ui_is_ru();
-                let (weak, body) = {
-                    let slot = match self.current_streaming.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    let Some(stream) = slot.as_ref() else {
-                        return;
-                    };
-                    (
-                        stream.weak.clone(),
-                        tool_status_body(&stream.prefix, &stream.accumulated, &name, &detail, ru),
-                    )
-                };
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(tile) = weak.upgrade() {
-                        tile.set_source_label(SharedString::from(crate::tile_text::tool_label(ru)));
-                        tile.set_blocks(ModelRc::new(VecModel::from(to_md_blocks_streaming(
-                            &body,
-                        ))));
-                    }
-                });
+            ai::AiEvent::Start { .. } => {
+                // Phase E6 v11 — Start fires once per AI call (F9 +
+                // each auto-tile). Bump the in-flight counter and
+                // light the bar's ai-streaming pulse.
+                self.inc_ai_in_flight();
             }
-            // The per-request sink owns its pulse, including cancellation/drop.
-            ai::AiEvent::Start { .. } => {}
         }
     }
 
     /// Increment in-flight AI stream count and push the new state to
     /// the bar's ai-streaming flag (true if > 0).
     fn inc_ai_in_flight(&self) {
-        self.ai_in_flight.fetch_add(1, Ordering::SeqCst);
-        self.refresh_ai_pulse();
+        let prev = self
+            .ai_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if prev == 0 {
+            let weak = self.overlay_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(o) = weak.upgrade() {
+                    o.set_ai_streaming(true);
+                }
+            });
+        }
     }
 
     /// Decrement in-flight AI stream count. Clears the pulse when it
     /// reaches 0. Saturates at 0 in case Done fires without a paired
     /// Start (shouldn't happen but defensive).
     fn dec_ai_in_flight(&self) {
-        let _ = self
+        let prev = self
             .ai_in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                Some(count.saturating_sub(1).max(0))
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if prev <= 1 {
+            // Clamp to 0 to recover from any unpaired Done/Error.
+            self.ai_in_flight
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            let weak = self.overlay_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(o) = weak.upgrade() {
+                    o.set_ai_streaming(false);
+                }
             });
-        self.refresh_ai_pulse();
+        }
     }
 
-    fn refresh_ai_pulse(&self) {
+    /// Force the in-flight AI stream count to 0 and clear the bar pulse.
+    /// Called from `install_streaming_tile` (each new ask supersedes the
+    /// prior stream) and on `session:stopped`. An aborted `ask_stream_loop`
+    /// never emits Done/Error, so its earlier Start increment would
+    /// otherwise leak and pin the "AI streaming" pulse ON permanently after
+    /// any rapid re-ask. Single-slot model makes reset-to-0 correct; a rare
+    /// concurrent auto-tile at worst clears the pulse a beat early (cosmetic,
+    /// never stuck).
+    fn reset_ai_in_flight(&self) {
+        self.ai_in_flight
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         let weak = self.overlay_weak.clone();
-        let count = self.ai_in_flight.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(o) = weak.upgrade() {
-                o.set_ai_streaming(count.load(Ordering::SeqCst) > 0);
+                o.set_ai_streaming(false);
             }
         });
     }
 }
 
 impl SlintUiBridge for OverlayBarBridge {
-    fn tile_request_open(&self, label: &str) -> bool {
-        self.auto_requests
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(label)
-    }
-
     fn forward_event(&self, channel: String, payload: serde_json::Value) {
         // ai:event has its own path because it needs mutable access
         // to current_streaming before scheduling the UI update.
@@ -1111,24 +796,16 @@ impl SlintUiBridge for OverlayBarBridge {
             }
             *last = now;
         }
-        if channel == slint_replay::slint_session::AUTO_TILE_STREAM_CHANNEL {
-            self.handle_auto_tile_stream(payload);
-            return;
-        }
-        if channel == slint_replay::slint_session::AUTO_TILE_FILL_CHANNEL
-            || channel == slint_replay::slint_session::AUTO_TILE_DROP_CHANNEL
-        {
-            self.handle_auto_tile_end(&channel, payload);
-            return;
-        }
         // Route all cap emitters through one visible, debounced notice.
         if channel == "cost:cap-hit" {
             self.handle_cost_cap_hit(payload);
             return;
         }
+        // A stopped session leaves no live AI stream — clear any leaked
+        // in-flight count so the "AI streaming" pulse can't stick ON
+        // (an aborted stream emits no Done/Error to decrement it).
         if channel == "session:stopped" {
-            // Each canceled request releases only its own pulse on Drop.
-            self.stream_gen.fetch_add(1, Ordering::SeqCst);
+            self.reset_ai_in_flight();
             // M2 — finalize a tile that was still streaming when the session
             // stopped. stop_session aborts the ai_task, so NO Done/Error ever
             // arrives to take the slot or re-enable the tile: the tile would
@@ -1171,12 +848,12 @@ impl SlintUiBridge for OverlayBarBridge {
                 "session:started" => {
                     o.set_timer_active(true);
                     o.set_status_text(SharedString::from("recording"));
-                    o.set_status_tone(crate::ui::StatusTone::Ok);
+                    o.set_status_color(slint::Color::from_rgb_u8(0x2a, 0xc7, 0x60));
                 }
                 "session:stopped" => {
                     o.set_timer_active(false);
                     o.set_status_text(SharedString::from("idle"));
-                    o.set_status_tone(crate::ui::StatusTone::Neutral);
+                    o.set_status_color(slint::Color::from_rgb_u8(0x88, 0x88, 0x8c));
                 }
                 "health:update" => {
                     // Crude: collapse 3-subsystem state to single
@@ -1198,9 +875,9 @@ impl SlintUiBridge for OverlayBarBridge {
                     // session:started, leaving "idle" text inside a red pill.
                     if o.get_timer_active() {
                         if any_down {
-                            o.set_status_tone(crate::ui::StatusTone::Danger);
+                            o.set_status_color(slint::Color::from_rgb_u8(0xe5, 0x4b, 0x4b));
                         } else if any_degraded {
-                            o.set_status_tone(crate::ui::StatusTone::Warning);
+                            o.set_status_color(slint::Color::from_rgb_u8(0xe5, 0xb4, 0x4b));
                         } else {
                             // All-clear during a session → restore the green
                             // recording pill. A degraded→ok episode only ever set
@@ -1208,7 +885,7 @@ impl SlintUiBridge for OverlayBarBridge {
                             // text-recovery branch below can't restore it and the
                             // pill would otherwise stay amber until the next
                             // session start/stop.
-                            o.set_status_tone(crate::ui::StatusTone::Ok);
+                            o.set_status_color(slint::Color::from_rgb_u8(0x2a, 0xc7, 0x60));
                         }
                     }
                     // V0.8.0 (Поток A) — surface AI-down in the bar TEXT, not just
@@ -1216,7 +893,7 @@ impl SlintUiBridge for OverlayBarBridge {
                     // reported pain). The marker is set/cleared only by this arm,
                     // so we restore the session pill on recovery without
                     // clobbering session:started/stopped's own text.
-                    const AI_DOWN_MARK: &str = "AI unavailable";
+                    const AI_DOWN_MARK: &str = "AI недоступен";
                     let cur = o.get_status_text();
                     // v0.8.2 (C1 fix) — only SET the mark while a session is
                     // active (timer_active). Without this guard a stale
@@ -1234,10 +911,10 @@ impl SlintUiBridge for OverlayBarBridge {
                         // Recovered — restore the session pill we overwrote.
                         if o.get_timer_active() {
                             o.set_status_text(SharedString::from("recording"));
-                            o.set_status_tone(crate::ui::StatusTone::Ok);
+                            o.set_status_color(slint::Color::from_rgb_u8(0x2a, 0xc7, 0x60));
                         } else {
                             o.set_status_text(SharedString::from("idle"));
-                            o.set_status_tone(crate::ui::StatusTone::Neutral);
+                            o.set_status_color(slint::Color::from_rgb_u8(0x88, 0x88, 0x8c));
                         }
                     }
                     // ok / idle leaves the prior color alone
@@ -1245,8 +922,8 @@ impl SlintUiBridge for OverlayBarBridge {
                 }
                 "meeting:ending" => {
                     // UI-audit 2026-06-13: dropped the 🏁 flag emoji — the rest
-                    // of the chrome is SVG/ASCII. The bar translates this state
-                    // word at display (`localized-status` in overlay_bar.slint).
+                    // of the chrome is SVG/ASCII; the status pill is English-only
+                    // by design (idle/recording/…), so this matches it.
                     o.set_status_text(SharedString::from("wrapping up"));
                 }
                 "transcript:line" => {
@@ -1292,20 +969,8 @@ impl SlintUiBridge for OverlayBarBridge {
     ) -> Result<String, String> {
         let n = self.tile_seq.fetch_add(1, Ordering::Relaxed);
         let label = format!("slint-tile-{n}");
-        let tile_id = super::next_tile_id();
-        let generation = {
-            let mut requests = self.auto_requests.lock().unwrap_or_else(|p| p.into_inner());
-            let generation = self.spawn_generation.load(Ordering::SeqCst);
-            if spec.source == slint_replay::slint_session::AUTO_TILE_STREAM_SOURCE {
-                requests.insert(label.clone(), tile_id);
-            }
-            generation
-        };
         let req = SpawnTileRequest {
             label: label.clone(),
-            tile_id,
-            generation,
-            action: SpawnAction::New,
             spec,
             monitor,
             stealth,

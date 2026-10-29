@@ -23,21 +23,10 @@ use super::{ComponentHandle, MemoryRow, ModelRc, SettingsWindow, SharedString, V
 const PROFILE: &str = "default";
 /// How many of the most-recent sessions the Extract action mines.
 const EXTRACT_RECENT_SESSIONS: usize = 12;
-/// Cap on rows loaded into the review tab: the newest N candidates / items.
-/// A DISPLAY bound only — the DB keeps everything and the AI context reads the full
-/// set. The rows render in UN-VIRTUALIZED lists inside a ScrollView, so the tab's
-/// content height ≈ 2·N·(row height). The Slint software renderer holds coordinates
-/// in i16 (max 32767px); once content exceeds that, a rounded-rect row's wrapped
-/// coordinate panics the SW renderer (`draw_rounded_rectangle_line` → `Shifted::new`)
-/// and corrupts skia (Баг5). With each row clamped to ≤120px in settings_panel.slint,
-/// N=100 keeps content well under the i16 limit (see the guard test below).
+/// Cap on rows fetched for the review tab. This is only a DB/read bound; the
+/// Slint UI uses virtualized ListViews, so opening the tab no longer instantiates
+/// every wrapped card or creates an unbounded render surface.
 const MEMORY_TAB_CAP: i64 = 100;
-
-// Баг5 guard (compile-time): keep the un-virtualized lists under the SW renderer's
-// i16 (32767px) coordinate limit. 2 lists · cap · per-row px (120px clamp in
-// settings_panel.slint + headroom) + a generous card allowance must stay under.
-// Raising MEMORY_TAB_CAP without lowering the per-row clamp fails the build.
-const _: () = assert!(MEMORY_TAB_CAP * 2 * 140 + 800 < 32_767);
 
 /// Guards re-entering the (worker-thread) extractor while a run is in flight, so
 /// a double-click can't launch two scans (P1-3).
@@ -58,9 +47,8 @@ fn is_latest_refresh(gen: u64) -> bool {
 }
 
 /// Wire the 💭 Memory tab: load the candidate + item lists and bind the
-/// approve / reject / delete / extract callbacks. `cfg` only picks the status
-/// language at click time, so a live language switch applies to the next action.
-pub(crate) fn wire_memory(win: &SettingsWindow, cfg: &overlay_backend::config::SharedConfig) {
+/// approve / reject / delete / extract callbacks.
+pub(crate) fn wire_memory(win: &SettingsWindow) {
     reload_memory(win);
 
     // Mutations open the catalog (blocking SQLite open + write) and reload both
@@ -125,7 +113,6 @@ pub(crate) fn wire_memory(win: &SettingsWindow, cfg: &overlay_backend::config::S
     }
     {
         let weak = win.as_weak();
-        let cfg_c = cfg.clone();
         win.on_memory_extract(move || {
             let Some(w) = weak.upgrade() else { return };
             // P1-3: the extractor scans candidate texts + reads AI turns for the
@@ -137,19 +124,14 @@ pub(crate) fn wire_memory(win: &SettingsWindow, cfg: &overlay_backend::config::S
             if EXTRACT_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            let ru = cfg_c.read().ui_is_ru();
-            w.set_memory_status(SharedString::from(if ru {
-                "Ищу предложения…"
-            } else {
-                "Looking for suggestions…"
-            }));
+            w.set_memory_status(SharedString::from("⏳ извлекаю…"));
             let done = w.as_weak();
             std::thread::spawn(move || {
                 let inserted = run_extract();
                 let _ = slint::invoke_from_event_loop(move || {
                     EXTRACT_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
                     if let Some(w) = done.upgrade() {
-                        w.set_memory_status(SharedString::from(extract_status(ru, inserted)));
+                        w.set_memory_status(SharedString::from(format!("➕ {inserted}")));
                         reload_memory(&w);
                     }
                 });
@@ -161,14 +143,12 @@ pub(crate) fn wire_memory(win: &SettingsWindow, cfg: &overlay_backend::config::S
     // consent the approve step otherwise provides); empty input is a no-op.
     {
         let weak = win.as_weak();
-        let cfg_c = cfg.clone();
         win.on_memory_add_fact(move |text| {
             let Some(w) = weak.upgrade() else { return };
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 return;
             }
-            let ru = cfg_c.read().ui_is_ru();
             let fact = trimmed.to_string();
             let submitted = fact.clone();
             let done = w.as_weak();
@@ -212,19 +192,13 @@ pub(crate) fn wire_memory(win: &SettingsWindow, cfg: &overlay_backend::config::S
                                 if w.get_memory_add_text().trim() == submitted.as_str() {
                                     w.set_memory_add_text(SharedString::default());
                                 }
-                                w.set_memory_status(SharedString::from(if ru {
-                                    "Факт добавлен"
-                                } else {
-                                    "Fact added"
-                                }));
+                                w.set_memory_status(SharedString::from("➕ факт добавлен"));
                             }
                             Err(e) => {
                                 eprintln!("[overlay-host] memory add-fact failed: {e}");
-                                w.set_memory_status(SharedString::from(if ru {
-                                    "Факт не сохранён: локальная база памяти недоступна. Нажмите «Добавить» ещё раз."
-                                } else {
-                                    "Fact not saved: the local memory database is unavailable. Press Add again."
-                                }));
+                                w.set_memory_status(SharedString::from(
+                                    "[err] не удалось сохранить факт — попробуйте ещё раз",
+                                ));
                             }
                         }
                         apply_memory_rows(&w, &cands, &items);
@@ -278,26 +252,52 @@ pub(crate) fn wire_memory(win: &SettingsWindow, cfg: &overlay_backend::config::S
 /// Best-effort: a catalog-open failure leaves the lists empty. Runs OFF the
 /// event loop — never call it on the Slint UI thread.
 fn read_memory_lists() -> (Vec<MemoryCandidate>, Vec<MemoryItem>) {
-    match open_default_store() {
-        Ok(store) => (
-            store
-                .list_candidates(PROFILE, "pending", MEMORY_TAB_CAP)
-                .unwrap_or_default(),
-            store
-                .list_memory_items(PROFILE, false, MEMORY_TAB_CAP)
-                .unwrap_or_default(),
-        ),
-        Err(_) => (Vec::new(), Vec::new()),
-    }
+    let started = std::time::Instant::now();
+    let store = match open_default_store() {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("[overlay-host] memory DB open failed after {}ms: {e:#}", started.elapsed().as_millis());
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let open_ms = started.elapsed().as_millis();
+    let started_candidates = std::time::Instant::now();
+    let candidates = store
+        .list_candidates(PROFILE, "pending", MEMORY_TAB_CAP)
+        .unwrap_or_else(|e| {
+            eprintln!("[overlay-host] memory candidates query failed: {e:#}");
+            Vec::new()
+        });
+    let candidates_ms = started_candidates.elapsed().as_millis();
+    let started_items = std::time::Instant::now();
+    let items = store
+        .list_memory_items(PROFILE, false, MEMORY_TAB_CAP)
+        .unwrap_or_else(|e| {
+            eprintln!("[overlay-host] memory items query failed: {e:#}");
+            Vec::new()
+        });
+    eprintln!(
+        "[overlay-host] memory DB load: open_ms={open_ms} candidates_ms={candidates_ms} items_ms={} candidates={} items={}",
+        started_items.elapsed().as_millis(), candidates.len(), items.len()
+    );
+    (candidates, items)
 }
 
 /// Push the candidate + item rows into the tab's models. MUST run on the Slint
 /// event loop (it touches the window's models).
 fn apply_memory_rows(win: &SettingsWindow, cands: &[MemoryCandidate], items: &[MemoryItem]) {
+    let started = std::time::Instant::now();
     let c_rows: Vec<MemoryRow> = cands.iter().map(candidate_row).collect();
     let i_rows: Vec<MemoryRow> = items.iter().map(item_row).collect();
+    let conversion_ms = started.elapsed().as_millis();
+    let started_publish = std::time::Instant::now();
     win.set_memory_candidates(ModelRc::new(VecModel::from(c_rows)));
     win.set_memory_items(ModelRc::new(VecModel::from(i_rows)));
+    // Record only counts and timings, never the user's stored memory text.
+    eprintln!(
+        "[overlay-host] memory UI update: conversion_ms={conversion_ms} model_set_ms={} candidates={} items={}",
+        started_publish.elapsed().as_millis(), cands.len(), items.len()
+    );
 }
 
 /// Run a catalog mutation off the event loop, then refresh both lists (also
@@ -367,16 +367,6 @@ fn run_extract() -> usize {
     inserted
 }
 
-/// Status line after Extract: how many new suggestions landed, or that none did.
-fn extract_status(ru: bool, inserted: usize) -> String {
-    match (ru, inserted) {
-        (true, 0) => "Новых предложений нет".to_string(),
-        (true, n) => format!("Новых предложений: {n}"),
-        (false, 0) => "No new suggestions".to_string(),
-        (false, n) => format!("New suggestions: {n}"),
-    }
-}
-
 /// Candidate → row: kind glyph + the heuristic reason + the candidate text.
 /// The DB id is i64; an out-of-range value down-casts to `-1` (a guaranteed
 /// no-op on the next callback) rather than silently wrapping onto a real row.
@@ -412,18 +402,5 @@ fn kind_glyph(kind: &str) -> &'static str {
         "experience" => "⭐",
         "note" => "📌",
         _ => "•",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_status_follows_ui_language() {
-        assert_eq!(extract_status(false, 0), "No new suggestions");
-        assert_eq!(extract_status(false, 19), "New suggestions: 19");
-        assert_eq!(extract_status(true, 0), "Новых предложений нет");
-        assert_eq!(extract_status(true, 3), "Новых предложений: 3");
     }
 }

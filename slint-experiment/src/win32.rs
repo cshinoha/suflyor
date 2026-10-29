@@ -36,48 +36,14 @@ mod windows_impl {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowDisplayAffinity, GetWindowLongPtrW, KillTimer, LoadCursorW, SetCursor, SetTimer,
         SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_HWNDPARENT,
-        GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, STYLESTRUCT,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-        SW_SHOWNOACTIVATE, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_MOUSEMOVE, WM_SETCURSOR,
-        WM_STYLECHANGING, WM_TIMER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
-        WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+        GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+        WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_MOUSEMOVE, WM_SETCURSOR, WM_TIMER, WS_EX_APPWINDOW,
+        WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
     };
 
     const STEALTH_CURSOR_SUBCLASS_ID: usize = 0x55F1_0001;
     const STEALTH_CURSOR_TIMER_ID: usize = 0x55F1_0002;
-    const CAPTION_GUARD_SUBCLASS_ID: usize = 0x55F1_0003;
-
-    fn strip_caption_buttons(style: u32) -> u32 {
-        style & !(WS_SYSMENU.0 | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0)
-    }
-
-    unsafe extern "system" fn caption_guard_subclass_proc(
-        hwnd: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-        _id: usize,
-        _ref: usize,
-    ) -> LRESULT {
-        if message == WM_STYLECHANGING && wparam.0 as i32 == GWL_STYLE.0 && lparam.0 != 0 {
-            // SAFETY: WM_STYLECHANGING supplies a writable STYLESTRUCT for this call.
-            let style = unsafe { &mut *(lparam.0 as *mut STYLESTRUCT) };
-            style.styleNew = strip_caption_buttons(style.styleNew);
-        }
-        unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
-    }
-
-    fn install_caption_guard(hwnd: HWND) {
-        // Reinstalling the same proc/id only updates its reference data.
-        let _ = unsafe {
-            SetWindowSubclass(
-                hwnd,
-                Some(caption_guard_subclass_proc),
-                CAPTION_GUARD_SUBCLASS_ID,
-                0,
-            )
-        };
-    }
 
     fn restore_arrow_after_message(message: u32) -> bool {
         message == WM_MOUSEMOVE
@@ -196,7 +162,7 @@ mod windows_impl {
     /// this yields a true transparent overlay on Windows 11. Confirmed
     /// visually 2026-05-27.
     pub fn make_transparent_overlay(hwnd: HWND) -> Result<(), Box<dyn std::error::Error>> {
-        apply_transparency(hwnd, /* click_through */ true)
+        apply_transparency(hwnd, /* click_through */ true, /* blur_behind */ true)
     }
 
     /// Apply the same transparency wiring as `make_transparent_overlay`
@@ -207,7 +173,38 @@ mod windows_impl {
     /// click-through from make_transparent_overlay and silently
     /// swallowed every TouchArea press.
     pub fn make_transparent_tile(hwnd: HWND) -> Result<(), Box<dyn std::error::Error>> {
-        apply_transparency(hwnd, /* click_through */ false)
+        // Compare DWM composition modes without changing the renderer, window
+        // opacity or the click-through behavior. The default explicitly resets
+        // blur-behind in case it was enabled before this call.
+        // Values: reset (default), frame (previous behavior), legacy (blur).
+        let mode = std::env::var("SUFLYOR_TILE_DWM_MODE")
+            .unwrap_or_else(|_| "reset".to_owned());
+        let mode = if mode.eq_ignore_ascii_case("legacy") {
+            "legacy"
+        } else if mode.eq_ignore_ascii_case("frame") {
+            "frame"
+        } else {
+            "reset"
+        };
+        apply_transparency(hwnd, /* click_through */ false, /* blur_behind */ mode == "legacy")?;
+        if mode == "reset" {
+            // Do not make the whole window translucent with LWA_ALPHA: Slint
+            // must keep text/buttons opaque while composing only the tile body.
+            let bb = DWM_BLURBEHIND {
+                dwFlags: DWM_BB_ENABLE,
+                fEnable: false.into(),
+                hRgnBlur: Default::default(),
+                fTransitionOnMaximized: false.into(),
+            };
+            unsafe { DwmEnableBlurBehindWindow(hwnd, &bb)? };
+        }
+        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        eprintln!(
+            "[overlay-host] tile DWM mode={mode} composition={} ex_style=0x{ex_style:x} layered={}",
+            composition_enabled(),
+            (ex_style & WS_EX_LAYERED.0 as isize) != 0,
+        );
+        Ok(())
     }
 
     /// True if DWM desktop composition is active. Per-pixel-alpha transparency
@@ -230,6 +227,7 @@ mod windows_impl {
     fn apply_transparency(
         hwnd: HWND,
         click_through: bool,
+        blur_behind: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // A top-level window can reach this shared path with WS_EX_APPWINDOW.
         // Merely OR-ing TOOLWINDOW leaves both bits set, so Explorer keeps a taskbar button.
@@ -267,17 +265,17 @@ mod windows_impl {
         // we extend the DWM frame into the client area (below), DWM paints the
         // caption's close/min/max glyphs faintly in the top-right corner — the
         // "еле заметный крестик" the user kept reporting on the bar (and it was on
-        // tiles too). Clear the sys-menu + min/max bits once, then keep them off
-        // with the WM_STYLECHANGING guard: winit rewrites GWL_STYLE on later state
-        // changes (show/hide, restore, flag diffs), bringing the buttons back.
-        // WS_CAPTION/WS_THICKFRAME stay intact, so DWM frame extension is unchanged.
-        // Alt+F4 also goes away — fine, every overlay window has its own close
-        // affordance (the bar's X chip, the tile's X button).
+        // tiles too). Clearing the sys-menu + min/max bits drops those non-client
+        // buttons while leaving WS_CAPTION/WS_THICKFRAME, so the DWM frame extension
+        // is unchanged. Verified live: the × disappears, transparency + rounded
+        // corners stay intact. Alt+F4 also goes away — fine, every overlay window
+        // has its own close affordance (the bar's X chip, the tile's X button).
         unsafe {
-            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
-            let no_buttons = strip_caption_buttons(style);
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let no_buttons = style
+                & !(WS_SYSMENU.0 as isize | WS_MAXIMIZEBOX.0 as isize | WS_MINIMIZEBOX.0 as isize);
             if no_buttons != style {
-                SetWindowLongPtrW(hwnd, GWL_STYLE, no_buttons as isize);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, no_buttons);
                 // SWP_FRAMECHANGED forces a non-client recompute so the removed
                 // buttons stop being drawn immediately (not on the next frame).
                 let _ = SetWindowPos(
@@ -292,27 +290,29 @@ mod windows_impl {
             }
         }
 
-        install_caption_guard(hwnd);
-
         let margins = MARGINS {
             cxLeftWidth: -1,
             cxRightWidth: -1,
             cyTopHeight: -1,
             cyBottomHeight: -1,
         };
-        unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins)? };
+        if (unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_NOREDIRECTIONBITMAP.0 as isize) == 0 {
+            unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins)? };
+        }
 
-        let h_rgn = unsafe { CreateRectRgn(0, 0, -1, -1) };
-        let bb = DWM_BLURBEHIND {
-            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-            fEnable: true.into(),
-            hRgnBlur: h_rgn,
-            fTransitionOnMaximized: false.into(),
-        };
-        unsafe {
-            let result = DwmEnableBlurBehindWindow(hwnd, &bb);
-            let _ = DeleteObject(h_rgn.into());
-            result?;
+        if blur_behind && (unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_NOREDIRECTIONBITMAP.0 as isize) == 0 {
+            let h_rgn = unsafe { CreateRectRgn(0, 0, -1, -1) };
+            let bb = DWM_BLURBEHIND {
+                dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+                fEnable: true.into(),
+                hRgnBlur: h_rgn,
+                fTransitionOnMaximized: false.into(),
+            };
+            unsafe {
+                let result = DwmEnableBlurBehindWindow(hwnd, &bb);
+                let _ = DeleteObject(h_rgn.into());
+                result?;
+            }
         }
 
         Ok(())
@@ -494,6 +494,108 @@ mod windows_impl {
         pub fn is_landscape(&self) -> bool {
             self.width() >= self.height()
         }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct CaptureWindowTarget {
+        pub title: String,
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+
+    impl CaptureWindowTarget {
+        #[must_use]
+        pub fn width(&self) -> i32 { self.right - self.left }
+        #[must_use]
+        pub fn height(&self) -> i32 { self.bottom - self.top }
+    }
+
+    fn capture_target_from_hwnd(hwnd: HWND) -> Option<CaptureWindowTarget> {
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible};
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() || unsafe { IsIconic(hwnd) }.as_bool() {
+            return None;
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() || rect.right <= rect.left || rect.bottom <= rect.top {
+            return None;
+        }
+        let len = unsafe { GetWindowTextLengthW(hwnd) };
+        if len <= 0 { return None; }
+        let mut buf = vec![0u16; len as usize + 1];
+        let copied = unsafe { GetWindowTextW(hwnd, &mut buf) };
+        if copied <= 0 { return None; }
+        let title = String::from_utf16_lossy(&buf[..copied as usize]).trim().to_string();
+        if title.is_empty() { return None; }
+        Some(CaptureWindowTarget {
+            title,
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        })
+    }
+
+    /// Top-most visible foreign window containing a screen point. EnumWindows
+    /// walks top-level windows in Z order; windows owned by Suflyor are skipped.
+    pub fn capture_window_at_point(x: i32, y: i32) -> Option<CaptureWindowTarget> {
+        use std::cell::RefCell;
+        use windows::core::BOOL;
+        use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
+        thread_local! {
+            static PICK: RefCell<Option<CaptureWindowTarget>> = const { RefCell::new(None) };
+            static POINT_PICK: RefCell<(i32, i32)> = const { RefCell::new((0, 0)) };
+        }
+        PICK.with(|slot| *slot.borrow_mut() = None);
+        POINT_PICK.with(|slot| *slot.borrow_mut() = (x, y));
+        unsafe extern "system" fn cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)); }
+            if pid == std::process::id() { return true.into(); }
+            let Some(target) = capture_target_from_hwnd(hwnd) else { return true.into(); };
+            let inside = POINT_PICK.with(|p| {
+                let (x, y) = *p.borrow();
+                x >= target.left && x < target.right && y >= target.top && y < target.bottom
+            });
+            if inside {
+                PICK.with(|slot| *slot.borrow_mut() = Some(target));
+                return false.into();
+            }
+            true.into()
+        }
+        unsafe { let _ = EnumWindows(Some(cb), LPARAM(0)); }
+        PICK.with(|slot| slot.borrow().clone())
+    }
+
+    /// Find a persisted capture target by exact title first, then by a
+    /// case-insensitive substring match so minor title decorations can survive.
+    pub fn find_capture_window(title: &str) -> Option<CaptureWindowTarget> {
+        use std::cell::RefCell;
+        use windows::core::BOOL;
+        use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
+        let wanted = title.trim().to_lowercase();
+        if wanted.is_empty() { return None; }
+        thread_local! {
+            static MATCHES: RefCell<Vec<CaptureWindowTarget>> = const { RefCell::new(Vec::new()) };
+        }
+        MATCHES.with(|m| m.borrow_mut().clear());
+        unsafe extern "system" fn cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)); }
+            if pid != std::process::id() {
+                if let Some(target) = capture_target_from_hwnd(hwnd) {
+                    MATCHES.with(|m| m.borrow_mut().push(target));
+                }
+            }
+            true.into()
+        }
+        unsafe { let _ = EnumWindows(Some(cb), LPARAM(0)); }
+        MATCHES.with(|m| {
+            let items = m.borrow();
+            items.iter().find(|w| w.title.to_lowercase() == wanted).cloned()
+                .or_else(|| items.iter().find(|w| w.title.to_lowercase().contains(&wanted) || wanted.contains(&w.title.to_lowercase())).cloned())
+        })
     }
 
     /// Enumerate all attached display monitors with their bounds + primary flag.
@@ -982,22 +1084,6 @@ mod windows_impl {
         use super::*;
 
         #[test]
-        fn caption_guard_strips_buttons_and_preserves_other_styles() {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                WS_CAPTION, WS_DISABLED, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
-            };
-            let buttons = WS_SYSMENU.0 | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0;
-            let preserved =
-                WS_CAPTION.0 | WS_THICKFRAME.0 | WS_VISIBLE.0 | WS_DISABLED.0 | WS_POPUP.0;
-            let stripped = strip_caption_buttons(preserved | buttons);
-
-            assert_eq!(strip_caption_buttons(buttons), 0);
-            assert_eq!(stripped, preserved);
-            assert_eq!(strip_caption_buttons(stripped), stripped);
-            assert_eq!(strip_caption_buttons(0), 0);
-        }
-
-        #[test]
         fn stealth_cursor_guard_defers_mouse_move_restore() {
             assert!(restore_arrow_after_message(WM_MOUSEMOVE));
             assert!(!restore_arrow_after_message(WM_SETCURSOR));
@@ -1109,19 +1195,30 @@ mod posix_stubs {
         }
     }
 
+    #[derive(Debug, Clone)]
+    pub struct CaptureWindowTarget {
+        pub title: String,
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+    impl CaptureWindowTarget {
+        pub fn width(&self) -> i32 { self.right - self.left }
+        pub fn height(&self) -> i32 { self.bottom - self.top }
+    }
+    pub fn capture_window_at_point(_x: i32, _y: i32) -> Option<CaptureWindowTarget> { None }
+    pub fn find_capture_window(_title: &str) -> Option<CaptureWindowTarget> { None }
+
     pub fn grab_hwnd(window: &slint::Window) -> Result<HWND, Box<dyn std::error::Error>> {
         #[cfg(target_os = "macos")]
         {
             crate::native::window::view_id(window).map(HWND)
         }
-        #[cfg(target_os = "linux")]
-        {
-            crate::native::window::view_id(window).map(HWND)
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let _ = window;
-            Err("native window handles are unavailable on this platform".into())
+            Ok(HWND(1))
         }
     }
 
@@ -1146,29 +1243,17 @@ mod posix_stubs {
                 return crate::native::window::configure_floating_by_id(hwnd.0);
             }
         }
-        #[cfg(target_os = "linux")]
-        {
-            return crate::native::window::pin(hwnd.0, on);
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (hwnd, on);
-            Ok(())
-        }
+        let _ = (hwnd, on);
+        Ok(())
     }
 
     /// Whether this platform can apply and verify capture exclusion.
     #[must_use]
     pub const fn stealth_supported() -> bool {
-        cfg!(target_os = "linux")
+        false
     }
 
     pub fn set_stealth(_hwnd: HWND, on: bool) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(target_os = "linux")]
-        {
-            return crate::native::window::set_exclusion(_hwnd.0, on);
-        }
-        #[cfg(not(target_os = "linux"))]
         if on {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -1176,16 +1261,10 @@ mod posix_stubs {
             )
             .into());
         }
-        #[cfg(not(target_os = "linux"))]
         Ok(())
     }
 
     pub fn read_display_affinity(_hwnd: HWND) -> Result<u32, Box<dyn std::error::Error>> {
-        #[cfg(target_os = "linux")]
-        {
-            return crate::native::window::exclusion(_hwnd.0).map(|on| if on { 0x11 } else { 0 });
-        }
-        #[cfg(not(target_os = "linux"))]
         Ok(0)
     }
 
@@ -1220,13 +1299,15 @@ mod posix_stubs {
                 })
                 .collect()
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(not(target_os = "macos"))]
         {
-            crate::native::window::monitors().unwrap_or_default()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            Vec::new()
+            vec![MonitorRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+                is_primary: true,
+            }]
         }
     }
 
@@ -1245,18 +1326,9 @@ mod posix_stubs {
                 })
                 .unwrap_or((0, 0, 0, 0))
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(not(target_os = "macos"))]
         {
-            let monitors = enum_monitors();
-            let left = monitors.iter().map(|m| m.left).min().unwrap_or(0);
-            let top = monitors.iter().map(|m| m.top).min().unwrap_or(0);
-            let right = monitors.iter().map(|m| m.right).max().unwrap_or(0);
-            let bottom = monitors.iter().map(|m| m.bottom).max().unwrap_or(0);
-            (left, top, right - left, bottom - top)
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            (0, 0, 0, 0)
+            (0, 0, 1920, 1080)
         }
     }
 
@@ -1265,51 +1337,27 @@ mod posix_stubs {
         {
             crate::native::screen::cursor_position().unwrap_or((0, 0))
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(not(target_os = "macos"))]
         {
-            crate::native::window::cursor().unwrap_or((0, 0))
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            (0, 0)
+            (500, 500)
         }
     }
 
     pub fn hide_own_windows() -> Vec<(isize, bool)> {
-        #[cfg(target_os = "linux")]
-        {
-            return crate::native::window::hide_own();
-        }
-        #[cfg(not(target_os = "linux"))]
         Vec::new()
     }
 
-    pub fn show_windows(hwnds: &[(isize, bool)]) {
-        #[cfg(target_os = "linux")]
-        crate::native::window::show_own(hwnds);
-        #[cfg(not(target_os = "linux"))]
-        let _ = hwnds;
-    }
+    pub fn show_windows(_hwnds: &[(isize, bool)]) {}
 
     pub fn focus_window(hwnd: HWND) {
         #[cfg(target_os = "macos")]
         let _ = crate::native::window::raise_key_front_by_id(hwnd.0);
-        #[cfg(target_os = "linux")]
-        let _ = crate::native::window::focus(hwnd.0);
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         let _ = hwnd;
     }
 
-    pub fn is_foreground_window(hwnd: HWND) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            return crate::native::window::foreground(hwnd.0);
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = hwnd;
-            true
-        }
+    pub fn is_foreground_window(_hwnd: HWND) -> bool {
+        true
     }
 
     pub fn reveal_window(hwnd: HWND) {
@@ -1335,15 +1383,8 @@ mod posix_stubs {
         w: i32,
         h: i32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(target_os = "linux")]
-        {
-            return crate::native::window::resize_move(hwnd.0, x, y, w, h);
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            set_window_rect(hwnd, x, y, w, h);
-            Ok(())
-        }
+        set_window_rect(hwnd, x, y, w, h);
+        Ok(())
     }
 
     pub fn move_window_pos_only(
@@ -1351,11 +1392,6 @@ mod posix_stubs {
         x: i32,
         y: i32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(target_os = "linux")]
-        {
-            return crate::native::window::move_to(hwnd.0, x, y);
-        }
-        #[cfg(not(target_os = "linux"))]
         if let Ok(mut guard) = POSIX_WINDOW_RECTS.lock() {
             let map = guard.get_or_insert_with(std::collections::HashMap::new);
             let old_size = map
@@ -1364,7 +1400,6 @@ mod posix_stubs {
                 .unwrap_or((460, 360));
             map.insert(hwnd.0, (x, y, old_size.0, old_size.1));
         }
-        #[cfg(not(target_os = "linux"))]
         Ok(())
     }
 
@@ -1374,11 +1409,6 @@ mod posix_stubs {
             return Ok(rect);
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            return crate::native::window::rect(hwnd.0);
-        }
-        #[cfg(not(target_os = "linux"))]
         if let Ok(guard) = POSIX_WINDOW_RECTS.lock() {
             if let Some(map) = guard.as_ref() {
                 if let Some(&rect) = map.get(&hwnd.0) {
@@ -1388,8 +1418,8 @@ mod posix_stubs {
         }
         #[cfg(target_os = "macos")]
         return Err("AppKit window geometry is unavailable".into());
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        Err("native window geometry is unavailable on this platform".into())
+        #[cfg(not(target_os = "macos"))]
+        Ok((100, 100, 1280, 800))
     }
 
     fn monitor_for_point(monitors: &[MonitorRect], x: i32, y: i32) -> Option<MonitorRect> {
@@ -1404,7 +1434,7 @@ mod posix_stubs {
     }
 
     pub fn work_area_for_window(hwnd: HWND) -> Option<MonitorRect> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             let monitors = enum_monitors();
             get_window_rect(hwnd)
@@ -1414,49 +1444,52 @@ mod posix_stubs {
                 })
                 .or_else(|| pick_monitor(&monitors))
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let _ = hwnd;
-            None
+            Some(MonitorRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+                is_primary: true,
+            })
         }
     }
 
     pub fn work_area_for_point(x: i32, y: i32) -> Option<MonitorRect> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             monitor_for_point(&enum_monitors(), x, y)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let _ = (x, y);
-            None
+            Some(MonitorRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+                is_primary: true,
+            })
         }
     }
 
-    pub fn drag_begin(hwnd: HWND) {
-        #[cfg(target_os = "linux")]
-        crate::native::window::drag_begin(hwnd.0);
-        let _ = hwnd;
-    }
-    pub fn drag_update(hwnd: HWND) {
-        #[cfg(target_os = "linux")]
-        crate::native::window::drag_update(hwnd.0);
-        let _ = hwnd;
-    }
-    pub fn drag_end() {
-        #[cfg(target_os = "linux")]
-        crate::native::window::drag_end();
-    }
+    pub fn drag_begin(_hwnd: HWND) {}
+
+    pub fn drag_update(_hwnd: HWND) {}
+
+    pub fn drag_end() {}
 
     pub fn set_round_corners(_hwnd: HWND) {}
 
     pub fn pick_monitor(monitors: &[MonitorRect]) -> Option<MonitorRect> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             let (x, y) = cursor_pos();
             monitor_for_point(monitors, x, y)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         {
             monitors.first().copied()
         }
@@ -1489,29 +1522,25 @@ mod posix_stubs {
         {
             crate::native::clipboard::read_text()
         }
-        #[cfg(target_os = "linux")]
-        {
-            crate::native::clipboard::read_text()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         {
             None
         }
     }
 
     pub fn clipboard_write_text(text: &str) {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             let _ = crate::native::clipboard::set_text(text);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let _ = text;
         }
     }
 
     pub fn clipboard_clear() {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         crate::native::clipboard::clear();
     }
 

@@ -32,10 +32,10 @@ macro_rules! diag {
 }
 
 use ui::{
-    ArchiveRow, ArchiveWindow, CaptureOverlay, ComponentRow, FoundModel, HelpWindow,
-    LockModeMenuWindow, MarkdownBlock, MemoryRow, OverlayBarWindow, PaletteResult, PaletteWindow,
-    RecoverOfferWindow, SettingsWindow, SpeakerRow, TextAskWindow, TileWindow, TranscriptLine,
-    TranscriptWindow, TrayMenuWindow, WizardWindow,
+    ArchiveRow, ArchiveWindow, CaptureOverlay, ComponentRow, HelpWindow, LockModeMenuWindow,
+    MarkdownBlock, MemoryRow, OverlayBarWindow, PaletteResult, PaletteWindow, RecoverOfferWindow,
+    SettingsWindow, SpeakerRow, TextAskWindow, TileWindow, TranscriptLine, TranscriptWindow,
+    TrayMenuWindow, WizardWindow,
 };
 
 // Phase 1 of the modularization (docs/overlay-host-modularization-plan.md §5.1):
@@ -100,10 +100,10 @@ use recovery::*;
 // and `open_settings`' "Run setup wizard" button resolve unchanged. The shared
 // mic guard (`try_acquire_mic`/`release_mic`) the step-4 check uses stays here
 // (a dozen non-wizard sites need it) and is reached from wizard.rs via its glob.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 #[path = "overlay_host/wizard.rs"]
 mod wizard;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 use wizard::*;
 
 // Phase 5 of the modularization (docs/overlay-host-modularization-plan.md §5.6):
@@ -217,12 +217,6 @@ use tile_ptt::*;
 mod tile_followup;
 use tile_followup::*;
 
-// `tile_terms.rs` — the terms under a fast answer and the chain of
-// definitions opened from them.
-#[path = "overlay_host/tile_terms.rs"]
-mod tile_terms;
-use tile_terms::*;
-
 // Phase 7b of the modularization (docs/overlay-host-modularization-plan.md
 // §5.8/§5.9) — the FINAL phase: the Settings window controller. `open_settings`
 // (the Settings fn with its remaining inline handlers + the stealth/scheme/
@@ -242,8 +236,6 @@ use tile_terms::*;
 // `WindowRegistry`, and the mic guard through the existing crate-root globs.
 #[path = "overlay_host/settings_controller.rs"]
 mod settings_controller;
-#[path = "overlay_host/settings_dialogs.rs"]
-mod settings_dialogs;
 use settings_controller::*;
 
 // The Vision (screenshot) Settings-tab callbacks (provider switch + cloud/local
@@ -252,14 +244,6 @@ use settings_controller::*;
 // re-exports `wire_vision_settings`, which `open_settings` calls in place of the
 // old inline V4 block; the moved code reaches `SettingsWindow` / the `diag!`
 // macro / the `overlay_backend` helpers through the crate-root globs.
-#[path = "overlay_host/settings_model_speed.rs"]
-mod settings_model_speed;
-#[cfg(any(windows, target_os = "linux"))]
-#[path = "overlay_host/settings_strata_updates.rs"]
-mod settings_strata_updates;
-#[cfg(any(windows, target_os = "linux"))]
-#[path = "overlay_host/settings_strata_vision.rs"]
-mod settings_strata_vision;
 #[path = "overlay_host/settings_vision.rs"]
 mod settings_vision;
 use settings_vision::*;
@@ -327,10 +311,10 @@ use settings_import_export::*;
 // macro / `overlay_backend::update` through the crate-root scope. SECURITY: the
 // download -> verify -> spawn sequence is unchanged (verification lives in
 // `overlay_backend::update`).
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 #[path = "overlay_host/settings_updates.rs"]
 mod settings_updates;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 use settings_updates::*;
 
 // The one-click local-AI installer Settings-tab callbacks (install pipeline +
@@ -374,10 +358,31 @@ use local_watchdog::*;
 #[path = "overlay_host/status_copy.rs"]
 mod status_copy;
 use status_copy::*;
-#[path = "overlay_host/tile_text.rs"]
-mod tile_text;
 
 pub(crate) type TileWindows = Rc<RefCell<Vec<TileWindow>>>;
+
+/// Enforce the user-configured live-tile cap before creating another tile.
+/// Every tile creation path calls this helper so the limit is global rather
+/// than applying only to auto-tiles. The oldest tile is evicted first.
+pub(crate) fn enforce_live_tile_cap_before_spawn(
+    tiles: &TileWindows,
+    bridge: &Arc<OverlayBarBridge>,
+    weak_overlay: &slint::Weak<OverlayBarWindow>,
+    max_live_tiles: usize,
+) {
+    let limit = max_live_tiles.clamp(1, 64);
+    while tiles.borrow().len() >= limit {
+        let dropped = tiles.borrow_mut().remove(0);
+        abort_tile_stream(dropped.get_tile_id());
+        bridge.drop_conversation(dropped.get_convo_id());
+        let _ = dropped.hide();
+        slint_replay::win32::force_hide(dropped.window());
+        eprintln!(
+            "[overlay-host] live tile cap hit (>= {limit}) — dropping oldest"
+        );
+    }
+    refresh_open_tiles(weak_overlay, tiles);
+}
 
 /// Parse markdown source into the Slint `MarkdownBlock` rows a tile body
 /// renders. Shared by the streaming Delta/Error paths + follow-ups.
@@ -490,34 +495,11 @@ const AI_MAX_TOKENS: u32 = 600;
 pub(crate) const AI_STREAM_MAX_TOKENS: u32 = 4096;
 
 fn main() -> Result<(), slint::PlatformError> {
-    #[cfg(target_os = "linux")]
-    {
-        let args: Vec<String> = std::env::args().collect();
-        if args.get(1).map(String::as_str) == Some("--command") {
-            let result = args.get(2).ok_or("missing command").and_then(|value| {
-                slint_replay::native::desktop::send_command(value)
-                    .map_err(|_| "Suflyor is not running")
-            });
-            if let Err(error) = result {
-                eprintln!("{error}");
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
-    }
     let Some(bootstrap) = app_bootstrap::run_preflight()? else {
         return Ok(());
     };
     let _is_relaunch = bootstrap.is_relaunch;
     let _singleton = bootstrap._singleton;
-    // After the singleton, so a second instance never replaces the live socket,
-    // and before any window exists: windows go to the Omarchy shell.
-    #[cfg(feature = "remote-ui")]
-    {
-        let socket = slint_replay::remote_ui::default_socket_path()
-            .ok_or_else(|| slint::PlatformError::Other("XDG_RUNTIME_DIR is not set".into()))?;
-        slint_replay::remote_ui::install(&socket).map_err(slint::PlatformError::Other)?;
-    }
     let tokio_rt = bootstrap.tokio_rt;
     let rt_handle = tokio_rt.handle().clone();
     let first_run = bootstrap.first_run;
@@ -629,6 +611,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             ),
             "whisper" => format!("Whisper {}", c.stt_whisper_url),
+            "speechmatics" => "cloud Speechmatics".to_string(),
+            "elevenlabs" => "cloud ElevenLabs".to_string(),
+            "deepgram" => "cloud Deepgram".to_string(),
             _ => "cloud Groq".to_string(),
         };
         diag!("stack: AI={} STT={}", ai_desc, stt_desc);
@@ -638,6 +623,17 @@ fn main() -> Result<(), slint::PlatformError> {
     // the very first tile spawned (before the Settings panel is ever
     // opened) already honours the saved transparency.
     set_global_tile_opacity(cfg.read().tile_body_opacity);
+    // Seed before any TileWindow is created, including tiles spawned while
+    // the Settings window has never been opened.
+    set_global_tile_reading_mode(cfg.read().tile_reading_mode);
+    {
+        let c = cfg.read();
+        set_global_tile_text_preferences(
+            [c.tile_font_body, c.tile_font_heading, c.tile_font_subheading,
+             c.tile_font_code, c.tile_font_table, c.tile_font_alert],
+            c.tile_memory_stars,
+        );
+    }
     // Seed the tile-monitor pin (Settings ▸ tile placement) the same way, so the
     // first tile honours the saved display even before Settings opens; unset or
     // an unplugged display → pick_monitor (auto).
@@ -647,6 +643,8 @@ fn main() -> Result<(), slint::PlatformError> {
             .as_deref()
             .and_then(parse_tile_monitor_pin),
     );
+    set_global_tile_anchor(&cfg.read().tile_anchor);
+    set_global_tile_zone(cfg.read().tile_zone);
     // E9 — seed the experimental prompt-cache toggle from config.
     ai::set_prompt_cache(cfg.read().ai_prompt_cache);
     // E10 — disable local-model "thinking" for fast answers unless the user
@@ -654,12 +652,6 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let c = cfg.read();
         ai::set_local_no_think(c.ai_provider == "local" && !c.ai_local_thinking);
-        // The reasoning level chosen for the bridge and the OpenAI profile.
-        ai::set_reasoning_efforts(c.reasoning_efforts());
-        // ADR-003 — the local model's tools, and a Strata installed before
-        // Suflyor if the user chose one.
-        ai::set_agent_tools(c.ai_agent_tools, c.ai_web_search);
-        overlay_backend::local_ai::set_adopted_strata(&c.ai_strata_dir, &c.ai_strata_config);
     }
     // E10.2 — restore persisted stealth only where capture exclusion exists.
     // Keep the saved preference untouched on macOS so returning to Windows does
@@ -766,29 +758,26 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(windows)]
     {
         use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
-        let _ = slint::BackendSelector::new()
-            .backend_name("winit".into())
-            .with_winit_window_attributes_hook(|attributes| attributes.with_skip_taskbar(true))
-            .select();
-        diag!("[overlay-host] Slint windows excluded from taskbar at creation");
-    }
-    // The plugin build has its own headless platform (remote_ui::install).
-    #[cfg(all(target_os = "linux", not(feature = "remote-ui")))]
-    {
-        use slint::winit_030::winit::platform::wayland::WindowAttributesExtWayland;
-        slint::BackendSelector::new()
+        // Skia's default EGL/OpenGL ES path crashes with heap corruption on
+        // some Windows drivers. Select the tested Direct3D path explicitly.
+        // Keep FemtoVG as the default unless the user opts into Skia D3D.
+        let selector = slint::BackendSelector::new()
             .backend_name("winit".into())
             .with_winit_window_attributes_hook(|attributes| {
-                attributes
-                    .with_name("suflyor", "suflyor")
-                    .with_resizable(false)
-            })
-            .select()?;
-        // Unlike the creation hook, the public application id survives Wayland remaps.
-        slint::set_xdg_app_id("suflyor")?;
+                attributes.with_skip_taskbar(true).with_no_redirection_bitmap(
+                    std::env::var("SUFLYOR_RENDERER").as_deref() == Ok("skia-d3d")
+                )
+            });
+        if std::env::var("SUFLYOR_RENDERER").as_deref() == Ok("skia-d3d") {
+            selector.renderer_name("skia".into()).require_d3d().select()?;
+            diag!("[overlay-host] renderer selected: Skia Direct3D (explicit)");
+        } else {
+            let _ = selector.select();
+            diag!("[overlay-host] renderer: default selection (FemtoVG unless overridden)");
+        }
+        diag!("[overlay-host] Slint windows excluded from taskbar at creation");
     }
     let overlay = OverlayBarWindow::new()?;
-    overlay.set_tile_idle_seconds(cfg.read().omarchy_tile_idle_seconds.min(600) as i32);
     // Seed the process-global colour scheme from config, then apply to the bar's
     // Theme global so the very first paint uses the user's choice (default
     // 0=Glacier). Every later-created window (tiles, palette, settings) reads
@@ -811,10 +800,8 @@ fn main() -> Result<(), slint::PlatformError> {
         cfg: cfg.clone(),
         spawn_tx,
         tile_seq: AtomicU64::new(0),
-        spawn_generation: AtomicU64::new(0),
-        auto_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         current_streaming: std::sync::Mutex::new(None),
-        ai_in_flight: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        ai_in_flight: std::sync::atomic::AtomicI32::new(0),
         conversations: std::sync::Mutex::new(std::collections::HashMap::new()),
         stream_gen: Arc::new(AtomicU64::new(0)),
         last_tile_render: std::sync::Mutex::new(std::time::Instant::now()),
@@ -838,26 +825,13 @@ fn main() -> Result<(), slint::PlatformError> {
         Ok(()) => eprintln!("[overlay-host] translation set to {lang}"),
         Err(e) => eprintln!("[overlay-host] translation {lang} not available: {e}"),
     }
-    #[cfg(feature = "remote-ui")]
-    slint_replay::remote_ui::set_locale(&lang);
 
-    #[cfg(target_os = "linux")]
-    {
-        overlay.set_status_text(SharedString::from(if cfg.read().ui_is_ru() {
-            "Linux: экспериментальный порт"
-        } else {
-            "Linux: experimental port"
-        }));
-        overlay.set_status_tone(crate::ui::StatusTone::Warning);
-        diag!(
-            "experimental native Linux adapters enabled; full-port acceptance remains in progress"
-        );
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        overlay.set_status_text(SharedString::from("idle"));
-        overlay.set_status_tone(crate::ui::StatusTone::Neutral);
-    }
+    overlay.set_status_text(SharedString::from("idle"));
+    overlay.set_status_color(slint::Color::from_rgb_u8(0x88, 0x88, 0x8c));
+    // Modal answer mode always starts in Normal. The bar button (or Shift+F9)
+    // changes the mode; the ordinary F9/PTT/text ask actions read it.
+    set_smart_ask_mode(false);
+    overlay.set_smart_mode_active(false);
     overlay.set_active_stack(SharedString::from(active_stack_label(&cfg.read())));
 
     // Poll request latency + process footprints into the footer (~1.5s). The
@@ -869,11 +843,11 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak_tps = overlay.as_weak();
         let cfg_tps = cfg.clone();
         let loading_tps = mlx_prewarm_loading.clone();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         let session_rt_tps = slint_rt.clone();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         let app_state_tps = state.clone();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         let last_system_state = Rc::new(std::cell::Cell::new(0_u8));
         _tps_timer.start(
             slint::TimerMode::Repeated,
@@ -892,15 +866,12 @@ fn main() -> Result<(), slint::PlatformError> {
                     o.set_app_memory(SharedString::from(memory_size_label(memory.app_bytes)));
                     o.set_mlx_memory(SharedString::from(memory_size_label(memory.mlx_bytes)));
 
-                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    #[cfg(target_os = "macos")]
                     {
                         use overlay_backend::audio::SystemCaptureState;
                         let system_state = {
                             let runtime = slint_replay::runtime_state::lock(&session_rt_tps);
-                            runtime
-                                .capture
-                                .as_ref()
-                                .map(|capture| capture.system_capture_state())
+                            runtime.capture.as_ref().map(|capture| capture.system_capture_state())
                         };
                         let code = match system_state {
                             None => 0,
@@ -922,7 +893,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                     } else {
                                         "system audio: starting..."
                                     }));
-                                    o.set_status_tone(crate::ui::StatusTone::Warning);
+                                    o.set_status_color(slint::Color::from_rgb_u8(0xfb, 0xbf, 0x24));
                                 }
                                 3 => {
                                     o.set_status_text(SharedString::from(if is_ru {
@@ -930,9 +901,13 @@ fn main() -> Result<(), slint::PlatformError> {
                                     } else {
                                         "system audio unavailable"
                                     }));
-                                    o.set_status_tone(crate::ui::StatusTone::Danger);
+                                    o.set_status_color(slint::Color::from_rgb_u8(0xf8, 0x71, 0x71));
                                 }
-                                0 | 2 => refresh_status(&o, get_mic_active(&app_state_tps), active),
+                                0 | 2 => refresh_status(
+                                    &o,
+                                    get_mic_active(&app_state_tps),
+                                    active,
+                                ),
                                 _ => {}
                             }
                         }
@@ -986,7 +961,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             };
                             if let Some(o) = weak_prewarm.upgrade() {
                                 o.set_status_text(SharedString::from(unavailable));
-                                o.set_status_tone(crate::ui::StatusTone::Danger);
+                                o.set_status_color(slint::Color::from_rgb_u8(0xf8, 0x71, 0x71));
                             }
                             let weak_restore = weak_prewarm.clone();
                             let state_restore = state_prewarm.clone();
@@ -1188,34 +1163,6 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
             }
-            // Strata as the local engine: start it once at boot. It needs the
-            // whole GPU, so it runs only while the saved local URL is its own.
-            {
-                let want_strata = {
-                    let c = cfg_w.read();
-                    c.ai_provider == "local"
-                        && !c.deep_lock
-                        && overlay_backend::local_ai::is_managed_strata_endpoint(
-                            &c.ai_local_base_url,
-                        )
-                };
-                if want_strata {
-                    let lifecycle_lock = {
-                        let s = state_w.lock().unwrap_or_else(|p| p.into_inner());
-                        s.local_ai_lock.clone()
-                    };
-                    let Some(guard) =
-                        overlay_backend::local_ai::blocking_acquire_lifecycle(&lifecycle_lock)
-                    else {
-                        return;
-                    };
-                    let no_cancel = std::sync::atomic::AtomicBool::new(false);
-                    let outcome =
-                        overlay_backend::local_ai::start_strata(&root, &no_cancel, &|_| {});
-                    drop(guard);
-                    diag!("Strata boot start: {outcome:?}");
-                }
-            }
             // v0.18.2 — keep llama.cpp fresh: a throttled (weekly) auto-update of
             // the engine so the local model stays fast and 12B vision (gemma4uv)
             // works without the user ever touching it. Runs ONCE at boot, BEHIND
@@ -1228,15 +1175,8 @@ fn main() -> Result<(), slint::PlatformError> {
             // auto-update too (a real swap stops :8080, and the watchdog below
             // won't bring it back while locked). Not marking the check done, so
             // the first unlocked boot catches up.
-            // The update check loads the 12B on the GPU; skip it while Strata
-            // holds the GPU. The first boot on the built-in engine catches up.
-            let update_active_engine = {
-                let c = cfg_w.read();
-                c.ai_provider == "local"
-                    && !c.deep_lock
-                    && overlay_backend::local_ai::is_managed_llama_endpoint(&c.ai_local_base_url)
-            };
-            if update_active_engine && overlay_backend::local_ai::should_check_engine_update(&root)
+            if !cfg_w.read().deep_lock
+                && overlay_backend::local_ai::should_check_engine_update(&root)
             {
                 let lifecycle_lock = {
                     let s = state_w.lock().unwrap_or_else(|p| p.into_inner());
@@ -1268,7 +1208,6 @@ fn main() -> Result<(), slint::PlatformError> {
                 overlay_backend::local_ai::mark_engine_update_checked(&root);
             }
             let mut watchdog = WatchdogState::default();
-            let mut strata_watchdog = WatchdogState::default();
             loop {
                 let (want_llama, choice) = {
                     let c = cfg_w.read();
@@ -1316,17 +1255,8 @@ fn main() -> Result<(), slint::PlatformError> {
                             let guard = lifecycle_lock.try_acquire_owned().ok();
                             if let Some(_ai_guard) = guard {
                                 // Re-check UNDER the lock — a manual op may have
-                                // brought :8080 up between our probe and the lock,
-                                // or switched the local engine to Strata.
-                                let still_wanted = {
-                                    let c = cfg_w.read();
-                                    c.ai_provider == "local"
-                                        && !c.deep_lock
-                                        && overlay_backend::local_ai::is_managed_llama_endpoint(
-                                            &c.ai_local_base_url,
-                                        )
-                                };
-                                if still_wanted && !overlay_backend::local_ai::llama_reachable() {
+                                // brought :8080 up between our probe and the lock.
+                                if !overlay_backend::local_ai::llama_reachable() {
                                     diag!(
                                         "local AI :8080 not answering — auto-(re)starting llama-server"
                                     );
@@ -1436,55 +1366,6 @@ fn main() -> Result<(), slint::PlatformError> {
                         }
                     }
                 }
-                let want_strata = {
-                    let c = cfg_w.read();
-                    c.ai_provider == "local"
-                        && !c.deep_lock
-                        && overlay_backend::local_ai::is_managed_strata_endpoint(
-                            &c.ai_local_base_url,
-                        )
-                };
-                if want_strata {
-                    if overlay_backend::local_ai::strata_reachable() {
-                        strata_watchdog.note_reachable();
-                    } else if strata_watchdog.should_restart(
-                        std::time::Instant::now(),
-                        std::time::Duration::from_secs(WATCHDOG_COOLDOWN_SECS),
-                        WATCHDOG_MAX_FAILS,
-                    ) {
-                        let lifecycle_lock = {
-                            let s = state_w.lock().unwrap_or_else(|p| p.into_inner());
-                            s.local_ai_lock.clone()
-                        };
-                        // A Settings switch owns the lifecycle: skip this tick.
-                        if let Ok(_ai_guard) = lifecycle_lock.try_acquire_owned() {
-                            // Re-check under the lock: a Settings switch may have
-                            // moved the local engine away from Strata meanwhile.
-                            let still_wanted = {
-                                let c = cfg_w.read();
-                                c.ai_provider == "local"
-                                    && !c.deep_lock
-                                    && overlay_backend::local_ai::is_managed_strata_endpoint(
-                                        &c.ai_local_base_url,
-                                    )
-                            };
-                            if still_wanted && !overlay_backend::local_ai::strata_reachable() {
-                                diag!("Strata :8090 not answering — restarting it");
-                                let no_cancel = std::sync::atomic::AtomicBool::new(false);
-                                let outcome = overlay_backend::local_ai::start_strata(
-                                    &root,
-                                    &no_cancel,
-                                    &|_| {},
-                                );
-                                strata_watchdog.note_attempt(
-                                    std::time::Instant::now(),
-                                    outcome == overlay_backend::local_ai::StrataStart::Ready,
-                                );
-                                diag!("Strata restart: {outcome:?}");
-                            }
-                        }
-                    }
-                }
                 std::thread::sleep(std::time::Duration::from_secs(WATCHDOG_SECS));
             }
         });
@@ -1540,7 +1421,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 o.set_mic_muted(muted);
                 if muted {
                     o.set_status_text(SharedString::from("mic muted"));
-                    o.set_status_tone(crate::ui::StatusTone::Warning);
+                    o.set_status_color(slint::Color::from_rgb_u8(0xfb, 0xbf, 0x24));
                 } else {
                     refresh_status(&o, true, get_sys_active(&s));
                 }
@@ -1593,23 +1474,24 @@ fn main() -> Result<(), slint::PlatformError> {
             // process tap. Reuse its System chunks instead of opening a second
             // aggregate device with the same UID. Outside a session the bounded
             // standalone probe remains unchanged.
-            let session_active = slint_replay::runtime_state::lock(&slint_rt_sys)
-                .capture
-                .is_some();
-            let use_session_stream =
-                session_active && slint_session::begin_system_audio_collector(&slint_rt_sys);
+            let session_active =
+                slint_replay::runtime_state::lock(&slint_rt_sys).capture.is_some();
+            let use_session_stream = session_active
+                && slint_session::begin_system_audio_collector(&slint_rt_sys);
             let aux_guard = if session_active {
                 None
             } else {
                 slint_session::try_acquire_system_audio_aux()
             };
-            if (session_active && !use_session_stream) || (!session_active && aux_guard.is_none()) {
+            if (session_active && !use_session_stream)
+                || (!session_active && aux_guard.is_none())
+            {
                 match s.lock() {
                     Ok(mut st) => st.sys_probe_in_flight = false,
                     Err(poisoned) => poisoned.into_inner().sys_probe_in_flight = false,
                 }
                 o.set_status_text(SharedString::from("sys test failed"));
-                o.set_status_tone(crate::ui::StatusTone::Danger);
+                o.set_status_color(slint::Color::from_rgb_u8(0xf8, 0x71, 0x71));
                 return;
             }
             let sys_device = cfg_sys.read().system_audio_device.clone();
@@ -1670,16 +1552,21 @@ fn main() -> Result<(), slint::PlatformError> {
                         );
                         return;
                     }
-                    let (label, tone) = match peak_dbfs {
+                    let (label, color) = match peak_dbfs {
                         Some(db) if db.is_finite() && db >= -40.0 => {
-                            ("sys ok", crate::ui::StatusTone::Info)
+                            ("sys ok", slint::Color::from_rgb_u8(0x6c, 0xcf, 0xff))
                         }
-                        Some(db) if db.is_finite() => ("sys quiet", crate::ui::StatusTone::Warning),
-                        Some(_) => ("sys silent", crate::ui::StatusTone::Warning),
-                        None => ("sys test failed", crate::ui::StatusTone::Danger),
+                        Some(db) if db.is_finite() => {
+                            ("sys quiet", slint::Color::from_rgb_u8(0xfb, 0xbf, 0x24))
+                        }
+                        Some(_) => ("sys silent", slint::Color::from_rgb_u8(0xfb, 0xbf, 0x24)),
+                        None => (
+                            "sys test failed",
+                            slint::Color::from_rgb_u8(0xf8, 0x71, 0x71),
+                        ),
                     };
                     o.set_status_text(SharedString::from(label));
-                    o.set_status_tone(tone);
+                    o.set_status_color(color);
                     eprintln!(
                         "[overlay-host] sys test result: {} dBFS ({label})",
                         peak_dbfs.map_or_else(|| "?".into(), |d| format!("{d:.2}"))
@@ -1734,7 +1621,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 o.set_session_paused(paused);
                 if paused {
                     o.set_status_text(SharedString::from("paused"));
-                    o.set_status_tone(crate::ui::StatusTone::Warning);
+                    o.set_status_color(slint::Color::from_rgb_u8(0xfb, 0xbf, 0x24));
                 } else {
                     refresh_status(&o, get_mic_active(&s), get_sys_active(&s));
                 }
@@ -1813,7 +1700,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     // Clear any "paused"/"recording" status back to idle so a
                     // Stop-while-paused doesn't leave a stale pill.
                     o.set_status_text(SharedString::from("idle"));
-                    o.set_status_tone(crate::ui::StatusTone::Neutral);
+                    o.set_status_color(slint::Color::from_rgb_u8(0x88, 0x88, 0x8c));
                 }
             }
 
@@ -1837,11 +1724,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     if generation_c.load(Ordering::Acquire) != session_intent {
                         return;
                     }
-                    let ui_is_ru = cfg_c.read().ui_is_ru();
                     if let Err(e) = slint_session::start_session(events_c, cfg_c, rt_c) {
                         eprintln!("[overlay-host] start_session failed: {e:#}");
-                        let message =
-                            status_copy::session_start_failed(ui_is_ru, &format!("{e:#}"));
                         // Revert UI toggle since the pipeline didn't start.
                         let _ = slint::invoke_from_event_loop(move || {
                             #[cfg(target_os = "macos")]
@@ -1861,8 +1745,8 @@ fn main() -> Result<(), slint::PlatformError> {
                             drop(st);
                             if let Some(o) = weak_revert.upgrade() {
                                 o.set_timer_active(false);
-                                o.set_status_text(SharedString::from(message));
-                                o.set_status_tone(crate::ui::StatusTone::Danger);
+                                o.set_status_text(SharedString::from("start failed"));
+                                o.set_status_color(slint::Color::from_rgb_u8(0xe5, 0x4b, 0x4b));
                             }
                         });
                     }
@@ -1986,7 +1870,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     overlay.set_timer_label(SharedString::from("00:00"));
                     overlay.set_session_name(SharedString::from(""));
                     overlay.set_status_text(SharedString::from(status));
-                    overlay.set_status_tone(crate::ui::StatusTone::Danger);
+                    overlay.set_status_color(slint::Color::from_rgb_u8(0xe5, 0x4b, 0x4b));
                 }
 
                 let runtime = runtime.clone();
@@ -2026,7 +1910,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(overlay) = weak_overlay_after_stop.upgrade() {
                             overlay.set_status_text(SharedString::from(status));
-                            overlay.set_status_tone(crate::ui::StatusTone::Danger);
+                            overlay.set_status_color(slint::Color::from_rgb_u8(0xe5, 0x4b, 0x4b));
                         }
                     });
                     if session_events
@@ -2084,78 +1968,24 @@ fn main() -> Result<(), slint::PlatformError> {
         // User reported (cycle 24): "баг с зависанием основной
         // панели не пропал".
         //
-        // Also: cap the LIVE tiles Vec at MAX_LIVE_TILES — if the
-        // user lets the session run wild, force-close the oldest
-        // tile before spawning a new one. Bounds Slint internal
-        // event dispatch cost (was O(N) per UI event).
+        // Also: cap the LIVE tiles Vec at the user's configured limit — if the
+        // session runs wild, force-close the oldest tile before spawning a new
+        // one. Bounds Slint internal event-dispatch cost and keeps the desktop
+        // readable. The limit is clamped so an externally-edited config cannot
+        // disable tiles with zero or create an unbounded window flood.
         const MAX_SPAWNS_PER_TICK: usize = 1;
-        const MAX_LIVE_TILES: usize = 16;
+        let max_live_tiles = cfg_for_poll.read().max_live_tiles.clamp(1, 64);
         let mut processed = 0;
         while processed < MAX_SPAWNS_PER_TICK {
-            let Ok(mut req) = spawn_rx.try_recv() else {
-                break;
-            };
+            let Ok(req) = spawn_rx.try_recv() else { break };
             processed += 1;
-            if req.generation != bridge_for_poll.spawn_generation.load(Ordering::SeqCst) {
-                continue;
-            }
-            // A fast answer ends with its terms: shown as buttons, not as text.
-            // Only auto tiles ask for them; a note or a summary keeps its text.
-            let answer_terms = if req.kind == TileKind::Auto {
-                let (shown, terms) = overlay_backend::runtime::split_terms_line(&req.spec.answer);
-                req.spec.answer = shown;
-                terms
-            } else {
-                Vec::new()
-            };
-            // The end of a streaming auto tile reuses its window. A tile the
-            // user already closed (or the cap evicted) stays closed.
-            let reused = if req.action == SpawnAction::New {
-                None
-            } else {
-                AUTO_STREAM_EARLY.with(|m| m.borrow_mut().remove(&req.label));
-                let Some(tile) = AUTO_STREAM_TILES
-                    .with(|m| m.borrow_mut().remove(&req.label))
-                    .and_then(|w| w.upgrade())
-                else {
-                    continue;
-                };
-                if req.action == SpawnAction::Drop {
-                    bridge_for_poll.cancel_tile_request(&tile);
-                    let sequence = tile.get_sequence();
-                    let _ = tile.hide();
-                    slint_replay::win32::force_hide(tile.window());
-                    tiles_for_poll
-                        .borrow_mut()
-                        .retain(|item| item.get_sequence() != sequence);
-                    refresh_open_tiles(&weak_overlay_poll, &tiles_for_poll);
-                    continue;
-                }
-                Some(tile)
-            };
-            // Drop oldest tile if we're at the cap. Slint releases
-            // the native window when the Strong refcount hits 0.
-            while reused.is_none() && tiles_for_poll.borrow().len() >= MAX_LIVE_TILES {
-                let dropped = tiles_for_poll.borrow_mut().remove(0);
-                // Abort the evicted tile's in-flight AI request (keyed by the
-                // synchronous tile-id; -1 for non-"+ tile" tiles is a no-op).
-                bridge_for_poll.cancel_tile_request(&dropped);
-                // FIX #8 — prune this tile's conversation too (no-op if it had
-                // none), so the map doesn't outlive the force-evicted tile.
-                bridge_for_poll.drop_conversation(dropped.get_convo_id());
-                let _ = dropped.hide();
-                slint_replay::win32::force_hide(dropped.window());
-                eprintln!(
-                    "[overlay-host] live tile cap hit (>= {MAX_LIVE_TILES}) — dropping oldest"
-                );
-            }
-            // Keep the bar's open-tile count honest even if the new() below
-            // fails after a cap eviction (review minor).
-            refresh_open_tiles(&weak_overlay_poll, &tiles_for_poll);
-            let tile = match reused
-                .as_ref()
-                .map_or_else(TileWindow::new, |t| Ok(t.clone_strong()))
-            {
+            enforce_live_tile_cap_before_spawn(
+                &tiles_for_poll,
+                &bridge_for_poll,
+                &weak_overlay_poll,
+                max_live_tiles,
+            );
+            let tile = match TileWindow::new() {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!(
@@ -2171,41 +2001,25 @@ fn main() -> Result<(), slint::PlatformError> {
             // Phase E6 fix — auto-increment sequence so tile labels
             // show #1, #2, #3 instead of all #0. Use Relaxed because
             // poll-Timer is single-threaded (UI thread).
-            if reused.is_none() {
-                let seq = TILE_DISPLAY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                tile.set_sequence(seq as i32);
-                tile.set_tile_id(req.tile_id);
-            }
+            let seq = TILE_DISPLAY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tile.set_sequence(seq as i32);
             wire_tile_drag(&tile);
-            tile.set_source_label(SharedString::from(tile_text::kind_label(
-                req.kind,
-                req.stealth,
-                cfg_for_poll.read().ui_is_ru(),
+            tile.set_source_label(SharedString::from(format!(
+                "{} · {}",
+                req.kind.as_journal_tag(),
+                if req.stealth { "stealth" } else { "" }
             )));
-            tile.set_plain_notice(req.kind == TileKind::Error);
             // Phase E6 v12 — first highlight (if any) becomes the
             // trigger badge. Backend's trigger_highlights() already
             // formats it as "keyword ..." or "question ...".
             // Color: orange for keyword/aggressive, blue for question.
-            // A question is shown whole under the header instead of as a
-            // badge cut at 60 characters.
-            let question_badge = req
-                .spec
-                .highlights
-                .first()
-                .is_some_and(|first| first.starts_with("question"));
-            tile.set_question_text(SharedString::from(if question_badge {
-                slint_replay::app_state::tile_title_line(&req.spec.question)
-            } else {
-                String::new()
-            }));
-            if let Some(first) = req.spec.highlights.first().filter(|_| !question_badge) {
+            if let Some(first) = req.spec.highlights.first() {
                 tile.set_trigger_label(SharedString::from(first.clone()));
                 let is_keyword = first.starts_with("keyword");
-                tile.set_trigger_tone(if is_keyword {
-                    crate::ui::TileTone::Orange
+                tile.set_trigger_color(if is_keyword {
+                    slint::Color::from_rgb_u8(0xfb, 0x92, 0x3c) // orange
                 } else {
-                    crate::ui::TileTone::Sky
+                    slint::Color::from_rgb_u8(0x6c, 0xcf, 0xff) // cyan
                 });
             }
             // Render answer markdown via the spike adapter
@@ -2221,13 +2035,6 @@ fn main() -> Result<(), slint::PlatformError> {
                 })
                 .collect();
             tile.set_blocks(ModelRc::new(VecModel::from(blocks)));
-            wire_terms(
-                &tile,
-                &answer_terms,
-                req.spec.question.clone(),
-                &cfg_for_poll,
-                &rt_handle_for_poll,
-            );
             // Phase E6 v20 — apply saved tile opacity from config so
             // new auto-tiles inherit the user's last slider setting.
             tile.set_body_opacity(cfg_for_poll.read().tile_body_opacity);
@@ -2244,19 +2051,22 @@ fn main() -> Result<(), slint::PlatformError> {
             tile.on_close_clicked(move || {
                 eprintln!("[overlay-host] tile (poll/F3) close_clicked fired");
                 if let Some(t) = weak_tile.upgrade() {
-                    bridge_for_close.cancel_tile_request(&t);
                     // FIX #8 — prune this tile's conversation (no-op if none).
                     bridge_for_close.drop_conversation(t.get_convo_id());
-                    let sequence = t.get_sequence();
+                    let close_hwnd = grab_hwnd(t.window()).ok();
                     let _ = t.hide();
                     slint_replay::win32::force_hide(t.window());
-                    let before = vec_for_close.borrow().len();
-                    vec_for_close
-                        .borrow_mut()
-                        .retain(|item| item.get_sequence() != sequence);
-                    let after = vec_for_close.borrow().len();
-                    eprintln!("[overlay-host]   dropped from vec: before={before} after={after}");
-                    refresh_open_tiles(&weak_overlay_close, &vec_for_close);
+                    if let Some(target) = close_hwnd {
+                        let before = vec_for_close.borrow().len();
+                        vec_for_close
+                            .borrow_mut()
+                            .retain(|item| grab_hwnd(item.window()).ok() != Some(target));
+                        let after = vec_for_close.borrow().len();
+                        eprintln!(
+                            "[overlay-host]   dropped from vec: before={before} after={after}"
+                        );
+                        refresh_open_tiles(&weak_overlay_close, &vec_for_close);
+                    }
                 }
             });
             // Phase E6 v17 — pin toggles visual state. Pinned tiles
@@ -2307,13 +2117,9 @@ fn main() -> Result<(), slint::PlatformError> {
                                                // Seed [system, user(question), assistant(answer)] the same way
                                                // F9 builds history, so regenerate re-asks the same question and
                                                // a follow-up carries full context.
-                let (meeting_context, response_language, fast) = {
+                let (meeting_context, response_language) = {
                     let c = cfg_for_poll.read();
-                    (
-                        c.meeting_context.clone(),
-                        c.response_language.clone(),
-                        AskRoute::Text.fast_answers(&c),
-                    )
+                    (c.meeting_context.clone(), c.response_language.clone())
                 };
                 let question = req.spec.question.clone();
                 // v0.12.2 — Summary tiles seed their dialog with the REAL recap
@@ -2418,13 +2224,12 @@ fn main() -> Result<(), slint::PlatformError> {
                             &meeting_context,
                             Some(question.as_str()),
                         );
-                        let mut messages = ai::build_live_request(
+                        let mut messages = ai::build_request(
                             &meeting_context,
                             &response_language,
                             &[],
                             None,
                             Some(&question),
-                            fast,
                         );
                         messages.push(ai::ChatMessage {
                             role: "assistant".into(),
@@ -2548,14 +2353,15 @@ fn main() -> Result<(), slint::PlatformError> {
                         // Dismiss the error tile (drop it from the live Vec like
                         // the close handler) — the resume spawns a fresh tile.
                         if let Some(t) = weak_retry.upgrade() {
-                            abort_tile_stream(t.get_tile_id());
-                            let sequence = t.get_sequence();
+                            let close_hwnd = grab_hwnd(t.window()).ok();
                             let _ = t.hide();
                             slint_replay::win32::force_hide(t.window());
-                            vec_for_retry
-                                .borrow_mut()
-                                .retain(|item| item.get_sequence() != sequence);
-                            refresh_open_tiles(&weak_overlay_retry, &vec_for_retry);
+                            if let Some(target) = close_hwnd {
+                                vec_for_retry
+                                    .borrow_mut()
+                                    .retain(|item| grab_hwnd(item.window()).ok() != Some(target));
+                                refresh_open_tiles(&weak_overlay_retry, &vec_for_retry);
+                            }
                         }
                         let events_c = events_retry.clone();
                         let cfg_c = cfg_retry.clone();
@@ -2573,26 +2379,6 @@ fn main() -> Result<(), slint::PlatformError> {
                         });
                     });
                 }
-            }
-            // The streaming auto tile shows the answer as it arrives and gets
-            // its dialog on Fill.
-            if req.action == SpawnAction::New
-                && req.spec.source == slint_replay::slint_session::AUTO_TILE_STREAM_SOURCE
-            {
-                let is_ru = cfg_for_poll.read().ui_is_ru();
-                let early = AUTO_STREAM_EARLY.with(|m| m.borrow_mut().remove(&req.label));
-                let body = early.unwrap_or_else(|| tile_text::asking_body(is_ru).to_string());
-                let body = overlay_backend::runtime::hide_terms_line_while_streaming(&body);
-                tile.set_blocks(ModelRc::new(VecModel::from(to_md_blocks_streaming(&body))));
-                tile.set_source_label(SharedString::from(tile_text::asking_label(is_ru)));
-                tile.set_followup_busy(true);
-                AUTO_STREAM_TILES.with(|m| {
-                    m.borrow_mut().insert(req.label.clone(), tile.as_weak());
-                });
-            }
-            if reused.is_some() {
-                // Already shown and placed; keep it where the user sees it.
-                continue;
             }
             // (monitor placement applied via apply_tile_hwnd_with_monitor.)
             present_tile_window(&tile);
@@ -2649,6 +2435,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // and the bar's active-stack readout shows what's actually live.
 
     // (#E10.2) The ⭐ bookmark chip was removed (no use-case found).
+    // journal::append_bookmark stays available for a future re-add.
 
     // KB palette — opened via the F4 global hotkey (registered below).
     // (The 💡 tips chip was removed; F4 is the sole entry point.)
@@ -2697,7 +2484,6 @@ fn main() -> Result<(), slint::PlatformError> {
     // applied via grab_hwnd RIGHT AFTER show(), which fails (HWND not realized) —
     // so the capture overlay used to be visible on screen-share + in the taskbar.
     let capture_overlay: Rc<RefCell<Option<CaptureOverlay>>> = Rc::new(RefCell::new(None));
-    #[cfg(not(target_os = "linux"))]
     match CaptureOverlay::new() {
         Ok(co) => {
             co.window().set_size(slint::PhysicalSize::new(1, 1));
@@ -2756,12 +2542,22 @@ fn main() -> Result<(), slint::PlatformError> {
     // `_hotkey_manager`: bound (not `_`) so it lives to the end of `main` — its
     // Drop unregisters every hotkey. Leading underscore silences the unused warn
     // without changing the drop point (it was read inside the moved block before).
+    let hotkey_bindings = cfg.read().hotkeys.clone();
+    // Show shortcuts next to buttons, using the SAME bindings registered below.
+    // The ask/grab hold-to-record buttons have no dedicated hotkeys: do not
+    // misleadingly label them F9 (F9 re-asks the latest transcript question).
+    overlay.set_shortcut_archive(SharedString::from(hotkey_bindings.archive.as_str()));
+    overlay.set_shortcut_vision(SharedString::from(hotkey_bindings.vision.as_str()));
+    overlay.set_shortcut_new_tile(SharedString::from(hotkey_bindings.new_tile.as_str()));
+    overlay.set_shortcut_close_all(SharedString::from(hotkey_bindings.close_all_tiles.as_str()));
+    overlay.set_shortcut_help(SharedString::from(hotkey_bindings.help.as_str()));
     let RegisteredHotkeys {
         manager: _hotkey_manager,
         f1_id,
         f3_id,
         f4_id,
         f6_id,
+        close_all_id,
         f7_id,
         f8_id,
         sf8_id,
@@ -2771,7 +2567,7 @@ fn main() -> Result<(), slint::PlatformError> {
         sa1_id,
         sa2_id,
         sa3_id,
-    } = register_hotkeys();
+    } = register_hotkeys(&hotkey_bindings);
 
     let hotkey_poll = Timer::default();
     let hp_palette = palette.clone();
@@ -2791,7 +2587,7 @@ fn main() -> Result<(), slint::PlatformError> {
         TimerMode::Repeated,
         Duration::from_millis(HOTKEY_POLL_MS),
         move || {
-            while let Some(event) = hotkeys::next_event() {
+            while let Ok(event) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
                 if event.state != global_hotkey::HotKeyState::Pressed {
                     continue;
                 }
@@ -2870,15 +2666,14 @@ fn main() -> Result<(), slint::PlatformError> {
                     // Phase E3 slice 3 — F6 manual spawn from last
                     // transcript line (bypasses auto-detector).
                     diag!("[overlay-host] F6 pressed — manual_spawn_tile");
-                    if AskRoute::Text.fast_answers(&hp_cfg.read())
-                        && !slint_replay::runtime_state::lock(&hp_rt).transcript.is_empty()
-                    {
-                        fire_f9_ask(
-                            &hp_bridge, &hp_events, &hp_cfg, &hp_rt, &hp_rt_handle,
-                            &hp_tiles, &hp_weak_overlay, AskRoute::Text, None,
-                        );
-                    } else {
-                        fire_f6_manual_spawn(&hp_events, &hp_cfg, &hp_rt, &hp_rt_handle);
+                    fire_f6_manual_spawn(&hp_events, &hp_cfg, &hp_rt, &hp_rt_handle);
+                } else if event.id == close_all_id {
+                    // User-configurable bulk-close hotkey. Reuse the bar callback
+                    // so click and keyboard paths share the exact same cleanup:
+                    // abort streams, drop conversations, hide windows, reset count.
+                    diag!("[overlay-host] close-all hotkey pressed");
+                    if let Some(o) = hp_weak_overlay.upgrade() {
+                        o.invoke_close_all_tiles_clicked();
                     }
                 } else if event.id == f9_id {
                     // Phase E3 slice 2 — F9 live AI ask via overlay-backend's
@@ -2887,7 +2682,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     // slot, then spawns the streaming AI task. Deltas land
                     // back through the bridge's ai:event handler and update
                     // the tile body live.
-                    diag!("[overlay-host] F9 pressed — live ask streaming");
+                    let route = active_ask_route();
+                    diag!("[overlay-host] F9 pressed — live ask streaming ({route:?})");
                     fire_f9_ask(
                         &hp_bridge,
                         &hp_events,
@@ -2896,26 +2692,21 @@ fn main() -> Result<(), slint::PlatformError> {
                         &hp_rt_handle,
                         &hp_tiles,
                         &hp_weak_overlay,
-                        AskRoute::Text,
+                        route,
                         None,
                     );
                 } else if event.id == sf9_id {
-                    // V0.8.0 (Поток D) — Shift+F9 escalates ONE ask to the smart
-                    // cloud model (deeper reasoning), without flipping the
-                    // persistent provider. Egress is intentional + visible (the
-                    // tile shows a 🧠 cloud badge).
-                    diag!("[overlay-host] Shift+F9 — one-shot CLOUD escalation");
-                    fire_f9_ask(
-                        &hp_bridge,
-                        &hp_events,
-                        &hp_cfg,
-                        &hp_rt,
-                        &hp_rt_handle,
-                        &hp_tiles,
-                        &hp_weak_overlay,
-                        AskRoute::Cloud,
-                        None,
+                    // Modal AI routing: Shift+F9 changes the mode only. F9, typed
+                    // ask and PTT all keep ONE invocation path and read the mode.
+                    let next = !smart_ask_mode();
+                    set_smart_ask_mode(next);
+                    diag!(
+                        "[overlay-host] Shift+F9 — AI mode -> {}",
+                        if next { "smart" } else { "normal" }
                     );
+                    if let Some(o) = hp_weak_overlay.upgrade() {
+                        o.set_smart_mode_active(next);
+                    }
                 } else if event.id == f8_id {
                     // V3 — F8 screenshot → Lightshot region select → vision (describe).
                     diag!("[overlay-host] F8 pressed — capture overlay");
@@ -2986,9 +2777,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     .to_string();
                     let saved = Rc::new(saved);
                     let copy_selection = Rc::new(move || {
-                        #[cfg(not(target_os = "linux"))]
                         slint_replay::win32::clipboard_clear();
-                        #[cfg(not(target_os = "linux"))]
                         if !slint_replay::win32::send_ctrl_c() {
                             restore_text_clipboard(saved.as_ref());
                             #[cfg(target_os = "macos")]
@@ -3030,19 +2819,13 @@ fn main() -> Result<(), slint::PlatformError> {
                         // Ctrl+C is async — the foreground app writes the clipboard
                         // on its own message loop; read after a short second delay.
                         Timer::single_shot(std::time::Duration::from_millis(140), move || {
-                            #[cfg(not(target_os = "linux"))]
                             let copied = slint_replay::win32::clipboard_read_text();
-                            #[cfg(target_os = "linux")]
-                            let copied = slint_replay::native::clipboard::read_primary();
                             diag!(
                                 "[overlay-host] sa1: copied {} chars from selection",
                                 copied.as_ref().map(|s| s.chars().count()).unwrap_or(0)
                             );
-                            #[cfg(not(target_os = "linux"))]
                             restore_text_clipboard(saved.as_ref());
-                            #[cfg(target_os = "linux")]
-                            let _ = saved;
-                            if let Some(text) = copied.filter(|text| !text.trim().is_empty()) {
+                            if let Some(text) = copied {
                                 // Spawn a visible tile showing the text + 🔊/⏯/📋/✕,
                                 // which auto-starts the read-aloud.
                                 spawn_text_tile(
@@ -3053,27 +2836,6 @@ fn main() -> Result<(), slint::PlatformError> {
                                     (&events_sa1, &cfg_sa1, &slint_rt_sa1, &rt_sa1),
                                     &tiles_sa1,
                                     &overlay_sa1,
-                                );
-                            } else {
-                                // The key must visibly react: say that nothing was
-                                // selected instead of doing nothing.
-                                let nothing_selected = if is_ru {
-                                    "Нет выделенного текста. Выделите текст в любом окне и нажмите Shift+Alt+1."
-                                } else {
-                                    "No text is selected. Select text in any window and press Shift+Alt+1."
-                                };
-                                let _ = events_sa1.spawn_tile_full(
-                                    TileSpec {
-                                        question: title.clone(),
-                                        answer: nothing_selected.into(),
-                                        source: "read_aloud_error".into(),
-                                        is_translation: false,
-                                        highlights: vec![],
-                                        summary_session: None,
-                                    },
-                                    MonitorHint::Auto,
-                                    false,
-                                    TileKind::Error,
                                 );
                             }
                         });
@@ -3153,7 +2915,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 // the sys-probe result does.
                 if let Some(o) = weak.upgrade() {
                     o.set_status_text(SharedString::from(mic_busy_status(cfg_p.read().ui_is_ru())));
-                    o.set_status_tone(crate::ui::StatusTone::Warning);
+                    o.set_status_color(slint::Color::from_rgb_u8(0xe5, 0x9b, 0x2b));
                 }
                 let weak_revert = weak.clone();
                 let state_revert = state_busy.clone();
@@ -3227,17 +2989,18 @@ fn main() -> Result<(), slint::PlatformError> {
             if ptt_state.borrow().is_some() {
                 return;
             }
-            let session_active = slint_replay::runtime_state::lock(&slint_rt_p)
-                .capture
-                .is_some();
-            let use_session_stream =
-                session_active && slint_session::begin_system_audio_collector(&slint_rt_p);
+            let session_active =
+                slint_replay::runtime_state::lock(&slint_rt_p).capture.is_some();
+            let use_session_stream = session_active
+                && slint_session::begin_system_audio_collector(&slint_rt_p);
             let aux_guard = if session_active {
                 None
             } else {
                 slint_session::try_acquire_system_audio_aux()
             };
-            if (session_active && !use_session_stream) || (!session_active && aux_guard.is_none()) {
+            if (session_active && !use_session_stream)
+                || (!session_active && aux_guard.is_none())
+            {
                 eprintln!("[overlay-host] PTT sys unavailable — system capture is busy");
                 return;
             }
@@ -3372,7 +3135,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     if let Some(t) = weak.upgrade() {
                         t.set_voice_recording(false);
                         t.set_followup_busy(false);
-                        t.set_source_label(SharedString::from("STT · ничего не распознано"));
+                        t.set_source_label(SharedString::from("stt · ничего не распознано"));
                     }
                     continue;
                 }
@@ -3458,9 +3221,6 @@ fn main() -> Result<(), slint::PlatformError> {
             // Abort every tile's in-flight AI request so bulk-close frees the
             // GPU instead of leaving the model generating for closed tiles.
             abort_all_tile_streams();
-            bridge_for_close_all.cancel_pending_tiles();
-            AUTO_STREAM_TILES.with(|m| m.borrow_mut().clear());
-            AUTO_STREAM_EARLY.with(|m| m.borrow_mut().clear());
             // Reset cascade placement — close-all clears the screen, so the next
             // tile must restart from the top-right cluster. This bulk path calls
             // refresh_tiles_chip (NOT refresh_open_tiles), so it would otherwise
@@ -3470,7 +3230,6 @@ fn main() -> Result<(), slint::PlatformError> {
                 let mut v = tiles_ref.borrow_mut();
                 let count = v.len();
                 for t in v.iter() {
-                    bridge_for_close_all.cancel_tile_request(t);
                     bridge_for_close_all.drop_conversation(t.get_convo_id());
                     let _ = t.hide();
                     slint_replay::win32::force_hide(t.window());
@@ -3478,7 +3237,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 v.clear();
                 count
             };
-            if let Some(hidden) = LAST_CLOSED_READ_TILE.with(|slot| slot.borrow_mut().take()) {
+            if let Some(hidden) =
+                LAST_CLOSED_READ_TILE.with(|slot| slot.borrow_mut().take())
+            {
                 bridge_for_close_all.drop_conversation(hidden.get_convo_id());
             }
             eprintln!("[overlay-host] close-all-tiles: closed {n} tile(s)");
@@ -3502,7 +3263,6 @@ fn main() -> Result<(), slint::PlatformError> {
         overlay.on_restore_tile_clicked(move || {
             let restored = LAST_CLOSED_READ_TILE.with(|slot| slot.borrow_mut().take());
             if let Some(tile) = restored {
-                open_tile_request(tile.get_tile_id());
                 present_tile_window(&tile);
                 apply_tile_hwnd_with_monitor(&tile);
                 tiles_ref.borrow_mut().push(tile);
@@ -3575,20 +3335,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let t = tiles.clone();
         let weak = overlay.as_weak();
         let cfg_ref = cfg.clone();
+        let bridge_for_manual_tile = bridge.clone();
         let rt = rt_handle.clone();
         let slint_rt_c = slint_rt.clone();
-        let bridge_c = bridge.clone();
-        let events_c = events.clone();
         overlay.on_spawn_tile_clicked(move || {
-            if AskRoute::Text.fast_answers(&cfg_ref.read())
-                && !slint_replay::runtime_state::lock(&slint_rt_c).transcript.is_empty()
-            {
-                fire_f9_ask(
-                    &bridge_c, &events_c, &cfg_ref, &slint_rt_c, &rt,
-                    &t, &weak, AskRoute::Text, None,
-                );
-                return;
-            }
             let Some(overlay) = weak.upgrade() else {
                 return;
             };
@@ -3605,6 +3355,13 @@ fn main() -> Result<(), slint::PlatformError> {
             // Synchronous id — the abort-registry key (the HWND isn't realized
             // yet at this point, so keying on it lost the registration).
             let tile_id = next_tile_id();
+            let max_live_tiles = cfg_ref.read().max_live_tiles;
+            enforce_live_tile_cap_before_spawn(
+                &t,
+                &bridge_for_manual_tile,
+                &weak,
+                max_live_tiles,
+            );
 
             let tile = match TileWindow::new() {
                 Ok(t) => t,
@@ -3643,8 +3400,7 @@ fn main() -> Result<(), slint::PlatformError> {
             tile.set_sequence(display_seq as i32);
             tile.set_tile_id(tile_id);
             tile.set_tile_title(SharedString::from(heading));
-            tile.set_source_label(SharedString::from(tile_text::asking_label(is_ru)));
-            tile.set_plain_notice(false);
+            tile.set_source_label(SharedString::from("ai · asking…"));
             wire_tile_drag(&tile);
 
             // Initial body — shown instantly: the AI-in-flight hint, or a
@@ -3671,13 +3427,18 @@ fn main() -> Result<(), slint::PlatformError> {
             tile.on_close_clicked(move || {
                 eprintln!("[overlay-host] tile (spawn-poll) close_clicked fired");
                 if let Some(tw) = weak_tile.upgrade() {
-                    let sequence = tw.get_sequence();
+                    let close_hwnd = grab_hwnd(tw.window()).ok();
                     let _ = tw.hide();
                     slint_replay::win32::force_hide(tw.window());
-                    // Request ownership is independent of native surface lifetime.
-                    abort_tile_stream(tile_id);
-                    vec_for_close.borrow_mut().retain(|item| item.get_sequence() != sequence);
-                    refresh_open_tiles(&weak_overlay_close, &vec_for_close);
+                    if let Some(target) = close_hwnd {
+                        // Abort this tile's in-flight AI request so the GPU isn't
+                        // left generating for a closed tile (keyed by tile-id).
+                        abort_tile_stream(tile_id);
+                        vec_for_close.borrow_mut().retain(|item| {
+                            grab_hwnd(item.window()).ok() != Some(target)
+                        });
+                        refresh_open_tiles(&weak_overlay_close, &vec_for_close);
+                    }
                 }
             });
             let weak_pin = tile.as_weak();
@@ -3725,8 +3486,10 @@ fn main() -> Result<(), slint::PlatformError> {
             // Cloud needs a bearer; a LOCAL server (llama.cpp / Ollama) usually
             // doesn't — so an empty LOCAL bearer must NOT block the ask. This is
             // why "+ tile" wrongly said "AI не настроен" for a working local model.
-            if (!matches!(ep.protocol, ai::AiProtocol::CodexSubscription)
-                && base_url.is_empty())
+            if (!matches!(
+                ep.protocol,
+                ai::AiProtocol::CodexSubscription | ai::AiProtocol::CodexDirect
+            ) && base_url.is_empty())
                 || (!is_local && bearer.is_empty())
                 || model.is_empty()
             {
@@ -3824,10 +3587,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             {
                                 overlay_backend::deep_lock::blocked_notice(is_ru)
                             } else {
-                                slint_replay::app_state::ai_error_text(
-                                    classify_ai_error(&chain),
-                                    is_ru,
-                                )
+                                classify_ai_error(&chain)
                             };
                             let md = manual_tile_failure(heading_for_task, category, is_ru);
                             let blocks: Vec<MarkdownBlock> = markdown::parse(&md)
@@ -3841,8 +3601,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                 })
                                 .collect();
                             tile.set_blocks(ModelRc::new(VecModel::from(blocks)));
-                            tile.set_source_label(SharedString::from(tile_text::error_label(is_ru)));
-                            tile.set_plain_notice(true);
+                            tile.set_source_label(SharedString::from("ai · error"));
                         }
                     }
                 });
@@ -3995,6 +3754,7 @@ fn main() -> Result<(), slint::PlatformError> {
         // Phase 1 (§5.1) — the Settings-tab stealth toggle + scheme switch (and
         // its nested "Run setup wizard") reach every open window via this registry.
         let registry_settings = registry.clone();
+        let capture_for_settings = capture_overlay.clone();
         overlay.on_open_settings_clicked(move || {
             open_settings(
                 &s,
@@ -4003,22 +3763,23 @@ fn main() -> Result<(), slint::PlatformError> {
                 &cfg_for_settings,
                 &overlay_weak,
                 &registry_settings,
+                &capture_for_settings,
             );
         });
     }
 
-    // The main panel and Settings edit the same persisted inactivity timeout.
+    // ===== Normal / Smart modal AI switch =====
     {
-        let cfg_idle = cfg.clone();
-        let weak_bar = overlay.as_weak();
-        let settings_idle = settings.clone();
-        overlay.on_tile_idle_seconds_changed(move |seconds| {
-            let saved = save_tile_idle_seconds(&cfg_idle, seconds);
-            if let Some(bar) = weak_bar.upgrade() {
-                bar.set_tile_idle_seconds(saved);
-            }
-            if let Some(win) = settings_idle.borrow().as_ref() {
-                win.set_tile_idle_seconds(saved);
+        let weak_mode = overlay.as_weak();
+        overlay.on_ai_mode_toggle_clicked(move || {
+            let next = !smart_ask_mode();
+            set_smart_ask_mode(next);
+            diag!(
+                "[overlay-host] AI answer mode -> {}",
+                if next { "smart" } else { "normal" }
+            );
+            if let Some(o) = weak_mode.upgrade() {
+                o.set_smart_mode_active(next);
             }
         });
     }
@@ -4210,144 +3971,142 @@ fn main() -> Result<(), slint::PlatformError> {
                     "[overlay-host] lock-menu event=prepared mode={mode} managed={managed}"
                 );
 
-                {
-                    let bar_hwnd = match grab_hwnd(bar.window()) {
-                        Ok(hwnd) => hwnd,
-                        Err(e) => {
-                            diag!("[overlay-host] lock-menu event=error stage=bar-hwnd error={e}");
-                            return;
-                        }
-                    };
-                    #[cfg(windows)]
-                    let (bar_left, bar_top) = {
-                        let pos = bar.window().position();
-                        if pos.x != -32000 && pos.x != 0 {
-                            (pos.x, pos.y)
-                        } else {
-                            get_window_rect(bar_hwnd)
-                                .map(|(l, t, _, _)| (l, t))
-                            .unwrap_or((pos.x, pos.y))
-                        }
-                    };
-                    #[cfg(not(windows))]
-                    let (bar_left, bar_top) = match get_window_rect(bar_hwnd) {
-                        Ok((left, top, _, _)) => (left, top),
-                        Err(e) => {
-                            diag!(
-                                "[overlay-host] lock-menu event=error stage=bar-rect error={e}"
-                            );
-                            return;
-                        }
-                    };
-                    #[cfg(windows)]
-                    let scale = bar.window().scale_factor().max(0.1);
-                    #[cfg(not(windows))]
-                    let scale = 1.0_f32;
-                    let menu_width = (210.0 * scale).round() as i32;
-                    let menu_height = ((if managed { 106.0 } else { 74.0 }) * scale).round() as i32;
-                    let anchor_x = bar_left + (anchor_x * scale) as i32;
-                    let anchor_y = bar_top + (anchor_y * scale) as i32;
-                    let monitor = enum_monitors()
-                        .into_iter()
-                        .find(|m| {
-                            anchor_x >= m.left
-                                && anchor_x < m.right
-                                && anchor_y >= m.top
-                                && anchor_y < m.bottom
-                        })
-                        .or_else(|| enum_monitors().into_iter().find(|m| m.is_primary));
-                    let Some(monitor) = monitor else {
-                        diag!("[overlay-host] lock-menu event=error stage=monitor reason=none");
-                        return;
-                    };
-                    let x = (anchor_x - menu_width).clamp(monitor.left, monitor.right - menu_width);
-                    let below = anchor_y + (4.0 * scale) as i32;
-                    let y = if below + menu_height <= monitor.bottom {
-                        below
-                    } else {
-                        (bar_top - menu_height - (4.0 * scale) as i32).max(monitor.top)
-                    };
-                    // Realize off-screen, then add owner/taskbar/stealth styles
-                    // before the first visible frame. A fresh Slint HWND is not
-                    // always available immediately after show(), hence the shared
-                    // retry helper rather than a best-effort one-shot grab.
-                    set_platform_window_position(menu.window(), -32000, -32000);
-                    let generation = focus_for_open.borrow_mut().begin_open();
-                    if let Err(e) = menu.show() {
-                        focus_for_open.borrow_mut().close();
-                        diag!("[overlay-host] lock-menu event=error stage=show error={e}");
+                let bar_hwnd = match grab_hwnd(bar.window()) {
+                    Ok(hwnd) => hwnd,
+                    Err(e) => {
+                        diag!("[overlay-host] lock-menu event=error stage=bar-hwnd error={e}");
                         return;
                     }
-                    diag!("[overlay-host] lock-menu event=show-request generation={generation}");
-                    let last_reveal_error = Rc::new(RefCell::new(None::<String>));
-                    let focus_for_reveal = focus_for_open.clone();
-                    let error_for_reveal = last_reveal_error.clone();
-                    let reveal = Rc::new(move |window: &LockModeMenuWindow| {
-                        if !focus_for_reveal.borrow().is_current_open(generation) {
-                            return true;
-                        }
-                        let hwnd = match grab_hwnd(window.window()) {
-                            Ok(hwnd) => hwnd,
-                            Err(e) => {
-                                *error_for_reveal.borrow_mut() = Some(format!("hwnd: {e}"));
-                                return false;
-                            }
-                        };
-                        set_window_owner(hwnd, bar_hwnd);
-                        if let Err(e) = set_skip_taskbar(hwnd, true) {
-                            *error_for_reveal.borrow_mut() = Some(format!("skip-taskbar: {e}"));
-                            return false;
-                        }
-                        if let Err(e) = set_always_on_top(hwnd, true) {
-                            *error_for_reveal.borrow_mut() = Some(format!("always-on-top: {e}"));
-                            return false;
-                        }
-                        if global_stealth() || cfg!(target_os = "linux") {
-                            if let Err(e) = set_stealth(hwnd, global_stealth()) {
-                                *error_for_reveal.borrow_mut() = Some(format!("stealth: {e}"));
-                                return false;
-                            }
-                        }
-                        if let Err(e) = move_window_pos_only(hwnd, x, y) {
-                            *error_for_reveal.borrow_mut() = Some(format!("move: {e}"));
-                            return false;
-                        }
-                        set_platform_window_position(window.window(), x, y);
-                        if !focus_for_reveal.borrow_mut().mark_revealed(generation) {
-                            return true;
-                        }
-                        *error_for_reveal.borrow_mut() = None;
-                        focus_window(hwnd);
+                };
+                #[cfg(windows)]
+                let (bar_left, bar_top) = {
+                    let pos = bar.window().position();
+                    if pos.x != -32000 && pos.x != 0 {
+                        (pos.x, pos.y)
+                    } else {
+                        get_window_rect(bar_hwnd)
+                            .map(|(l, t, _, _)| (l, t))
+                        .unwrap_or((pos.x, pos.y))
+                    }
+                };
+                #[cfg(target_os = "macos")]
+                let (bar_left, bar_top) = match get_window_rect(bar_hwnd) {
+                    Ok((left, top, _, _)) => (left, top),
+                    Err(e) => {
                         diag!(
-                            "[overlay-host] lock-menu event=revealed generation={generation} x={x} y={y} mode={mode} managed={managed} focus=requested"
+                            "[overlay-host] lock-menu event=error stage=bar-rect error={e}"
                         );
-                        let focus_for_arm = focus_for_reveal.clone();
-                        Timer::single_shot(Duration::ZERO, move || {
-                            if focus_for_arm.borrow_mut().arm(generation) {
-                                diag!(
-                                    "[overlay-host] lock-menu event=armed generation={generation}"
-                                );
-                            }
-                        });
-                        true
-                    });
-                    let focus_for_fallback = focus_for_open.clone();
-                    let fallback = Rc::new(move |window: &LockModeMenuWindow| {
-                        if !focus_for_fallback.borrow().is_current_open(generation) {
-                            return;
-                        }
-                        focus_for_fallback.borrow_mut().close();
-                        if let Err(e) = window.hide() {
-                            diag!("[overlay-host] lock-menu event=error stage=hide-reveal-fallback error={e}");
-                        }
-                        let detail = last_reveal_error
-                            .borrow()
-                            .clone()
-                            .unwrap_or_else(|| "native-window-not-realized".to_string());
-                        diag!("[overlay-host] lock-menu event=error stage=reveal error={detail}");
-                    });
-                    realize_with_retries(menu.as_ref(), reveal, fallback);
+                        return;
+                    }
+                };
+                #[cfg(windows)]
+                let scale = bar.window().scale_factor().max(0.1);
+                #[cfg(target_os = "macos")]
+                let scale = 1.0_f32;
+                let menu_width = (210.0 * scale).round() as i32;
+                let menu_height = ((if managed { 106.0 } else { 74.0 }) * scale).round() as i32;
+                let anchor_x = bar_left + (anchor_x * scale) as i32;
+                let anchor_y = bar_top + (anchor_y * scale) as i32;
+                let monitor = enum_monitors()
+                    .into_iter()
+                    .find(|m| {
+                        anchor_x >= m.left
+                            && anchor_x < m.right
+                            && anchor_y >= m.top
+                            && anchor_y < m.bottom
+                    })
+                    .or_else(|| enum_monitors().into_iter().find(|m| m.is_primary));
+                let Some(monitor) = monitor else {
+                    diag!("[overlay-host] lock-menu event=error stage=monitor reason=none");
+                    return;
+                };
+                let x = (anchor_x - menu_width).clamp(monitor.left, monitor.right - menu_width);
+                let below = anchor_y + (4.0 * scale) as i32;
+                let y = if below + menu_height <= monitor.bottom {
+                    below
+                } else {
+                    (bar_top - menu_height - (4.0 * scale) as i32).max(monitor.top)
+                };
+                // Realize off-screen, then add owner/taskbar/stealth styles
+                // before the first visible frame. A fresh Slint HWND is not
+                // always available immediately after show(), hence the shared
+                // retry helper rather than a best-effort one-shot grab.
+                set_platform_window_position(menu.window(), -32000, -32000);
+                let generation = focus_for_open.borrow_mut().begin_open();
+                if let Err(e) = menu.show() {
+                    focus_for_open.borrow_mut().close();
+                    diag!("[overlay-host] lock-menu event=error stage=show error={e}");
+                    return;
                 }
+                diag!("[overlay-host] lock-menu event=show-request generation={generation}");
+                let last_reveal_error = Rc::new(RefCell::new(None::<String>));
+                let focus_for_reveal = focus_for_open.clone();
+                let error_for_reveal = last_reveal_error.clone();
+                let reveal = Rc::new(move |window: &LockModeMenuWindow| {
+                    if !focus_for_reveal.borrow().is_current_open(generation) {
+                        return true;
+                    }
+                    let hwnd = match grab_hwnd(window.window()) {
+                        Ok(hwnd) => hwnd,
+                        Err(e) => {
+                            *error_for_reveal.borrow_mut() = Some(format!("hwnd: {e}"));
+                            return false;
+                        }
+                    };
+                    set_window_owner(hwnd, bar_hwnd);
+                    if let Err(e) = set_skip_taskbar(hwnd, true) {
+                        *error_for_reveal.borrow_mut() = Some(format!("skip-taskbar: {e}"));
+                        return false;
+                    }
+                    if let Err(e) = set_always_on_top(hwnd, true) {
+                        *error_for_reveal.borrow_mut() = Some(format!("always-on-top: {e}"));
+                        return false;
+                    }
+                    if global_stealth() {
+                        if let Err(e) = set_stealth(hwnd, true) {
+                            *error_for_reveal.borrow_mut() = Some(format!("stealth: {e}"));
+                            return false;
+                        }
+                    }
+                    if let Err(e) = move_window_pos_only(hwnd, x, y) {
+                        *error_for_reveal.borrow_mut() = Some(format!("move: {e}"));
+                        return false;
+                    }
+                    set_platform_window_position(window.window(), x, y);
+                    if !focus_for_reveal.borrow_mut().mark_revealed(generation) {
+                        return true;
+                    }
+                    *error_for_reveal.borrow_mut() = None;
+                    focus_window(hwnd);
+                    diag!(
+                        "[overlay-host] lock-menu event=revealed generation={generation} x={x} y={y} mode={mode} managed={managed} focus=requested"
+                    );
+                    let focus_for_arm = focus_for_reveal.clone();
+                    Timer::single_shot(Duration::ZERO, move || {
+                        if focus_for_arm.borrow_mut().arm(generation) {
+                            diag!(
+                                "[overlay-host] lock-menu event=armed generation={generation}"
+                            );
+                        }
+                    });
+                    true
+                });
+                let focus_for_fallback = focus_for_open.clone();
+                let fallback = Rc::new(move |window: &LockModeMenuWindow| {
+                    if !focus_for_fallback.borrow().is_current_open(generation) {
+                        return;
+                    }
+                    focus_for_fallback.borrow_mut().close();
+                    if let Err(e) = window.hide() {
+                        diag!("[overlay-host] lock-menu event=error stage=hide-reveal-fallback error={e}");
+                    }
+                    let detail = last_reveal_error
+                        .borrow()
+                        .clone()
+                        .unwrap_or_else(|| "native-window-not-realized".to_string());
+                    diag!("[overlay-host] lock-menu event=error stage=reveal error={detail}");
+                });
+                realize_with_retries(menu.as_ref(), reveal, fallback);
             });
         }
 
@@ -4390,50 +4149,6 @@ fn main() -> Result<(), slint::PlatformError> {
                         c.suppress_tiles
                     };
                     eprintln!("[overlay-host] suppress-tiles (listening mode) -> {new_state}");
-                    if let Some(o) = weak_for_lock.upgrade() {
-                        refresh_lock_chip(&o, &cfg_for_lock);
-                        let ru = cfg_for_lock.read().ui_is_ru();
-                        o.set_status_text(SharedString::from(
-                            overlay_backend::deep_lock::status_text(
-                                ru,
-                                if new_state {
-                                    LockStatus::ListeningOn
-                                } else {
-                                    LockStatus::ListeningOff
-                                },
-                            ),
-                        ));
-                    }
-                }
-                LockAction::ReleaseStaleLock => {
-                    let new_state = requested != LockMode::Normal;
-                    let saved = {
-                        let mut c = cfg_for_lock.write();
-                        let previous_suppress_tiles = c.suppress_tiles;
-                        c.deep_lock = false;
-                        c.suppress_tiles = new_state;
-                        match overlay_backend::config::save(&c) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                c.deep_lock = true;
-                                c.suppress_tiles = previous_suppress_tiles;
-                                eprintln!(
-                                    "[overlay-host] stale deep lock release save failed; lock kept: {e:#}"
-                                );
-                                false
-                            }
-                        }
-                    };
-                    if !saved {
-                        if let Some(o) = weak_for_lock.upgrade() {
-                            refresh_lock_chip(&o, &cfg_for_lock);
-                        }
-                        return;
-                    }
-                    overlay_backend::deep_lock::set_deep_lock_active(false);
-                    eprintln!(
-                        "[overlay-host] stale deep lock released (endpoint is not app-managed)"
-                    );
                     if let Some(o) = weak_for_lock.upgrade() {
                         refresh_lock_chip(&o, &cfg_for_lock);
                         let ru = cfg_for_lock.read().ui_is_ru();
@@ -4539,11 +4254,6 @@ fn main() -> Result<(), slint::PlatformError> {
                                     "[overlay-host] deep lock: :8080 is held by a foreign process — left alive"
                                 );
                             }
-                            // Strata holds the GPU the same way. Only the server
-                            // this app started stops; a Strata the user started
-                            // stays (the request guard blocks our traffic to it).
-                            overlay_backend::local_ai::abort_strata_start();
-                            overlay_backend::local_ai::stop_strata();
                         }
                         // Reap exited server handles so kill-on-quit tracking
                         // stays honest.
@@ -4668,9 +4378,6 @@ fn main() -> Result<(), slint::PlatformError> {
                             return;
                         }
                         let root = overlay_backend::local_ai::default_root();
-                        let unlock_strata = overlay_backend::local_ai::is_managed_strata_endpoint(
-                            &cfg_unlock.read().ai_local_base_url,
-                        );
                         let choice = {
                             let mut c = cfg_unlock.write();
                             // Repair a stale persisted tier before selecting the
@@ -4695,31 +4402,6 @@ fn main() -> Result<(), slint::PlatformError> {
                         let (outcome, started) = match
                             overlay_backend::local_ai::blocking_acquire_lifecycle(&lifecycle_lock)
                         {
-                            // The engine in use comes back: Strata (or a Strata
-                            // the user started, still answering) or llama.cpp.
-                            Some(guard) if unlock_strata => {
-                                let no_cancel = std::sync::atomic::AtomicBool::new(false);
-                                let start = if overlay_backend::local_ai::strata_reachable()
-                                    && !overlay_backend::local_ai::strata_running()
-                                {
-                                    overlay_backend::local_ai::use_running_strata(&root)
-                                } else {
-                                    overlay_backend::local_ai::start_strata(
-                                        &root,
-                                        &no_cancel,
-                                        &|_| {},
-                                    )
-                                };
-                                drop(guard);
-                                (
-                                    if start == overlay_backend::local_ai::StrataStart::Ready {
-                                        overlay_backend::local_ai::ModelSwitch::Switched
-                                    } else {
-                                        overlay_backend::local_ai::ModelSwitch::FailedToStart
-                                    },
-                                    Vec::new(),
-                                )
-                            }
                             Some(guard) => {
                                 let result =
                                     overlay_backend::local_ai::restart_llama_server_for_unlock(
@@ -4808,7 +4490,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                     let _ = events_unlock.spawn_tile_full(
                                         overlay_backend::events::TileSpec {
                                             question: if ru {
-                                                "Локальный AI".into()
+                                                "Локальный ИИ".into()
                                             } else {
                                                 "Local AI".into()
                                             },
@@ -5047,7 +4729,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // a beat after the bar is up, so the bar has pinned + realized first. The
     // wizard is created stealth-aware (centred on the picked monitor). Step 1's
     // mode pick writes config.json, so this branch will not fire again next run.
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(windows)]
     if first_run {
         eprintln!("[overlay-host] first run detected — auto-opening setup wizard");
         let wz = wizard.clone();
@@ -5244,72 +4926,6 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // The Omarchy plugin's bar widget is the tray there; a second StatusNotifierItem
-    // would show Suflyor twice in the Omarchy bar.
-    #[cfg(feature = "remote-ui")]
-    {
-        TRAY_AVAILABLE.store(true, Ordering::Relaxed);
-        overlay.set_tray_available(true);
-    }
-    #[cfg(all(target_os = "linux", not(feature = "remote-ui")))]
-    let _native_status = match slint_replay::native::status::install(cfg.read().ui_is_ru()) {
-        Ok(guard) => {
-            TRAY_AVAILABLE.store(true, Ordering::Relaxed);
-            overlay.set_tray_available(true);
-            Some(guard)
-        }
-        Err(error) => {
-            diag!("{error}");
-            None
-        }
-    };
-
-    #[cfg(target_os = "linux")]
-    let _command_timer = {
-        let weak = overlay.as_weak();
-        #[cfg(feature = "remote-ui")]
-        let (stealth_state, stealth_registry) = (state.clone(), registry.clone());
-        let timer = Timer::default();
-        timer.start(TimerMode::Repeated, Duration::from_millis(30), move || {
-            if let Some(bar) = weak.upgrade() {
-                for action in hotkeys::take_actions() {
-                    match action.as_str() {
-                        #[cfg(feature = "remote-ui")]
-                        "config-reloaded" => {
-                            let on = global_stealth();
-                            apply_bar_stealth(&bar, &stealth_state, on);
-                            stealth_registry.apply_stealth(on);
-                        }
-                        "ptt-mic-down" => bar.invoke_ptt_mic_pressed(),
-                        "ptt-mic-up" => bar.invoke_ptt_mic_released(),
-                        "ptt-sys-down" => bar.invoke_ptt_sys_pressed(),
-                        "ptt-sys-up" => bar.invoke_ptt_sys_released(),
-                        "show" => restore_bar_from_tray(&weak),
-                        "hide" => bar.invoke_hide_to_tray_clicked(),
-                        "tray-online" | "tray-offline" => {
-                            let available = action == "tray-online";
-                            TRAY_AVAILABLE.store(available, Ordering::Relaxed);
-                            bar.set_tray_available(available);
-                            if !available && BAR_TRAY_HIDDEN.load(Ordering::Relaxed) {
-                                restore_bar_from_tray(&weak);
-                            }
-                        }
-                        "settings" => bar.invoke_open_settings_clicked(),
-                        "mic" => bar.invoke_mic_toggle_clicked(),
-                        "system" => bar.invoke_sys_toggle_clicked(),
-                        "session" => bar.invoke_timer_toggle_clicked(),
-                        "pause" => bar.invoke_pause_toggle_clicked(),
-                        "quit" => {
-                            let _ = slint::quit_event_loop();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-        timer
-    };
-
     // `ComponentHandle::run()` exits as soon as the last Slint window is
     // hidden. Hidden-to-tray deliberately has no visible Slint window, so keep
     // the UI thread pumping our native tray message window until an explicit
@@ -5326,12 +4942,6 @@ fn main() -> Result<(), slint::PlatformError> {
         drop(installed_status_item);
     }
     TRAY_AVAILABLE.store(false, Ordering::Relaxed);
-    #[cfg(target_os = "linux")]
-    {
-        #[cfg(not(feature = "remote-ui"))]
-        drop(_native_status);
-        slint_replay::native::desktop::close();
-    }
     // All event-loop exits share the normal session stop path.
     let _ = slint_session::stop_session(slint_rt.clone(), &cfg);
     // MLX owns exactly one child and stdin pipe process-wide. Clear its

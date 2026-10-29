@@ -54,7 +54,8 @@ fn persist_text_ask_pos(win: &TextAskWindow, cfg: &overlay_backend::config::Shar
 }
 
 /// V0.8.3 — "Написать": open (or re-focus) the small text-input window. On
-/// submit it routes the typed text through `fire_f9_ask(.., Some(text))`, so the
+/// submit it routes the typed text through `fire_f9_ask(.., Some(text))` using
+/// the currently selected Normal/Smart mode, so the
 /// whole tile-create + stream + cost + journal + follow-up pipeline is reused →
 /// the answer lands in a standard tile. Stealth (WDA) + on-screen placement come
 /// from `present_window_stealth_aware_at` (restoring the last dragged position,
@@ -114,7 +115,7 @@ pub(in super::super) fn open_text_ask(
                     &rth,
                     &tiles_c,
                     &wov,
-                    AskRoute::Text,
+                    active_ask_route(),
                     Some(q),
                 );
             }

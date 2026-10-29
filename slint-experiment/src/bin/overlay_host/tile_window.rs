@@ -33,15 +33,16 @@
 //! explicitly below.
 use super::{
     apply_scheme_tile, drag_begin, drag_update, enum_monitors, get_window_rect, global_scheme,
-    global_stealth, global_tile_monitor, global_tile_opacity, grab_hwnd, make_transparent_tile,
-    move_window_pos_only, pick_monitor, set_always_on_top, set_platform_window_position,
-    set_skip_taskbar, set_stealth, work_area_for_window, ComponentHandle, TileWindow,
-    TILE_DEFAULT_H, TILE_DEFAULT_W,
+    global_stealth, global_tile_anchor, global_tile_monitor, global_tile_opacity, global_tile_zone, grab_hwnd,
+    make_transparent_tile, move_window_pos_only, pick_monitor, set_always_on_top,
+    set_platform_window_position, set_skip_taskbar, set_stealth, work_area_for_window,
+    ComponentHandle, Duration, TileWindow, Timer, HWND_GRAB_DELAY_MS, TILE_ANCHOR_BOTTOM_LEFT,
+    TILE_ANCHOR_BOTTOM_RIGHT, TILE_ANCHOR_TOP_LEFT, TILE_DEFAULT_H, TILE_DEFAULT_W,
 };
 
 /// Atomic counter for tile-slot index — increments per spawn so
-/// successive tiles distribute across a 2-column grid on the right
-/// half of the chosen monitor.
+/// successive tiles distribute across a 2-column grid that grows inward
+/// from the user-selected corner of the chosen monitor.
 pub(crate) static TILE_SLOT_COUNTER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -74,10 +75,12 @@ thread_local! {
     /// + close path runs on the Slint main thread), so a plain thread_local +
     /// RefCell is race-free.
     ///
-    /// An empty entry owns prompt preparation before its task is registered.
-    /// Removing it on close also prevents a late callback from starting work.
+    /// SCOPE: only the non-streaming "+ tile" path registers here (its discarded
+    /// JoinHandle was the worst leak — the user's spam repro). Streaming tiles
+    /// (F9 / auto / PTT / followup) instead stop via the receiver-drop check in
+    /// `ai::stream_inner`; hard-aborting those on close is a separate follow-up.
     static TILE_STREAMS: std::cell::RefCell<
-        std::collections::HashMap<i32, Option<tokio::task::AbortHandle>>,
+        std::collections::HashMap<i32, tokio::task::AbortHandle>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -89,13 +92,8 @@ pub(crate) fn register_tile_stream(tile_id: i32, handle: tokio::task::AbortHandl
         return;
     }
     TILE_STREAMS.with(|m| {
-        let mut streams = m.borrow_mut();
-        if let Some(slot) = streams.get_mut(&tile_id) {
-            if let Some(old) = slot.replace(handle) {
-                old.abort();
-            }
-        } else {
-            handle.abort();
+        if let Some(old) = m.borrow_mut().insert(tile_id, handle) {
+            old.abort();
         }
     });
 }
@@ -107,7 +105,7 @@ pub(crate) fn abort_tile_stream(tile_id: i32) {
         return;
     }
     TILE_STREAMS.with(|m| {
-        if let Some(Some(h)) = m.borrow_mut().remove(&tile_id) {
+        if let Some(h) = m.borrow_mut().remove(&tile_id) {
             h.abort();
         }
     });
@@ -119,20 +117,8 @@ pub(crate) fn abort_tile_stream(tile_id: i32) {
 pub(crate) fn abort_all_tile_streams() {
     TILE_STREAMS.with(|m| {
         for (_, h) in m.borrow_mut().drain() {
-            if let Some(h) = h {
-                h.abort();
-            }
+            h.abort();
         }
-    });
-}
-
-pub(crate) fn tile_request_open(tile_id: i32) -> bool {
-    TILE_STREAMS.with(|m| m.borrow().contains_key(&tile_id))
-}
-
-pub(crate) fn open_tile_request(tile_id: i32) {
-    TILE_STREAMS.with(|m| {
-        m.borrow_mut().entry(tile_id).or_insert(None);
     });
 }
 
@@ -145,16 +131,13 @@ pub(crate) fn open_tile_request(tile_id: i32) {
 fn cascade_cycle(
     raw_seq: usize,
     total_slots: usize,
-    x_base: i32,
-    y_base: i32,
-    mon_left: i32,
-    mon_bottom: i32,
-    real_h: i32,
+    x_room: i32,
+    y_room: i32,
     cascade_dx: i32,
     cascade_dy: i32,
 ) -> usize {
-    let max_cycle_x = ((x_base - (mon_left + 8)).max(0) / cascade_dx) as usize;
-    let max_cycle_y = ((mon_bottom - real_h - 8 - y_base).max(0) / cascade_dy) as usize;
+    let max_cycle_x = (x_room.max(0) / cascade_dx.max(1)) as usize;
+    let max_cycle_y = (y_room.max(0) / cascade_dy.max(1)) as usize;
     (raw_seq / total_slots.max(1)).min(max_cycle_x.min(max_cycle_y))
 }
 
@@ -183,7 +166,7 @@ pub(crate) fn toggle_tile_maximize(hwnd: slint_replay::win32::HWND, tile: &TileW
     // rects use physical pixels; AppKit/CoreGraphics geometry uses points.
     #[cfg(windows)]
     let scale = tile.window().scale_factor();
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     let scale = 1.0_f32;
     let pw = (w * scale) as i32;
     let ph = (h * scale) as i32;
@@ -224,15 +207,35 @@ pub(crate) fn toggle_tile_maximize(hwnd: slint_replay::win32::HWND, tile: &TileW
 /// which consumed the mouse-up before Slint saw it, leaving the
 /// TouchArea stuck "pressed" → tile became undraggable/unclickable.
 /// User: "вызванный тайл завис, двигается но ничего не прожимается".
+/// Keep moving the native HWND while the left button is held. Slint's
+/// TouchArea.moved can stop firing after its owning window is repositioned,
+/// even though the user has not released the button. Polling is non-modal:
+/// mouse-up, buttons, selection and regular Slint input continue to work.
+#[cfg(target_os = "windows")]
+fn poll_tile_drag_while_pressed(tile: slint::Weak<TileWindow>) {
+    Timer::single_shot(Duration::from_millis(16), move || {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+        if unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) } >= 0 {
+            slint_replay::win32::drag_end();
+            return;
+        }
+        if let Some(t) = tile.upgrade() {
+            if let Ok(hwnd) = grab_hwnd(t.window()) {
+                drag_update(hwnd);
+                poll_tile_drag_while_pressed(tile);
+                return;
+            }
+        }
+        slint_replay::win32::drag_end();
+    });
+}
+
 pub(crate) fn wire_tile_drag(tile: &TileWindow) {
-    if tile.get_tile_id() < 0 {
-        tile.set_tile_id(next_tile_id());
-    }
-    open_tile_request(tile.get_tile_id());
     // Seed this tile's Theme global from the process-global scheme. Called on
     // every tile-creation path, so newly-spawned tiles inherit the live choice
     // without threading the value through 5 call sites.
     apply_scheme_tile(tile, global_scheme());
+    super::apply_global_tile_text_preferences(tile);
     let weak = tile.as_weak();
     tile.on_drag_start_requested(move || {
         if let Some(t) = weak.upgrade() {
@@ -240,6 +243,8 @@ pub(crate) fn wire_tile_drag(tile: &TileWindow) {
             let _ = slint_replay::native::window::begin_drag(t.window());
             if let Ok(hwnd) = grab_hwnd(t.window()) {
                 drag_begin(hwnd);
+                #[cfg(target_os = "windows")]
+                poll_tile_drag_while_pressed(t.as_weak());
             }
         }
     });
@@ -251,6 +256,9 @@ pub(crate) fn wire_tile_drag(tile: &TileWindow) {
             }
         }
     });
+    // Make the header copy button work for all tile types, not only AI chats.
+    // The conversation-specific handler overrides this after wire_tile_drag.
+    super::tile_copy::wire_visible_copy(tile);
     // C (ТЗ 2026-07-02) — every tile that can render code gets the per-code-block
     // copy button wired here: this is the single hook every tile-creation path
     // (F9 / PTT / vision / content) calls, so no site can miss it.
@@ -279,6 +287,11 @@ pub(crate) fn present_tile_window(tile: &TileWindow) {
     // G1 — layout-independent Ctrl+C/V/X/A/Z/Y for the tile's editable fields (capture
     // editor + follow-up LineEdit) and copy/select-all on the read-only answer text.
     crate::kbd_shortcuts::install(tile.window());
+    if global_tile_opacity() <= f32::EPSILON {
+        // Hidden preset: keep the tile in the registry/conversation state but do
+        // not create an invisible native window that would intercept clicks.
+        return;
+    }
     if global_stealth() {
         set_platform_window_position(tile.window(), -32000, -32000);
     }
@@ -300,14 +313,15 @@ pub(crate) fn apply_tile_hwnd_with_monitor(tile: &TileWindow) {
     // report). Set synchronously on the passed handle so it takes
     // effect on the first painted frame.
     tile.set_body_opacity(global_tile_opacity());
+    // Apply saved compact layout BEFORE realizing the new window so it never
+    // briefly displays the toolbar and reply field when the global mode is on.
+    tile.set_reading_mode(super::global_tile_reading_mode());
 
-    let attempt = std::rc::Rc::new(move |t: &TileWindow| {
-        // A close/drop before delayed native setup must stay hidden.
-        if !t.window().is_visible() {
-            return true;
-        }
+    let weak = tile.as_weak();
+    Timer::single_shot(Duration::from_millis(HWND_GRAB_DELAY_MS), move || {
+        let Some(t) = weak.upgrade() else { return };
         let Ok(hwnd) = grab_hwnd(t.window()) else {
-            return false;
+            return;
         };
 
         // Phase E6 fix v4 — use make_transparent_tile (no WS_EX_
@@ -327,20 +341,16 @@ pub(crate) fn apply_tile_hwnd_with_monitor(tile: &TileWindow) {
         // / browser windows and the user can interact with them.
         // Without this, clicks land on whatever non-topmost window
         // is at the pixel under the tile.
-        // Linux applies the pin and capture exclusion together with the move
-        // in `place_tile`, in one compositor request.
-        if !cfg!(target_os = "linux") {
-            let _ = set_always_on_top(hwnd, true);
+        let _ = set_always_on_top(hwnd, true);
 
-            // #111 — inherit stealth: a tile spawned while stealth is on must
-            // also be excluded from screen capture (the toggle only covered tiles
-            // that already existed). No-op when stealth is off. I1: a failed
-            // exclusion is logged, never silently swallowed — the tile stays
-            // capturable and the user must be able to diagnose it.
-            if global_stealth() {
-                if let Err(e) = set_stealth(hwnd, global_stealth()) {
-                    diag!("[overlay-host] tile stealth apply failed (tile stays capturable): {e}");
-                }
+        // #111 — inherit stealth: a tile spawned while stealth is on must
+        // also be excluded from screen capture (the toggle only covered tiles
+        // that already existed). No-op when stealth is off. I1: a failed
+        // exclusion is logged, never silently swallowed — the tile stays
+        // capturable and the user must be able to diagnose it.
+        if global_stealth() {
+            if let Err(e) = set_stealth(hwnd, true) {
+                diag!("[overlay-host] tile stealth apply failed (tile stays capturable): {e}");
             }
         }
 
@@ -359,25 +369,63 @@ pub(crate) fn apply_tile_hwnd_with_monitor(tile: &TileWindow) {
         // pinned display is unplugged (not found) — never an off-screen tile.
         let pinned = global_tile_monitor()
             .and_then(|(l, t)| monitors.iter().find(|m| m.left == l && m.top == t).copied());
-        if let Some(mon) = pinned.or_else(|| pick_monitor(&monitors)) {
+        if let Some(monitor) = pinned.or_else(|| pick_monitor(&monitors)) {
+            // Map a normalized rectangle into PHYSICAL desktop coordinates.
+            // The second display can have negative left/top; use its own origin.
+            let selected_region = global_tile_zone().and_then(|[x, y, w, h]| {
+                let mw = i64::from(monitor.width());
+                let mh = i64::from(monitor.height());
+                let left = i64::from(monitor.left) + mw * i64::from(x) / 1000;
+                let top = i64::from(monitor.top) + mh * i64::from(y) / 1000;
+                let right = i64::from(monitor.left) + mw * i64::from(x as u32 + w as u32) / 1000;
+                let bottom = i64::from(monitor.top) + mh * i64::from(y as u32 + h as u32) / 1000;
+                let width = right - left;
+                let height = bottom - top;
+                if width >= i64::from(real_w) + 16 && height >= i64::from(real_h) + 16 {
+                    Some(slint_replay::win32::MonitorRect {
+                        left: left as i32,
+                        top: top as i32,
+                        right: right as i32,
+                        bottom: bottom as i32,
+                        is_primary: monitor.is_primary,
+                    })
+                } else {
+                    eprintln!("[overlay-host] tile zone too small for realized tile; using full monitor");
+                    None
+                }
+            });
+            let zone_enabled = selected_region.is_some();
+            let mon = selected_region.unwrap_or(monitor);
             let gap_x: i32 = 12;
             let gap_y: i32 = 12;
-            let top_margin: i32 = 80;
-            let right_margin: i32 = 20;
+            let side_margin: i32 = if zone_enabled { 8 } else { 20 };
+            let top_margin: i32 = if zone_enabled { 8 } else { 80 };
+            let bottom_margin: i32 = if zone_enabled { 8 } else { 20 };
+            let anchor = global_tile_anchor();
+            let anchored_left = matches!(anchor, TILE_ANCHOR_TOP_LEFT | TILE_ANCHOR_BOTTOM_LEFT);
+            let anchored_bottom = matches!(
+                anchor,
+                TILE_ANCHOR_BOTTOM_RIGHT | TILE_ANCHOR_BOTTOM_LEFT
+            );
 
-            let usable_h = mon.height().saturating_sub(top_margin + 20);
+            let vertical_start_margin = if anchored_bottom { bottom_margin } else { top_margin };
+            let vertical_end_margin = if anchored_bottom { top_margin } else { bottom_margin };
+            let usable_h = mon
+                .height()
+                .saturating_sub(vertical_start_margin + vertical_end_margin);
             let rows = ((usable_h + gap_y) / (real_h + gap_y)).max(1) as usize;
-            let cols: usize = 2;
+            // A narrow custom zone gets one column, not an off-region second
+            // column. Preserve the original two-column layout otherwise.
+            let cols: usize = if zone_enabled {
+                ((mon.width() - 2 * side_margin + gap_x) / (real_w + gap_x)).clamp(1, 2) as usize
+            } else {
+                2
+            };
             let total_slots = (rows * cols).max(1);
 
-            // Phase E6 v9 — cascade-offset on wrap. Previously
-            // `slot = COUNTER % total_slots` made the 5th+ tile land
-            // ON TOP of the 1st tile, etc. User complaint: "потом
-            // они начали друг на друга прыгать". Now: track which
-            // cycle (wraparound generation) we're on, and offset
-            // every wrapped tile by (cascade_dx, cascade_dy) per
-            // cycle — visually a stagger like macOS cascade-windows.
-            // Hard clamps still prevent off-screen.
+            // Cascade wrapped generations inward from the chosen corner so a
+            // long session does not place exact duplicates on top of the first
+            // grid. The room calculation is directional and clamped below.
             let raw_seq = TILE_SLOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let slot = raw_seq % total_slots;
             let cascade_dx: i32 = 32;
@@ -385,34 +433,52 @@ pub(crate) fn apply_tile_hwnd_with_monitor(tile: &TileWindow) {
             let row = slot / cols;
             let col = slot % cols;
 
-            let x_outer = mon.left + mon.width() - real_w - right_margin;
-            let x_inner = x_outer - real_w - gap_x;
-            let x_base = if col == 0 { x_inner } else { x_outer };
-            let y_base = mon.top + top_margin + (row as i32) * (real_h + gap_y);
+            let x_edge = if anchored_left {
+                mon.left + side_margin
+            } else {
+                mon.right - real_w - side_margin
+            };
+            let x_inner = if anchored_left {
+                x_edge + real_w + gap_x
+            } else {
+                x_edge - real_w - gap_x
+            };
+            // The first tile starts at the selected screen edge; the second
+            // occupies the adjacent inner column.
+            let x_base = if col == 0 { x_edge } else { x_inner };
+            let y_base = if anchored_bottom {
+                mon.bottom - bottom_margin - real_h - (row as i32) * (real_h + gap_y)
+            } else {
+                mon.top + top_margin + (row as i32) * (real_h + gap_y)
+            };
 
-            // Cascade offset grows leftward + downward so wrapped tiles peek out
-            // from under their first-cycle siblings (negative dx because the
-            // right cluster is already at the right edge). The cascade GENERATION
-            // is clamped to the room that actually fits the work-area, so a long
-            // session or a spam burst (raw_seq keeps climbing even while
-            // MAX_LIVE_TILES caps the OPEN count) can never march a tile off the
-            // left/bottom edge — it pins at the last in-band step. Cross-burst
-            // marching is separately fixed by resetting TILE_SLOT_COUNTER when the
-            // last tile closes (see refresh_open_tiles).
+            let x_min = mon.left + 8;
+            let x_max = (mon.right - real_w - 8).max(x_min);
+            let y_min = mon.top + 8;
+            let y_max = (mon.bottom - real_h - 8).max(y_min);
+            let x_dir: i32 = if anchored_left { 1 } else { -1 };
+            let y_dir: i32 = if anchored_bottom { -1 } else { 1 };
+            let x_room = if x_dir < 0 {
+                x_base - x_min
+            } else {
+                x_max - x_base
+            };
+            let y_room = if y_dir < 0 {
+                y_base - y_min
+            } else {
+                y_max - y_base
+            };
             let cycle = cascade_cycle(
                 raw_seq,
                 total_slots,
-                x_base,
-                y_base,
-                mon.left,
-                mon.bottom,
-                real_h,
+                x_room,
+                y_room,
                 cascade_dx,
                 cascade_dy,
             );
 
-            let x = x_base - (cycle as i32) * cascade_dx;
-            let y = y_base + (cycle as i32) * cascade_dy;
+            let x = x_base + x_dir * (cycle as i32) * cascade_dx;
+            let y = y_base + y_dir * (cycle as i32) * cascade_dy;
 
             // Hard clamp so a tile can never land off-screen even if
             // monitor enum returned weird coordinates (portrait
@@ -421,56 +487,28 @@ pub(crate) fn apply_tile_hwnd_with_monitor(tile: &TileWindow) {
             // 1200px portrait secondary, or under heavy DPI) can't make
             // max < min and panic `i32::clamp` — it just pins to the top-left
             // margin instead of crashing.
-            let x_min = mon.left + 8;
-            let x_max = (mon.right - real_w - 8).max(x_min);
-            let y_min = mon.top + 8;
-            let y_max = (mon.bottom - real_h - 8).max(y_min);
             let x_clamped = x.clamp(x_min, x_max);
             let y_clamped = y.clamp(y_min, y_max);
 
             eprintln!(
-                "[overlay-host] tile placement: monitor=({},{},{},{}) real_size=({},{}) slot={} cycle={} row={} col={} pos=({},{})",
-                mon.left, mon.top, mon.right, mon.bottom,
+                "[overlay-host] tile placement: anchor={} monitor=({},{},{},{}) real_size=({},{}) slot={} cycle={} row={} col={} pos=({},{})",
+                anchor, mon.left, mon.top, mon.right, mon.bottom,
                 real_w, real_h, slot, cycle, row, col, x_clamped, y_clamped,
             );
             // Move-only — preserve Slint's natural size so HiDPI
             // rendering stays correct (text fills the dark fill area
             // instead of overflowing).
-            place_tile(t, hwnd, x_clamped, y_clamped);
+            let _ = move_window_pos_only(hwnd, x_clamped, y_clamped);
+            set_platform_window_position(t.window(), x_clamped, y_clamped);
         } else {
             // No monitor from pick_monitor (degenerate — no primary display).
             // A stealth-parked tile would otherwise stay off the virtual desktop
             // (permanently invisible), so bring it back to a safe on-screen spot.
-            place_tile(t, hwnd, 100, 100);
+            let _ = move_window_pos_only(hwnd, 100, 100);
+            set_platform_window_position(t.window(), 100, 100);
             eprintln!("[overlay-host] tile placement: no monitor from pick_monitor — fallback to (100, 100)");
         }
-        true
     });
-    let fallback = std::rc::Rc::new(|t: &TileWindow| {
-        if t.window().is_visible() {
-            diag!("[overlay-host] tile native setup failed after realization retries");
-        }
-    });
-    super::realize_with_retries(tile, attempt, fallback);
-}
-
-/// Put a realized tile at (x, y). On Linux the move, pin and capture exclusion
-/// go in one compositor request: each separate `hyprctl` round trip kept a new
-/// tile centred for seconds on a busy compositor. I1 still holds there — a
-/// failed exclusion is logged, never silently swallowed.
-fn place_tile(t: &TileWindow, hwnd: slint_replay::win32::HWND, x: i32, y: i32) {
-    #[cfg(target_os = "linux")]
-    {
-        let stealth = global_stealth();
-        if let Err(e) = slint_replay::native::window::arrange(hwnd.0, x, y, stealth) {
-            diag!("[overlay-host] tile placement failed: {e}");
-        } else if slint_replay::native::window::exclusion(hwnd.0).ok() != Some(stealth) {
-            diag!("[overlay-host] tile stealth apply failed (tile stays capturable): readback mismatch");
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = move_window_pos_only(hwnd, x, y);
-    set_platform_window_position(t.window(), x, y);
 }
 
 // Tests live at the END of the module (clippy::items_after_test_module, denied
@@ -478,37 +516,7 @@ fn place_tile(t: &TileWindow, hwnd: slint_replay::win32::HWND, x: i32, y: i32) {
 // by production items.
 #[cfg(test)]
 mod cascade_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    use super::*;
-
-    #[tokio::test]
-    async fn closed_tiles_abort_active_queued_and_late_registered_tasks_independently() {
-        let first = next_tile_id();
-        let second = next_tile_id();
-        open_tile_request(first);
-        open_tile_request(second);
-        let pending = || tokio::spawn(std::future::pending::<()>());
-        let a = pending();
-        let b = pending();
-        register_tile_stream(first, a.abort_handle());
-        register_tile_stream(second, b.abort_handle());
-        abort_tile_stream(first);
-        assert!(a.await.unwrap_err().is_cancelled());
-        assert!(
-            !b.is_finished(),
-            "closing one tile must preserve another question"
-        );
-        assert!(!tile_request_open(first));
-        let late = pending();
-        register_tile_stream(first, late.abort_handle());
-        assert!(
-            late.await.unwrap_err().is_cancelled(),
-            "closed prompt callback cannot restart work"
-        );
-        abort_all_tile_streams();
-        assert!(b.await.unwrap_err().is_cancelled());
-        assert!(!tile_request_open(second));
-    }
+    use super::cascade_cycle;
 
     #[test]
     fn cascade_clamp_pins_in_band() {
@@ -518,12 +526,12 @@ mod cascade_tests {
         // max_cycle_y 25; tighter axis = 25.
         // A runaway raw_seq must PIN at 25, not march off-screen.
         assert_eq!(
-            cascade_cycle(100_000, 10, 1400, 100, 0, 1080, 360, dx, dy),
+            cascade_cycle(100_000, 10, 1392, 612, dx, dy),
             25
         );
         // raw_seq below total_slots -> first batch, cycle 0.
-        assert_eq!(cascade_cycle(5, 10, 1400, 100, 0, 1080, 360, dx, dy), 0);
+        assert_eq!(cascade_cycle(5, 10, 1392, 612, dx, dy), 0);
         // Mid-range raw_seq stays at its natural (in-band) cycle.
-        assert_eq!(cascade_cycle(25, 10, 1400, 100, 0, 1080, 360, dx, dy), 2);
+        assert_eq!(cascade_cycle(25, 10, 1392, 612, dx, dy), 2);
     }
 }

@@ -15,23 +15,20 @@
 // (open_wizard / wire_wizard_steps / refill_wizard_summary) is untouched.
 // Per-step checks reuse the existing Diagnostics backend fns; an error warns
 // (level 4) but never blocks Next.
-import { Button, Switch, Palette } from "std-widgets.slint";
+import { Button, Switch } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Metrics } from "metrics.slint";
-import { BrandHeaderMark, CloseButton, DragGrip, WindowHeader } from "controls.slint";
+import { BrandHeaderMark, CloseButton, DragGrip } from "controls.slint";
 
 // One row in the left progress rail. state: 0 future · 1 current · 2 done.
 component RailStep inherits Rectangle {
     in property <string> num;
     in property <string> label;
     in property <int> state;
-    in property <int> level: 0;
-    property <bool> passed: root.state == 2 && root.level == 0;
-    property <bool> needs-attention: root.state == 2 && root.level == 4;
     height: 30px;
     border-radius: 4px;
     background: root.state == 1 ? Theme.accent-subtle : transparent;
-    animate background { duration: Metrics.motion-fast; }
+    animate background { duration: 120ms; }
     // active left-accent bar (same idiom as the Settings NavItem)
     if root.state == 1: Rectangle {
         x: 0;
@@ -43,9 +40,9 @@ component RailStep inherits Rectangle {
     }
     HorizontalLayout {
         padding-left: 10px;
-        padding-right: Metrics.space-sm;
+        padding-right: 8px;
         spacing: 9px;
-        // Checked steps show their result; skipped steps keep a neutral number.
+        // numbered badge → turns into a ✓ once the step is behind us
         Rectangle {
             width: 18px;
             height: 18px;
@@ -53,11 +50,11 @@ component RailStep inherits Rectangle {
             y: (parent.height - self.height) / 2;
             border-radius: 9px;
             border-width: 1px;
-            border-color: root.needs-attention ? Theme.warning : (root.state == 1 || root.passed ? Theme.accent : Theme.border-strong);
-            background: root.passed ? Theme.accent-subtle : transparent;
+            border-color: root.state == 0 ? Theme.border-strong : Theme.accent;
+            background: root.state == 2 ? Theme.accent-subtle : transparent;
             // SVG check (skia-safe) for DONE steps — a Unicode "✓" rendered as a
             // tofu square in the bundled font (the documented glyph-tofu pitfall).
-            if root.passed: Image {
+            if root.state == 2: Image {
                 source: @image-url("../assets/icons/check.svg");
                 colorize: Theme.accent;
                 width: 11px;
@@ -65,18 +62,18 @@ component RailStep inherits Rectangle {
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
             }
-            if !root.passed: Text {
-                text: root.needs-attention ? "!" : root.num;
-                font-size: Metrics.font-caption;
+            if root.state != 2: Text {
+                text: root.num;
+                font-size: 10px;
                 font-weight: 700;
-                color: root.needs-attention ? Theme.warning : (root.state == 1 ? Theme.accent : Theme.text-muted);
+                color: root.state == 0 ? Theme.text-muted : Theme.accent;
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
             }
         }
         Text {
             text: root.label;
-            font-size: Metrics.font-body;
+            font-size: 12px;
             color: root.state == 1 ? Theme.accent : (root.state == 2 ? Theme.text-secondary : Theme.text-muted);
             vertical-alignment: center;
             overflow: elide;
@@ -92,11 +89,11 @@ component ModeOption inherits Rectangle {
     in property <string> desc;
     in property <bool> selected;
     callback chosen();
-    border-radius: Metrics.radius-field;
+    border-radius: 8px;
     border-width: 1px;
     border-color: root.selected ? Theme.accent : Theme.border;
     background: root.selected ? Theme.accent-subtle : Theme.bg-surface;
-    animate border-color, background { duration: Metrics.motion-fast; }
+    animate border-color, background { duration: 120ms; }
     VerticalLayout {
         padding: 10px;
         spacing: 3px;
@@ -108,7 +105,7 @@ component ModeOption inherits Rectangle {
         }
         Text {
             text: root.desc;
-            font-size: Metrics.font-label;
+            font-size: 11px;
             color: Theme.text-secondary;
             wrap: word-wrap;
         }
@@ -120,10 +117,6 @@ component ModeOption inherits Rectangle {
 }
 
 export component WizardWindow inherits Window {
-    // std-widgets follow the active colour scheme instead of the light default.
-    property <bool> widgets-light: Theme.is-light;
-    init => { Palette.color-scheme = root.widgets-light ? ColorScheme.light : ColorScheme.dark; }
-    changed widgets-light => { Palette.color-scheme = root.widgets-light ? ColorScheme.light : ColorScheme.dark; }
     no-frame: true;
     always-on-top: true;
     title: @tr("Setup wizard");
@@ -197,20 +190,20 @@ export component WizardWindow inherits Window {
                     background: Theme.border;
                 }
                 VerticalLayout {
-                    padding: Metrics.space-lg;
+                    padding: 16px;
                     spacing: 3px;
                     Text {
                         text: @tr("Setup");
-                        font-size: Metrics.font-caption;
+                        font-size: 10px;
                         font-weight: 700;
                         color: Theme.text-muted;
                     }
                     RailStep { num: "1"; label: @tr("Mode"); state: root.step == 0 ? 1 : (root.step > 0 ? 2 : 0); }
-                    RailStep { num: "2"; label: @tr("AI"); state: root.step == 1 ? 1 : (root.step > 1 ? 2 : 0); level: root.ai-level; }
-                    RailStep { num: "3"; label: @tr("STT"); state: root.step == 2 ? 1 : (root.step > 2 ? 2 : 0); level: root.stt-level; }
-                    RailStep { num: "4"; label: @tr("Microphone"); state: root.step == 3 ? 1 : (root.step > 3 ? 2 : 0); level: root.mic-level; }
-                    RailStep { num: "5"; label: @tr("System audio"); state: root.step == 4 ? 1 : (root.step > 4 ? 2 : 0); level: root.sys-level; }
-                    RailStep { num: "6"; label: @tr("Stealth"); state: root.step == 5 ? 1 : (root.step > 5 ? 2 : 0); }
+                    RailStep { num: "2"; label: @tr("AI"); state: root.step == 1 ? 1 : (root.step > 1 ? 2 : 0); }
+                    RailStep { num: "3"; label: @tr("STT"); state: root.step == 2 ? 1 : (root.step > 2 ? 2 : 0); }
+                    RailStep { num: "4"; label: @tr("Microphone"); state: root.step == 3 ? 1 : (root.step > 3 ? 2 : 0); }
+                    RailStep { num: "5"; label: @tr("System audio"); state: root.step == 4 ? 1 : (root.step > 4 ? 2 : 0); }
+                    RailStep { num: "6"; label: @tr("Overlay"); state: root.step == 5 ? 1 : (root.step > 5 ? 2 : 0); }
                     RailStep { num: "7"; label: @tr("Done"); state: root.step == 6 ? 1 : 0; }
                     Rectangle { vertical-stretch: 1; }
                 }
@@ -219,54 +212,85 @@ export component WizardWindow inherits Window {
             // ===================== Step content =====================
             VerticalLayout {
                 horizontal-stretch: 1;
-                padding: Metrics.space-md;
-                spacing: Metrics.space-md;
+                padding: 20px;
+                spacing: 14px;
 
-                // Header: the shared WindowHeader; the step counter is its note.
-                WindowHeader {
-                    title: @tr("Setup wizard");
-                    note: @tr("Step {} of 7", root.step + 1);
-                    drag-start => { root.drag-start-requested(); }
-                    drag-move => { root.drag-moved(); }
-                    close => { root.cancelled(); }
+                // Header: brand · grip · step counter + corner close. Doubles
+                // as the drag handle (frameless — no native title bar); the
+                // TouchArea sits BEHIND the row so the CloseButton on top still
+                // captures its own clicks (same idiom as Settings).
+                Rectangle {
+                    height: 26px;
+                    TouchArea {
+                        mouse-cursor: grab;
+                        pointer-event(ev) => {
+                            if (ev.button == PointerEventButton.left
+                                && ev.kind == PointerEventKind.down) {
+                                root.drag-start-requested();
+                            }
+                        }
+                        moved => { if (self.pressed) { root.drag-moved(); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 7px;
+                        Rectangle {
+                            width: 22px;
+                            height: 26px;
+                            BrandHeaderMark { y: 2px; mark-size: 22px; }
+                        }
+                        DragGrip { }
+                        Text {
+                            text: @tr("Step {} of 7", root.step + 1);
+                            color: Theme.text-secondary;
+                            font-size: Metrics.font-body;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        CloseButton {
+                            box: 26px;
+                            glyph: 14px;
+                            clicked => { root.cancelled(); }
+                        }
+                    }
                 }
 
                 // Step card (exactly one panel visible)
                 Rectangle {
                     vertical-stretch: 1;
                     background: Theme.bg-elevated;
-                    border-radius: Metrics.radius-control;
+                    border-radius: 10px;
                     border-width: 1px;
                     border-color: Theme.border;
                     clip: true;
                     VerticalLayout {
-                        padding: Metrics.space-lg;
+                        padding: 16px;
                         spacing: 10px;
 
                         // Step 1 — mode
                         if root.step == 0: VerticalLayout {
-                            spacing: Metrics.space-sm;
+                            spacing: 8px;
                             Text {
-                                text: @tr("Choose how Suflyor works");
+                                text: @tr("Choose how suflyor runs");
                                 font-size: Metrics.font-heading;
                                 font-weight: 700;
                                 color: Theme.text-primary;
                             }
                             ModeOption {
                                 title: @tr("Cloud");
-                                desc: @tr("Speech recognition and AI in the cloud: a quick start, needs keys and internet.");
+                                desc: @tr("Groq STT + Claude bridge — fast start, needs keys + internet.");
                                 selected: root.mode == 0;
                                 chosen => { root.mode = 0; root.mode-selected(0); }
                             }
                             ModeOption {
                                 title: @tr("Fully local");
-                                desc: @tr("AI and speech on this PC, offline; download models first.");
+                                desc: @tr("Local AI + local STT — nothing leaves the machine, needs models.");
                                 selected: root.mode == 1;
                                 chosen => { root.mode = 1; root.mode-selected(1); }
                             }
                             ModeOption {
                                 title: @tr("Mixed");
-                                desc: @tr("For example, speech on this PC and AI in the cloud; set up in Settings.");
+                                desc: @tr("e.g. local STT + cloud AI — configure manually.");
                                 selected: root.mode == 2;
                                 chosen => { root.mode = 2; root.mode-selected(2); }
                             }
@@ -277,15 +301,16 @@ export component WizardWindow inherits Window {
                             spacing: 10px;
                             Text { text: @tr("AI"); font-size: Metrics.font-heading; font-weight: 700; color: Theme.text-primary; }
                             Text {
-                                text: @tr("The AI is chosen in Settings → AI providers. Here we only check that it answers.");
+                                text: @tr("Configure the AI provider in Settings; here we just confirm it answers.");
                                 color: Theme.text-secondary;
                                 font-size: Metrics.font-body;
                                 wrap: word-wrap;
                             }
                             HorizontalLayout {
                                 spacing: Metrics.space-sm;
-                                Button { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; text: @tr("Test AI"); clicked => { root.ai-test-clicked(); } }
-                                Button { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; text: @tr("Install the built-in AI"); clicked => { root.install-local-clicked(); } }
+                                alignment: start;
+                                Button { text: @tr("Test AI"); clicked => { root.ai-test-clicked(); } }
+                                Button { text: @tr("Install / complete local AI"); clicked => { root.install-local-clicked(); } }
                             }
                             HorizontalLayout {
                                 spacing: 6px;
@@ -299,13 +324,14 @@ export component WizardWindow inherits Window {
                             spacing: 10px;
                             Text { text: @tr("Speech recognition (STT)"); font-size: Metrics.font-heading; font-weight: 700; color: Theme.text-primary; }
                             Text {
-                                text: @tr("Speech recognition is set up in Settings → STT. Here we only check the connection.");
+                                text: @tr("Configure STT in Settings; here we confirm it connects.");
                                 color: Theme.text-secondary;
                                 font-size: Metrics.font-body;
                                 wrap: word-wrap;
                             }
                             HorizontalLayout {
-                                Button { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; text: @tr("Test STT"); clicked => { root.stt-test-clicked(); } }
+                                alignment: start;
+                                Button { text: @tr("Test STT"); clicked => { root.stt-test-clicked(); } }
                             }
                             HorizontalLayout {
                                 spacing: 6px;
@@ -325,7 +351,8 @@ export component WizardWindow inherits Window {
                                 wrap: word-wrap;
                             }
                             HorizontalLayout {
-                                Button { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; text: @tr("Record test"); clicked => { root.mic-test-clicked(); } }
+                                alignment: start;
+                                Button { text: @tr("Record test"); clicked => { root.mic-test-clicked(); } }
                             }
                             HorizontalLayout {
                                 spacing: 6px;
@@ -339,13 +366,14 @@ export component WizardWindow inherits Window {
                             spacing: 10px;
                             Text { text: @tr("System audio"); font-size: Metrics.font-heading; font-weight: 700; color: Theme.text-primary; }
                             Text {
-                                text: @tr("Needed to hear the other side. Plays a short sound and checks that it is recorded.");
+                                text: @tr("Needed to hear the other side. Plays a short test tone and checks loopback.");
                                 color: Theme.text-secondary;
                                 font-size: Metrics.font-body;
                                 wrap: word-wrap;
                             }
                             HorizontalLayout {
-                                Button { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; text: @tr("Check system audio"); clicked => { root.sys-test-clicked(); } }
+                                alignment: start;
+                                Button { text: @tr("Check system audio"); clicked => { root.sys-test-clicked(); } }
                             }
                             HorizontalLayout {
                                 spacing: 6px;
@@ -357,14 +385,14 @@ export component WizardWindow inherits Window {
                         // Step 6 — overlay + stealth
                         if root.step == 5: VerticalLayout {
                             spacing: 10px;
-                            Text { text: @tr("Stealth"); font-size: Metrics.font-heading; font-weight: 700; color: Theme.text-primary; }
+                            Text { text: @tr("Overlay & stealth"); font-size: Metrics.font-heading; font-weight: 700; color: Theme.text-primary; }
                             HorizontalLayout {
                                 spacing: Metrics.space-sm;
-                                Text { text: @tr("Hide Suflyor windows from screen capture"); color: Theme.text-primary; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+                                Text { text: @tr("Hide overlay from screen capture"); color: Theme.text-primary; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
                                 Switch { horizontal-stretch: 0; checked <=> root.stealth-on; toggled => { root.stealth-toggled(self.checked); } }
                             }
                             Text {
-                                text: @tr("When it is on: press Print Screen or open a screen-share preview. Suflyor windows should disappear from the capture and stay on your screen. This cannot be checked automatically.");
+                                text: @tr("Press Print Screen or open a screen-share preview — the overlay should vanish from the capture but stay on your screen. We can't verify stealth automatically.");
                                 color: Theme.text-secondary;
                                 font-size: Metrics.font-body;
                                 wrap: word-wrap;
@@ -373,48 +401,36 @@ export component WizardWindow inherits Window {
 
                         // Step 7 — summary
                         if root.step == 6: VerticalLayout {
-                            spacing: Metrics.space-md;
-                            // "Done" only when nothing needs attention.
-                            Text {
-                                text: root.ai-level == 4 || root.stt-level == 4 || root.mic-level == 4 || root.sys-level == 4
-                                    ? @tr("Almost done: check the marked items")
-                                    : @tr("Done");
-                                font-size: Metrics.font-heading;
-                                font-weight: 700;
-                                color: Theme.text-primary;
-                                wrap: word-wrap;
-                            }
-                            // Aligned label, status and detail columns.
-                            // The status wraps: "Требует внимания" is wider than its 110px column.
+                            spacing: Metrics.space-sm;
+                            Text { text: @tr("Done"); font-size: Metrics.font-heading; font-weight: 700; color: Theme.text-primary; }
+                            // 2-column rows so labels translate (RU) AND stay aligned.
                             // AI/STT are universal acronyms (left literal); Microphone /
                             // System audio reuse the existing step-title msgids.
                             HorizontalLayout {
                                 spacing: Metrics.space-sm;
-                                Text { text: "AI"; width: 130px; color: Theme.text-secondary; }
-                                Text { text: root.level-text(root.ai-level); width: 110px; color: root.level-color(root.ai-level); font-weight: 700; wrap: word-wrap; }
-                                Text { text: root.summary-ai; horizontal-stretch: 1; color: Theme.text-secondary; wrap: word-wrap; }
+                                Text { text: "AI"; width: 130px; color: Theme.text-secondary; font-family: Theme.font-mono; }
+                                Text { text: root.summary-ai; horizontal-stretch: 1; color: Theme.text-secondary; font-family: Theme.font-mono; wrap: word-wrap; }
                             }
                             HorizontalLayout {
                                 spacing: Metrics.space-sm;
-                                Text { text: "STT"; width: 130px; color: Theme.text-secondary; }
-                                Text { text: root.level-text(root.stt-level); width: 110px; color: root.level-color(root.stt-level); font-weight: 700; wrap: word-wrap; }
-                                Text { text: root.summary-stt; horizontal-stretch: 1; color: Theme.text-secondary; wrap: word-wrap; }
+                                Text { text: "STT"; width: 130px; color: Theme.text-secondary; font-family: Theme.font-mono; }
+                                Text { text: root.summary-stt; horizontal-stretch: 1; color: Theme.text-secondary; font-family: Theme.font-mono; wrap: word-wrap; }
                             }
                             HorizontalLayout {
                                 spacing: Metrics.space-sm;
-                                Text { text: @tr("Microphone"); width: 130px; color: Theme.text-secondary; }
-                                Text { text: root.level-text(root.mic-level); width: 110px; color: root.level-color(root.mic-level); font-weight: 700; wrap: word-wrap; }
-                                Text { text: root.summary-mic; horizontal-stretch: 1; color: Theme.text-secondary; wrap: word-wrap; }
+                                Text { text: @tr("Microphone"); width: 130px; color: Theme.text-secondary; font-family: Theme.font-mono; }
+                                Text { text: root.summary-mic; horizontal-stretch: 1; color: Theme.text-secondary; font-family: Theme.font-mono; wrap: word-wrap; }
                             }
                             HorizontalLayout {
                                 spacing: Metrics.space-sm;
-                                Text { text: @tr("System audio"); width: 130px; color: Theme.text-secondary; }
-                                Text { text: root.level-text(root.sys-level); width: 110px; color: root.level-color(root.sys-level); font-weight: 700; wrap: word-wrap; }
-                                Text { text: root.summary-sys; horizontal-stretch: 1; color: Theme.text-secondary; wrap: word-wrap; }
+                                Text { text: @tr("System audio"); width: 130px; color: Theme.text-secondary; font-family: Theme.font-mono; }
+                                Text { text: root.summary-sys; horizontal-stretch: 1; color: Theme.text-secondary; font-family: Theme.font-mono; wrap: word-wrap; }
                             }
                             HorizontalLayout {
                                 spacing: Metrics.space-sm;
-                                Button { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; text: @tr("Open diagnostics"); clicked => { root.open-diagnostics(); } }
+                                alignment: start;
+                                Button { text: @tr("Start working"); primary: true; clicked => { root.finished(); } }
+                                Button { text: @tr("Open diagnostics"); clicked => { root.open-diagnostics(); } }
                             }
                         }
 
@@ -423,14 +439,13 @@ export component WizardWindow inherits Window {
                     }
                 }
 
-                // Footer actions stay enabled; an error never blocks navigation.
+                // Nav row (Back / Skip / Next) — always enabled; an error never blocks
                 HorizontalLayout {
                     spacing: Metrics.space-sm;
                     Button { text: @tr("Back"); enabled: root.step > 0; clicked => { root.nav-back(); } }
                     Rectangle { horizontal-stretch: 1; }
                     Button { text: @tr("Skip"); visible: root.step < 6; clicked => { root.nav-skip(); } }
-                    if root.step < 6: Button { text: @tr("Next"); primary: true; clicked => { root.nav-next(); } }
-                    if root.step == 6: Button { text: @tr("Start working"); primary: true; clicked => { root.finished(); } }
+                    Button { text: @tr("Next"); primary: true; visible: root.step < 6; clicked => { root.nav-next(); } }
                 }
             }
         }
