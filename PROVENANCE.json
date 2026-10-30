@@ -1,0 +1,136 @@
+{
+  "date": "2026-10-30",
+  "variant": "last recovered custom Suflyor before master2 (unverified reconstructed source)",
+  "excluded": [
+    "master2",
+    "master+master2 merge"
+  ],
+  "primary_base": {
+    "name": "suflyor-recovered-source-v8.zip",
+    "sha256": "8848370be1816ef3d8544b05d27b64011e66381c77080515e97a46310d29ee35",
+    "source_files": 293
+  },
+  "source_archive": "Suflyor_UI_v8_2_recovery.zip",
+  "applied_in_order": [
+    "Suflyor_Proxy_Fallback_v9.zip",
+    "Suflyor_Recording_MiddleClick_v10.zip",
+    "suflyor-debrief-retry-v1.zip",
+    "suflyor-ai-mode-visibility-v1.zip",
+    "suflyor-ptt-feedback-race-fix-v1.zip",
+    "Suflyor_Diagnostics_v11_8_Targeted_UI_Repair(2).zip"
+  ],
+  "patch_archive_sha256": {
+    "Suflyor_Proxy_Fallback_v9.zip": "b08871cde605de2d9a0e49f213717473ef95408d9af86e7dc3f3ee4cacfa2933",
+    "Suflyor_Recording_MiddleClick_v10.zip": "1d4e9dbcc2daf0f7886c51661bf2fdc3e5e0cf3ef690915f0a22176538e892f3",
+    "suflyor-debrief-retry-v1.zip": "98fe548958e274e284b0435e28e98c1716ecb22e85556eeb8e78e9f79f3aaea9",
+    "suflyor-ai-mode-visibility-v1.zip": "2015351a73094b69f51ee76424dbf81fd2318162bf3dc0ff201157ee5164eed1",
+    "suflyor-ptt-feedback-race-fix-v1.zip": "79d4f37947b5e683d2750573d668cdb84a50385e07c9a59b0f13eb5521115df4"
+  },
+  "diagnostic_patch_sha256": "6d41fbc4f3e05636f8028140a9e3d0291550e12285bbbec0deb9082f5feee0ef",
+  "changed_files_since_v8": [
+    {
+      "file": "overlay-backend/Cargo.toml",
+      "status": "modified",
+      "sha256": "05e4acbbcb109aafe0930881912ae4d9d9469bab70777d5dbef0b4e7f51f6d7e"
+    },
+    {
+      "file": "slint-experiment/ui/overlay_bar.slint",
+      "status": "modified",
+      "sha256": "b06f8166094ac88f00e58ebca2d720ab08a3d2bcd42e654d6a8846c807964487"
+    },
+    {
+      "file": "slint-experiment/ui/settings_panel.slint",
+      "status": "modified",
+      "sha256": "7215e7f1da9e2c6fef5d80b96c33cc01f622dceb585f060401e3d96333b5642b"
+    },
+    {
+      "file": "slint-experiment/src/bin/overlay_host_windows.rs",
+      "status": "modified",
+      "sha256": "9ff003460b4eaae7d5e8fe9a778cd650764db654d21f0c72f7df0ae5ba11127c"
+    },
+    {
+      "file": "slint-experiment/src/bin/overlay_host/settings_controller.rs",
+      "status": "modified",
+      "sha256": "24596e054b28f6845c157f7e7a19e150660e1c72f392cd5a4f7391c457e084e4"
+    },
+    {
+      "file": "slint-experiment/src/bin/overlay_host/bar_tray.rs",
+      "status": "modified",
+      "sha256": "46860f9507b074e65453b7a3285428ab3225e746bfcae4d6fdd1db58b5457996"
+    },
+    {
+      "file": "slint-experiment/src/bin/overlay_host/tile_window.rs",
+      "status": "modified",
+      "sha256": "9504d8ada9be5c88fb202e044ed575d9d398d941ed885e106a2b038727026ec9"
+    },
+    {
+      "file": "slint-experiment/src/bin/overlay_host/diagnostics.rs",
+      "status": "modified",
+      "sha256": "214765749420db7948ac519ea5fed14cc187b0e8eafa1cbb7ace01d9fd7e2c91"
+    },
+    {
+      "file": "overlay-backend/src/codex_direct.rs",
+      "status": "modified",
+      "sha256": "3237336c3782e161d95ddda876efcd70a55ded9597a80ced8bb14f93c3d33a11"
+    },
+    {
+      "file": "overlay-backend/src/network.rs",
+      "status": "added",
+      "sha256": "011b37d666eadabd108f84c8c18bc949211565b64ecabfb33c6e33cd75e71d5d"
+    },
+    {
+      "file": "overlay-backend/src/runtime.rs",
+      "status": "modified",
+      "sha256": "60ed953173cf41e2d621ccf1fc7f14c8ff129cbbb9bcb7ac18f3f133d3348e63"
+    },
+    {
+      "file": "overlay-backend/src/events.rs",
+      "status": "modified",
+      "sha256": "c7f3acb2f3ee977feaa448e496fa6fed0312b14903b7c5f92a87aa4add3ac153"
+    },
+    {
+      "file": "overlay-backend/src/stt.rs",
+      "status": "modified",
+      "sha256": "c5cd4a02745d46f4e069ea4499de9ed16cad0c74f7466de191148ae10df22031"
+    },
+    {
+      "file": "overlay-backend/src/lib.rs",
+      "status": "modified",
+      "sha256": "995923239f45c4c121895831263eb92da8bc5b894935e84d69f9b18df00e1c70"
+    },
+    {
+      "file": "overlay-backend/src/conspect.rs",
+      "status": "modified",
+      "sha256": "029eab343fc7668c32bdb6022624046b4d1f36b138a3d2982c9d9e45d527f9f9"
+    },
+    {
+      "file": "overlay-backend/src/config.rs",
+      "status": "modified",
+      "sha256": "7b5092b80d9c47af645705eea501847ab39413cfeaf064df9a9f9a3f4a72bde5"
+    },
+    {
+      "file": "overlay-backend/src/ai/completion.rs",
+      "status": "modified",
+      "sha256": "1bf394327c1767ce9c6b6f72499da0c48c5f6d7df9b19d6de7235e3e8aa87274"
+    },
+    {
+      "file": "overlay-backend/src/ai/stream.rs",
+      "status": "modified",
+      "sha256": "f56407abd645ecac78946ce8560e4651601c1cbf75e163c35990d483d285843b"
+    },
+    {
+      "file": "overlay-backend/src/ai/inspect.rs",
+      "status": "modified",
+      "sha256": "0c1ffec93fc6aaf41039d8e2237e4740308b3829a645d2ce4820aae7075d824f"
+    }
+  ],
+  "removed_files": [],
+  "source_file_count": 294,
+  "checks": {
+    "all_git_patches_applied": true,
+    "v11.8_original_4_files_match_base": true,
+    "cargo_toml_parseable": true,
+    "windows_cargo_build": "NOT_RUN",
+    "known_previous_v11_8_build_failure": "0xc0000005"
+  }
+}

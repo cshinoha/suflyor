@@ -13,56 +13,6 @@
 //! never loses data.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-
-// Kept separate from portable settings: a model disk belongs to this machine.
-static MODEL_STORAGE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-/// The optional model disk, fixed for the process lifetime. Changes take effect
-/// after restart so a running download or engine never switches roots midway.
-#[must_use]
-pub fn model_storage_root() -> Option<PathBuf> {
-    MODEL_STORAGE_ROOT
-        .get_or_init(configured_model_storage_root)
-        .clone()
-}
-
-/// The saved choice, including a change awaiting restart.
-#[must_use]
-pub fn configured_model_storage_root() -> Option<PathBuf> {
-    let text = std::fs::read_to_string(data_root()?.join("models-dir")).ok()?;
-    let path = PathBuf::from(text.trim());
-    path.is_absolute().then_some(path)
-}
-
-/// Select an existing directory without moving, deleting or downloading models.
-/// An empty value restores the legacy locations after restart.
-pub fn save_model_storage_root(value: &str) -> std::io::Result<()> {
-    let value = value.trim();
-    let path = Path::new(value);
-    if !value.is_empty() && (!path.is_absolute() || !path.is_dir()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "choose an existing absolute model directory",
-        ));
-    }
-    let data = data_root().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "configuration directory unavailable",
-        )
-    })?;
-    std::fs::create_dir_all(&data)?;
-    replace_private(&data.join("models-dir"), value.as_bytes())
-}
-
-/// Speech assets follow the chosen disk; old installations keep their paths.
-#[must_use]
-pub fn speech_model_dir(name: &str) -> Option<PathBuf> {
-    model_storage_root()
-        .or_else(data_root)
-        .map(|root| root.join(name))
-}
 
 /// Legacy Tauri product name — the old `%APPDATA%\overlay-mvp\` data dir.
 const LEGACY_DIR: &str = "overlay-mvp";
@@ -88,78 +38,6 @@ fn data_root_in(base: &Path) -> PathBuf {
     } else {
         brand
     }
-}
-
-/// Write `bytes` to `path` so that only the owner can read the file on Unix (mode 0600),
-/// whether it is new or already exists with a wider mode. An existing file is emptied only
-/// after its mode was restricted, so a failure to restrict it leaves its content intact.
-/// Elsewhere this is `std::fs::write`.
-pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(false).mode(0o600);
-        let mut file = options.open(path)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.set_len(0)?;
-        file.write_all(bytes)?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(path, bytes)?;
-    Ok(())
-}
-
-/// Atomically replace a small machine-local file, including an existing Windows target.
-pub fn replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file parent unavailable")
-    })?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(bytes)?;
-    file.persist(path).map_err(|error| error.error)?;
-    Ok(())
-}
-
-/// Restrict an existing file to its owner on Unix (mode 0600). Does nothing elsewhere.
-pub fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
-/// Open `path` for appending; a file created here is owner-only on Unix (mode 0600).
-pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
-/// Create `dir` and, on Unix, restrict it to its owner (mode 0700). A filesystem that cannot
-/// change the mode is logged and tolerated: losing the journal would be worse.
-pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-            log::warn!("could not restrict {} to its owner: {e}", dir.display());
-        }
-    }
-    Ok(())
 }
 
 /// Outcome of [`migrate_data_root`], for one-line logging at startup.
@@ -218,38 +96,6 @@ fn migrate_in(base: &Path) -> DataMigration {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn write_private_replaces_a_longer_wide_file_with_an_owner_only_one() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("export.json");
-        std::fs::write(&path, "a much longer previous content").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        write_private(&path, b"new").unwrap();
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn open_private_append_and_restrict_to_owner_enforces_mode_0600() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("overlay-host.log");
-
-        let _file = open_private_append(&path).unwrap();
-        restrict_to_owner(&path).unwrap();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
 
     #[test]
     fn data_root_in_prefers_brand_then_legacy_then_brand() {

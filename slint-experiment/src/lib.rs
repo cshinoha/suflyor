@@ -14,8 +14,6 @@ pub mod logging;
 pub mod markdown;
 pub mod math_display;
 pub mod native;
-#[cfg(all(unix, feature = "remote-ui"))]
-pub mod remote_ui;
 pub mod runtime_state;
 pub mod session_namer;
 pub mod slint_events;

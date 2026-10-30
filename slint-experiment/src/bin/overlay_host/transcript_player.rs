@@ -435,10 +435,7 @@ pub(crate) fn ensure(session_id: &str) -> bool {
                     false
                 }
             },
-            Err(error) => {
-                log::warn!("transcript recording could not load: {error}");
-                false
-            }
+            Err(_) => false, // no recordings for this session
         }
     })
 }

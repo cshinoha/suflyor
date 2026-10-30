@@ -19,11 +19,12 @@
 
 use super::{tile_copy, transcript_player};
 use super::{
-    apply_scheme_palette, apply_scheme_text_ask, apply_tile_hwnd_with_monitor, clamp_scheme,
+    active_ask_route, apply_scheme_palette, apply_scheme_text_ask, apply_tile_hwnd_with_monitor,
+    clamp_scheme,
     drag_begin, drag_update, fire_f9_ask, focus_window, global_scheme, grab_hwnd, kb, markdown,
     present_tile_window, present_window_stealth_aware, present_window_stealth_aware_at,
     refresh_open_tiles, toggle_tile_maximize, ui, wire_tile_drag, Arc, ArchiveRow, ArchiveWindow,
-    AskRoute, ComponentHandle, HelpWindow, MarkdownBlock, ModelRc, OverlayBarBridge,
+    ComponentHandle, HelpWindow, MarkdownBlock, ModelRc, OverlayBarBridge,
     OverlayBarWindow, PaletteResult, PaletteWindow, Rc, RefCell, RuntimeEvents, SharedSlintRuntime,
     SharedString, SpeakerRow, TextAskWindow, TileWindow, TileWindows, TranscriptLine,
     TranscriptWindow, VecModel, TILE_DISPLAY_SEQ,

@@ -10,11 +10,6 @@ use super::{
 /// LAN host or another local port is not ours to restart or relabel.
 #[must_use]
 pub fn is_managed_llama_endpoint(base_url: &str) -> bool {
-    is_loopback_v1_on_port(base_url, LLAMA_PORT)
-}
-
-/// `http://127.0.0.1|localhost|[::1]:<port>/v1` and nothing else.
-pub(super) fn is_loopback_v1_on_port(base_url: &str, expected_port: &str) -> bool {
     let Some(without_scheme) = base_url.trim().strip_prefix("http://") else {
         return false;
     };
@@ -30,7 +25,7 @@ pub(super) fn is_loopback_v1_on_port(base_url: &str, expected_port: &str) -> boo
         authority.rsplit_once(':')
     };
     host_port.is_some_and(|(host, port)| {
-        port == expected_port
+        port == LLAMA_PORT
             && matches!(
                 host.to_ascii_lowercase().as_str(),
                 "127.0.0.1" | "localhost" | "::1"

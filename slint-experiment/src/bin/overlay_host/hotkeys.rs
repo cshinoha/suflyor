@@ -3,8 +3,8 @@
 //! `docs/overlay-host-modularization-plan.md` §5.3).
 //!
 //! This module owns the one-time global-hotkey REGISTRATION ([`register_hotkeys`])
-//! — it builds the process-wide `GlobalHotKeyManager`, registers every F-key
-//! (F3 / F4 / F6 / F7 / F8 / Shift+F8 / F9 / Shift+F9 / F1), logs each
+//! — it builds the process-wide `GlobalHotKeyManager`, registers the user's
+//! configured bindings (defaults mirror F1/F3/F4/F6/Shift+F6/F7/F8/F9), logs each
 //! "Fx hotkey registered", and records the per-key outcome into [`HOTKEY_DIAG`]
 //! so the Settings ▸ Diagnostics tab can surface a CONFLICTING key by name
 //! instead of a blanket "hotkeys disabled" (audit P1.2). The captured outcome is
@@ -27,11 +27,12 @@
 //! (`use hotkeys::*;` in the parent lifts `hotkey_diag_row` to crate root for
 //! `diagnostics.rs`).
 
-/// Registration outcome for Diagnostics, refreshed after compositor reloads.
-/// The Diagnostics tab can surface a per-key conflict, not just an eprintln.
+/// P1.2 — outcome of registering the global hotkeys at startup, captured ONCE so
+/// the Diagnostics tab can surface a per-key conflict (not just an eprintln!).
+/// Set in the registration loop; read by [`hotkey_diag_row`].
 #[allow(dead_code)]
 pub(crate) struct HotkeyDiag {
-    /// Space-separated keys that registered, e.g. "F1 F3 F4 F6 F8 F9 Shift+F9".
+    /// Space-separated keys that registered, e.g. "F1 F3 F4 F6 F8 F9 Shift+F9" (Shift+F9 toggles AI mode).
     registered: String,
     /// Comma-separated keys whose `register()` failed (conflict / already taken).
     /// Empty when every key registered.
@@ -40,7 +41,7 @@ pub(crate) struct HotkeyDiag {
     manager_missing: bool,
 }
 
-static HOTKEY_DIAG: std::sync::RwLock<Option<HotkeyDiag>> = std::sync::RwLock::new(None);
+static HOTKEY_DIAG: std::sync::OnceLock<HotkeyDiag> = std::sync::OnceLock::new();
 
 /// Render the captured hotkey-registration outcome (P1.2) into a (level, detail,
 /// failed) triple for the Diagnostics tab. level 0=all registered, 4=a key
@@ -48,8 +49,7 @@ static HOTKEY_DIAG: std::sync::RwLock<Option<HotkeyDiag>> = std::sync::RwLock::n
 /// raw key list so the .slint composes the translated "conflict:" wording.
 #[allow(dead_code)]
 pub(crate) fn hotkey_diag_row() -> (i32, String, String) {
-    let diag = HOTKEY_DIAG.read().unwrap_or_else(|p| p.into_inner());
-    match diag.as_ref() {
+    match HOTKEY_DIAG.get() {
         None => (3, String::new(), String::new()),
         // Manager failed to init → level 4 (error) but EMPTY failed list, so the
         // UI/report render "unavailable", not a misleading "conflict: all".
@@ -73,6 +73,7 @@ pub(crate) struct RegisteredHotkeys {
     pub f3_id: u32,
     pub f4_id: u32,
     pub f6_id: u32,
+    pub close_all_id: u32,
     pub f7_id: u32,
     pub f8_id: u32,
     pub sf8_id: u32,
@@ -86,98 +87,6 @@ pub(crate) struct RegisteredHotkeys {
     pub sa3_id: u32,
 }
 
-#[cfg(target_os = "linux")]
-const WAYLAND_BINDINGS: &[(&str, &str)] = &[
-    ("F1", "f1"),
-    ("F3", "f3"),
-    ("F4", "f4"),
-    ("F6", "f6"),
-    ("F7", "f7"),
-    ("F8", "f8"),
-    ("SHIFT + F8", "sf8"),
-    ("CTRL + F8", "cf8"),
-    ("F9", "f9"),
-    ("SHIFT + F9", "sf9"),
-    ("SHIFT + ALT + 1", "sa1"),
-    ("SHIFT + ALT + 2", "sa2"),
-    ("SHIFT + ALT + 3", "sa3"),
-    ("SUPER + F9", "ptt-mic-down"),
-    ("SUPER + F9@release", "ptt-mic-up"),
-    ("SUPER + SHIFT + F9", "ptt-sys-down"),
-    ("SUPER + SHIFT + F9@release", "ptt-sys-up"),
-    ("SUPER + F10", "show"),
-];
-
-#[cfg(target_os = "linux")]
-fn wayland_hotkey_diag() -> HotkeyDiag {
-    let installed =
-        slint_replay::native::desktop::install_bindings(WAYLAND_BINDINGS).unwrap_or_default();
-    let mut registered = Vec::new();
-    let mut failed = Vec::new();
-    for &(spec, action) in WAYLAND_BINDINGS {
-        // Diagnostics counts space-separated keys, so "SHIFT + F8" must stay one word.
-        let label = spec.replace(" + ", "+");
-        if installed.iter().any(|key| key == action) {
-            registered.push(label);
-        } else {
-            failed.push(label);
-        }
-    }
-    HotkeyDiag {
-        registered: registered.join(" "),
-        failed: failed.join(", "),
-        manager_missing: false,
-    }
-}
-
-#[cfg(target_os = "linux")]
-thread_local! { static ACTIONS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; }
-#[cfg(target_os = "linux")]
-pub(crate) fn take_actions() -> Vec<String> {
-    ACTIONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
-}
-
-pub(crate) fn next_event() -> Option<global_hotkey::GlobalHotKeyEvent> {
-    #[cfg(target_os = "linux")]
-    for _ in 0..64 {
-        let Some(command) = slint_replay::native::desktop::receive() else {
-            break;
-        };
-        use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-        let (key, mods) = match command.as_str() {
-            "config-reloaded" => {
-                *HOTKEY_DIAG.write().unwrap_or_else(|p| p.into_inner()) =
-                    Some(wayland_hotkey_diag());
-                #[cfg(feature = "remote-ui")]
-                ACTIONS.with(|slot| slot.borrow_mut().push(command));
-                continue;
-            }
-            "f1" => (Code::F1, None),
-            "f3" => (Code::F3, None),
-            "f4" => (Code::F4, None),
-            "f6" => (Code::F6, None),
-            "f7" => (Code::F7, None),
-            "f8" => (Code::F8, None),
-            "sf8" => (Code::F8, Some(Modifiers::SHIFT)),
-            "cf8" => (Code::F8, Some(Modifiers::CONTROL)),
-            "f9" => (Code::F9, None),
-            "sf9" => (Code::F9, Some(Modifiers::SHIFT)),
-            "sa1" => (Code::Digit1, Some(Modifiers::SHIFT | Modifiers::ALT)),
-            "sa2" => (Code::Digit2, Some(Modifiers::SHIFT | Modifiers::ALT)),
-            "sa3" => (Code::Digit3, Some(Modifiers::SHIFT | Modifiers::ALT)),
-            _ => {
-                ACTIONS.with(|slot| slot.borrow_mut().push(command));
-                continue;
-            }
-        };
-        return Some(global_hotkey::GlobalHotKeyEvent {
-            id: HotKey::new(mods, key).id(),
-            state: global_hotkey::HotKeyState::Pressed,
-        });
-    }
-    global_hotkey::GlobalHotKeyEvent::receiver().try_recv().ok()
-}
-
 /// ===== Global hotkeys (Phase D2 + B3 extra) =====
 ///
 /// global-hotkey 0.6 owns a single process-wide event receiver +
@@ -185,18 +94,71 @@ pub(crate) fn next_event() -> Option<global_hotkey::GlobalHotKeyEvent> {
 /// then poll the receiver every 50 ms from a Slint Timer — fires
 /// on UI thread so we can touch Rc-borrowed state without Send.
 ///
-/// Registered keys (see Settings ▸ Hotkeys):
-///   F3 — re-ask the last question     F4 — KB palette (toggle)
-///   F6 — manual tile from transcript  F7 — session archive (toggle)
-///   F8 — screenshot → vision          F9 — ask the AI now
+/// Default bindings are shown in Settings ▸ Hotkeys and can be edited there.
+/// Registration happens once at startup, so saved changes take effect on restart.
 ///
 /// Returns the manager (kept alive by the caller) + each key's id for the
 /// dispatch loop. Registration order, the per-key log lines, and the
 /// `HOTKEY_DIAG` write are identical to the former inline block in `main`.
-pub(crate) fn register_hotkeys() -> RegisteredHotkeys {
-    #[cfg(target_os = "linux")]
-    let hotkey_manager: Option<global_hotkey::GlobalHotKeyManager> = None;
-    #[cfg(not(target_os = "linux"))]
+fn configured_hotkey(
+    configured: &str,
+    fallback: &str,
+    action: &str,
+) -> global_hotkey::hotkey::HotKey {
+    match configured.trim().parse::<global_hotkey::hotkey::HotKey>() {
+        Ok(hotkey) => hotkey,
+        Err(error) => {
+            eprintln!(
+                "[overlay-host] invalid hotkey for {action}: {configured:?} ({error}); using {fallback}"
+            );
+            match fallback.parse::<global_hotkey::hotkey::HotKey>() {
+                Ok(hotkey) => hotkey,
+                Err(_) => global_hotkey::hotkey::HotKey::new(
+                    None,
+                    global_hotkey::hotkey::Code::F24,
+                ),
+            }
+        }
+    }
+}
+
+/// Validate all user-editable bindings before persisting them. Besides syntax,
+/// duplicate physical hotkeys are rejected because the OS can register only one
+/// action for a given combination.
+pub(crate) fn hotkey_bindings_valid(
+    bindings: &overlay_backend::config::HotkeyBindings,
+) -> bool {
+    let values = [
+        bindings.help.as_str(),
+        bindings.reask.as_str(),
+        bindings.knowledge.as_str(),
+        bindings.new_tile.as_str(),
+        bindings.close_all_tiles.as_str(),
+        bindings.archive.as_str(),
+        bindings.vision.as_str(),
+        bindings.vision_translate.as_str(),
+        bindings.vision_ocr.as_str(),
+        bindings.ask.as_str(),
+        bindings.ask_deep.as_str(),
+        bindings.read_selected.as_str(),
+        bindings.read_ocr.as_str(),
+        bindings.read_pause.as_str(),
+    ];
+    let mut ids = std::collections::HashSet::new();
+    for value in values {
+        let Ok(hotkey) = value.trim().parse::<global_hotkey::hotkey::HotKey>() else {
+            return false;
+        };
+        if !ids.insert(hotkey.id()) {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn register_hotkeys(
+    bindings: &overlay_backend::config::HotkeyBindings,
+) -> RegisteredHotkeys {
     let hotkey_manager = match global_hotkey::GlobalHotKeyManager::new() {
         Ok(m) => Some(m),
         Err(e) => {
@@ -204,59 +166,37 @@ pub(crate) fn register_hotkeys() -> RegisteredHotkeys {
             None
         }
     };
-    let f3_hotkey = global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F3);
-    let f4_hotkey = global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F4);
-    // Phase E3 slice 3 — F6 manual spawn from last transcript line
-    // (bypasses auto-detector). Matches src-tauri hotkey table.
-    let f6_hotkey = global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F6);
-    // Phase E3 slice 2 — F9 ask (live AI streaming via overlay-backend's
-    // ask_stream_loop). Matches src-tauri/React-side semantic where F9
-    // is the "ask AI with full transcript context" hotkey.
-    let f9_hotkey = global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F9);
-    // V0.8.0 (Поток D) — Shift+F9 = one-shot escalate the ask to the smart cloud
-    // model (deeper reasoning) without flipping the persistent provider.
-    let sf9_hotkey = global_hotkey::hotkey::HotKey::new(
-        Some(global_hotkey::hotkey::Modifiers::SHIFT),
-        global_hotkey::hotkey::Code::F9,
+    let defaults = overlay_backend::config::HotkeyBindings::default();
+    let f3_hotkey = configured_hotkey(&bindings.reask, &defaults.reask, "reask");
+    let f4_hotkey = configured_hotkey(&bindings.knowledge, &defaults.knowledge, "knowledge");
+    let f6_hotkey = configured_hotkey(&bindings.new_tile, &defaults.new_tile, "new_tile");
+    let close_all_hotkey = configured_hotkey(
+        &bindings.close_all_tiles,
+        &defaults.close_all_tiles,
+        "close_all_tiles",
     );
-    // V2 — F8 screenshot → vision (captures the monitor under the cursor and
-    // streams a vision model's reading into a tile, via the SEPARATE vision
-    // endpoint so text can stay local).
-    let f8_hotkey = global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F8);
-    // Feature #3 — Shift+F8 = the SAME region capture but in TRANSLATE mode
-    // (output only the translation, no screen description). For games/subtitles.
-    let sf8_hotkey = global_hotkey::hotkey::HotKey::new(
-        Some(global_hotkey::hotkey::Modifiers::SHIFT),
-        global_hotkey::hotkey::Code::F8,
+    let f7_hotkey = configured_hotkey(&bindings.archive, &defaults.archive, "archive");
+    let f8_hotkey = configured_hotkey(&bindings.vision, &defaults.vision, "vision");
+    let sf8_hotkey = configured_hotkey(
+        &bindings.vision_translate,
+        &defaults.vision_translate,
+        "vision_translate",
     );
-    // Read-aloud feature — Ctrl+F8 = the SAME region capture but in OCR mode:
-    // transcribe the selected text verbatim (later: read it aloud via TTS).
-    let cf8_hotkey = global_hotkey::hotkey::HotKey::new(
-        Some(global_hotkey::hotkey::Modifiers::CONTROL),
-        global_hotkey::hotkey::Code::F8,
+    let cf8_hotkey = configured_hotkey(&bindings.vision_ocr, &defaults.vision_ocr, "vision_ocr");
+    let f9_hotkey = configured_hotkey(&bindings.ask, &defaults.ask, "ask");
+    let sf9_hotkey = configured_hotkey(&bindings.ask_deep, &defaults.ask_deep, "ask_deep");
+    let sa1_hotkey = configured_hotkey(
+        &bindings.read_selected,
+        &defaults.read_selected,
+        "read_selected",
     );
-    // Read-aloud one-handed shortcuts: Shift+Alt+1 = read SELECTED text (clipboard),
-    // Shift+Alt+2 = OCR a region + read, Shift+Alt+3 = pause/stop. Digit codes;
-    // bare Shift+Alt is the OS layout-switch chord (no digit) so it doesn't clash.
-    let sa1_hotkey = global_hotkey::hotkey::HotKey::new(
-        Some(global_hotkey::hotkey::Modifiers::SHIFT | global_hotkey::hotkey::Modifiers::ALT),
-        global_hotkey::hotkey::Code::Digit1,
-    );
-    let sa2_hotkey = global_hotkey::hotkey::HotKey::new(
-        Some(global_hotkey::hotkey::Modifiers::SHIFT | global_hotkey::hotkey::Modifiers::ALT),
-        global_hotkey::hotkey::Code::Digit2,
-    );
-    let sa3_hotkey = global_hotkey::hotkey::HotKey::new(
-        Some(global_hotkey::hotkey::Modifiers::SHIFT | global_hotkey::hotkey::Modifiers::ALT),
-        global_hotkey::hotkey::Code::Digit3,
-    );
-    // V0.8.4 — F1 opens the 🆘 help (toggle, like F4).
-    let f1_hotkey = global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F1);
-    // Phase 3a — F7 opens the 🗄 session archive (toggle, like F4/F1).
-    let f7_hotkey = global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F7);
+    let sa2_hotkey = configured_hotkey(&bindings.read_ocr, &defaults.read_ocr, "read_ocr");
+    let sa3_hotkey = configured_hotkey(&bindings.read_pause, &defaults.read_pause, "read_pause");
+    let f1_hotkey = configured_hotkey(&bindings.help, &defaults.help, "help");
     let f3_id = f3_hotkey.id();
     let f4_id = f4_hotkey.id();
     let f6_id = f6_hotkey.id();
+    let close_all_id = close_all_hotkey.id();
     let f7_id = f7_hotkey.id();
     let f9_id = f9_hotkey.id();
     let sf9_id = sf9_hotkey.id();
@@ -274,19 +214,20 @@ pub(crate) fn register_hotkeys() -> RegisteredHotkeys {
         let mut failed: Vec<&str> = Vec::new();
         if let Some(m) = hotkey_manager.as_ref() {
             for (label, hk) in [
-                ("F3", f3_hotkey),
-                ("F4", f4_hotkey),
-                ("F6", f6_hotkey),
-                ("F7", f7_hotkey),
-                ("F8", f8_hotkey),
-                ("Shift+F8", sf8_hotkey),
-                ("Ctrl+F8", cf8_hotkey),
-                ("F9", f9_hotkey),
-                ("Shift+F9", sf9_hotkey),
-                ("F1", f1_hotkey),
-                ("Shift+Alt+1", sa1_hotkey),
-                ("Shift+Alt+2", sa2_hotkey),
-                ("Shift+Alt+3", sa3_hotkey),
+                (bindings.reask.as_str(), f3_hotkey),
+                (bindings.knowledge.as_str(), f4_hotkey),
+                (bindings.new_tile.as_str(), f6_hotkey),
+                (bindings.close_all_tiles.as_str(), close_all_hotkey),
+                (bindings.archive.as_str(), f7_hotkey),
+                (bindings.vision.as_str(), f8_hotkey),
+                (bindings.vision_translate.as_str(), sf8_hotkey),
+                (bindings.vision_ocr.as_str(), cf8_hotkey),
+                (bindings.ask.as_str(), f9_hotkey),
+                (bindings.ask_deep.as_str(), sf9_hotkey),
+                (bindings.help.as_str(), f1_hotkey),
+                (bindings.read_selected.as_str(), sa1_hotkey),
+                (bindings.read_ocr.as_str(), sa2_hotkey),
+                (bindings.read_pause.as_str(), sa3_hotkey),
             ] {
                 match m.register(hk) {
                     Ok(()) => {
@@ -300,22 +241,11 @@ pub(crate) fn register_hotkeys() -> RegisteredHotkeys {
                 }
             }
         }
-        #[cfg(target_os = "linux")]
-        let diag = match slint_replay::native::desktop::listen() {
-            Ok(()) => wayland_hotkey_diag(),
-            Err(_) => HotkeyDiag {
-                registered: String::new(),
-                failed: String::new(),
-                manager_missing: true,
-            },
-        };
-        #[cfg(not(target_os = "linux"))]
-        let diag = HotkeyDiag {
+        let _ = HOTKEY_DIAG.set(HotkeyDiag {
             registered: registered.join(" "),
             failed: failed.join(", "),
             manager_missing: hotkey_manager.is_none(),
-        };
-        *HOTKEY_DIAG.write().unwrap_or_else(|p| p.into_inner()) = Some(diag);
+        });
     }
 
     RegisteredHotkeys {
@@ -324,6 +254,7 @@ pub(crate) fn register_hotkeys() -> RegisteredHotkeys {
         f3_id,
         f4_id,
         f6_id,
+        close_all_id,
         f7_id,
         f8_id,
         sf8_id,

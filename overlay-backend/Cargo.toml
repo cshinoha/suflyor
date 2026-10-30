@@ -12,12 +12,7 @@ description = "Shared backend for suflyor — audio, STT, AI, journal, KB, confi
 [lib]
 path = "src/lib.rs"
 
-[features]
-# Optional Linux NVIDIA build; regular platform builds retain their runtime.
-cuda = ["transcribe-rs/ort-cuda", "ort/load-dynamic"]
-
 [dependencies]
-tempfile = "3"
 # Serialization & config (shared by config, journal, kb, ai)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,7 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 parking_lot = "0.12"
 
 # HTTP (stt + ai)
-reqwest = { version = "0.13", features = ["json", "multipart", "native-tls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "form", "multipart", "native-tls", "socks"], default-features = false }
 
 # Neural TTS (read-aloud) runs in the `suflyor-tts` SIDECAR process — sherpa-onnx
 # is deliberately NOT linked here. It bundles its own onnxruntime, which crashes
@@ -74,7 +69,7 @@ getrandom = "0.2"
 # unsupported audio seam (`audio_unavailable.rs`) — no silent fallback.
 [target.'cfg(windows)'.dependencies]
 # Audio capture (audio.rs)
-wasapi = "0.26"
+wasapi = "0.23"
 
 # Local STT — GigaAM-v3 in-process via ONNX (Russian-specialised). The `ort`
 # crate statically links the onnxruntime binary at build time. We enable
@@ -89,12 +84,7 @@ wasapi = "0.26"
 # Local Whisper goes through the existing reqwest client (whisper.cpp server),
 # so we deliberately DON'T enable the whisper-cpp feature (avoids a libclang
 # build-dep on the whole project).
-# Exact versions: this crate has no committed lockfile, so a standalone build
-# resolves anew. ort 2.0.0-rc.14 changed `Session::builder` and transcribe-rs
-# no longer compiles against it. These are the versions of
-# slint-experiment/Cargo.lock, which the product is built from.
-transcribe-rs = { version = "=0.3.12", default-features = false, features = ["onnx", "ort-directml"] }
-ort = { version = "=2.0.0-rc.12", default-features = false }
+transcribe-rs = { version = "0.3.11", default-features = false, features = ["onnx", "ort-directml"] }
 
 # Text-to-speech (tts.rs, read-aloud feature) — Windows SAPI 5 ISpVoice via the
 # official Win32 binding, feature-gated to just the Speech + COM namespaces it
@@ -115,8 +105,6 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_Security_Credentials",
-    # Fixed drives, where Settings looks for a Strata the user installed.
-    "Win32_Storage_FileSystem",
 ] }
 # The `#[implement(IMMNotificationClient)]` macro expands against the direct
 # crate name even though `windows` re-exports its public types.
@@ -125,20 +113,7 @@ windows-core = "0.62"
 # The same in-process GigaAM-v3 model runs on Apple Silicon through ONNX
 # Runtime's Core ML execution provider, with CPU as the built-in fallback.
 [target.'cfg(target_os = "macos")'.dependencies]
-# Exact versions: this crate has no committed lockfile, so a standalone build
-# resolves anew. ort 2.0.0-rc.14 changed `Session::builder` and transcribe-rs
-# no longer compiles against it. These are the versions of
-# slint-experiment/Cargo.lock, which the product is built from.
-transcribe-rs = { version = "=0.3.12", default-features = false, features = ["onnx", "ort-coreml"] }
-ort = { version = "=2.0.0-rc.12", default-features = false }
-
-# Owned updater cancellation uses POSIX signals on both Linux and macOS.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-transcribe-rs = { version = "=0.3.12", default-features = false, features = ["onnx"] }
-ort = { version = "=2.0.0-rc.12", default-features = false }
+transcribe-rs = { version = "0.3.11", default-features = false, features = ["onnx", "ort-coreml"] }
 
 # macOS-only BUILD dependency — compiles the tiny Objective-C AVAudioEngine
 # microphone bridge (native/macos/mic_capture.m) via build.rs. No new runtime
@@ -149,6 +124,8 @@ cc = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Drop-guard for test cleanup (bookmark_tests in journal.rs).
+scopeguard = "1"
 
 [lints.clippy]
 # Tier 3 lint baseline — mirrors slint-experiment. These restriction lints are

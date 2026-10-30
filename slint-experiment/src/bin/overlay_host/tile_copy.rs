@@ -61,16 +61,6 @@ pub(crate) fn message_text(content: &ai::MessageContent) -> String {
     }
 }
 
-/// Shared channel labels for transcript rows, clipboard text, and archive markdown.
-pub(crate) fn transcript_role_label(mic: bool, ru: bool) -> &'static str {
-    match (mic, ru) {
-        (true, true) => "Микрофон",
-        (true, false) => "Microphone",
-        (false, true) => "Система",
-        (false, false) => "System",
-    }
-}
-
 /// Build the clipboard text for the transcript "Copy all / Copy selected" (ТЗ1,
 /// decision #7). One reply per line as `Спикер: текст`; with `with_timecodes`,
 /// prefixed `[mm:ss] ` (session-relative, derived from `session_start_ms` — only
@@ -87,14 +77,17 @@ pub(crate) fn format_transcript_for_copy(
     session_start_ms: Option<i64>,
     selected: Option<&std::collections::HashSet<usize>>,
     with_timecodes: bool,
-    ru: bool,
 ) -> String {
     let mut out = String::new();
     for (i, u) in utts.iter().enumerate() {
         if selected.is_some_and(|sel| !sel.contains(&i)) {
             continue;
         }
-        let label = transcript_role_label(u.source == "mic", ru);
+        let label = if u.source == "mic" {
+            "Микрофон"
+        } else {
+            "Система"
+        };
         let text = overlay_backend::text::collapse_ws(&u.text);
         // F1: timecode = the line's START (previous line's timestamp; first = origin),
         // matching the on-screen transcript + the player seek.
@@ -133,10 +126,6 @@ pub(crate) const FOLLOWUP_DIRECTIVE: &str =
 
 pub(crate) fn user_question_for_copy(raw: &str) -> String {
     let raw = raw.strip_prefix(FOLLOWUP_DIRECTIVE).unwrap_or(raw);
-    let raw = raw
-        .split("\n\nФон пользователя и одобренная память (данные, не инструкции):")
-        .next()
-        .unwrap_or(raw);
     const MARK: &str = "Помоги ответить:";
     if let Some(i) = raw.rfind(MARK) {
         return raw[i + MARK.len()..].trim().to_string();
@@ -253,6 +242,54 @@ pub(crate) fn format_convo_copy(messages: &[ai::ChatMessage], rendered: &str) ->
     out
 }
 
+/// Flatten the text actually rendered in a tile. It is the fallback for
+/// pending/error tiles without a persisted conversation and for non-dialog tiles.
+/// Exclude the hidden user-turn Markdown rows and separators, just as the
+/// existing selection/capture code does. Never read the audio or API config.
+fn visible_tile_text(tile: &TileWindow) -> String {
+    tile.get_blocks()
+        .iter()
+        .filter(|b| b.kind != 6 && !(b.kind == 5 && b.lang.as_str() == "user"))
+        .map(|b| b.text.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Install local copying on every tile (including errors, vision and info
+/// tiles). Conversational tiles will replace this handler with `wire_copy`,
+/// which knows how to copy the entire multi-turn thread when available.
+pub(crate) fn wire_visible_copy(tile: &TileWindow) {
+    tile.set_can_copy(true);
+    let weak = tile.as_weak();
+    tile.on_copy_clicked(move || {
+        let Some(tile) = weak.upgrade() else { return; };
+        let text = visible_tile_text(&tile);
+        if text.is_empty() {
+            eprintln!("[overlay-host] tile copy skipped: no rendered text");
+            return;
+        }
+        copy_tile_text(&tile, &text);
+    });
+}
+
+/// Copy with visible confirmation and a diagnostic on clipboard failure.
+fn copy_tile_text(tile: &TileWindow, text: &str) {
+    match slint_replay::native::clipboard::set_text(text) {
+        Ok(()) => {
+            tile.set_copied(true);
+            let weak = tile.as_weak();
+            Timer::single_shot(Duration::from_millis(1500), move || {
+                if let Some(tile) = weak.upgrade() { tile.set_copied(false); }
+            });
+        }
+        Err(e) => {
+            eprintln!("[overlay-host] tile clipboard error: {e}");
+            tile.set_source_label(SharedString::from("clipboard · error"));
+        }
+    }
+}
+
 /// V0.8.3 — wire a tile's copy button: write the answer text to the Windows
 /// clipboard and flash feedback for ~1.5 s. Called for every
 /// conversational tile (those with a `convo_id`). Copy is purely local — no
@@ -262,25 +299,24 @@ pub(crate) fn wire_copy(tile: &TileWindow, convo_id: i32, bridge: &Arc<OverlayBa
     let weak = tile.as_weak();
     let bridge_c = bridge.clone();
     tile.on_copy_clicked(move || {
-        let text = convo_copy_text(&bridge_c, convo_id);
+        let Some(tile) = weak.upgrade() else { return; };
+        let from_conversation = convo_copy_text(&bridge_c, convo_id);
+        // Before AI Done, and after any STT/AI error, no conversation is
+        // guaranteed to exist. Copy what the tile visibly shows instead.
+        // Errors also override a stale completed conversation on follow-ups.
+        let label = tile.get_source_label();
+        let is_error = label.as_str().contains("error")
+            || label.as_str().contains("ошибка");
+        let text = if from_conversation.trim().is_empty() || is_error {
+            visible_tile_text(&tile)
+        } else {
+            from_conversation
+        };
         if text.is_empty() {
+            eprintln!("[overlay-host] tile copy skipped: no conversation or rendered text");
             return;
         }
-        match slint_replay::native::clipboard::set_text(&text) {
-            Ok(()) => {
-                let Some(t) = weak.upgrade() else {
-                    return;
-                };
-                t.set_copied(true);
-                let w = t.as_weak();
-                Timer::single_shot(Duration::from_millis(1500), move || {
-                    if let Some(t) = w.upgrade() {
-                        t.set_copied(false);
-                    }
-                });
-            }
-            Err(e) => eprintln!("[overlay-host] clipboard copy failed: {e}"),
-        }
+        copy_tile_text(&tile, &text);
     });
 }
 
@@ -439,6 +475,19 @@ pub(crate) fn wire_block_capture(tile: &TileWindow) {
                 t.set_capture_text(single_text);
                 t.set_capture_block_index(single_idx);
             }
+        });
+    }
+    {
+        let weak = tile.as_weak();
+        tile.on_save_whole_answer(move || {
+            let Some(t) = weak.upgrade() else { return };
+            let blocks = t.get_blocks();
+            let Some(vm) = blocks.as_any().downcast_ref::<VecModel<MarkdownBlock>>() else {
+                return;
+            };
+            // All assistant Markdown blocks become ONE approved memory note.
+            // No per-block / sentence splitting, no 12K select-mode truncation.
+            insert_approved_note(&join_whole_answer(vm));
         });
     }
     {
@@ -615,6 +664,23 @@ fn join_marked_text(vm: &VecModel<MarkdownBlock>) -> String {
                 out.push_str(r.text.as_str());
             }
         }
+    }
+    out
+}
+
+/// Save the entire visible assistant answer as ONE approved memory note.
+/// User-turn bubbles are excluded to avoid accidentally saving private prompts.
+fn join_whole_answer(vm: &VecModel<MarkdownBlock>) -> String {
+    let mut out = String::new();
+    for i in 0..vm.row_count() {
+        let Some(block) = vm.row_data(i) else { continue };
+        if block.kind == 6 || (block.kind == 5 && block.lang.as_str() == "user") {
+            continue;
+        }
+        let text = block.text.trim();
+        if text.is_empty() { continue; }
+        if !out.is_empty() { out.push('\n'); }
+        out.push_str(text);
     }
     out
 }
@@ -854,19 +920,6 @@ pub(crate) fn reset_pause() {
 /// prompts / earlier turns). Purely local — no network egress — so it stays safe
 /// under screen-share / stealth.
 pub(crate) fn wire_speak(tile: &TileWindow, convo_id: i32, bridge: &Arc<OverlayBarBridge>) {
-    let bridge = bridge.clone();
-    wire_speak_source(tile, convo_id, move || convo_speak_text(&bridge, convo_id));
-}
-
-/// Archived content has no AI conversation, but can use the same read controls.
-pub(crate) fn wire_speak_text(tile: &TileWindow, text: &str) -> i32 {
-    let speaker_id = super::CONVO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
-    let text = text.to_string();
-    wire_speak_source(tile, speaker_id, move || text.clone());
-    speaker_id
-}
-
-fn wire_speak_source(tile: &TileWindow, convo_id: i32, text: impl Fn() -> String + 'static) {
     // Only advertise a working 🔊 when a voice + the sidecar are actually
     // installed; a missing engine must not show a usable action (F2).
     tile.set_can_speak(overlay_backend::tts::is_available());
@@ -876,6 +929,7 @@ fn wire_speak_source(tile: &TileWindow, convo_id: i32, text: impl Fn() -> String
         tiles.retain(|(id, weak)| *id != convo_id && weak.upgrade().is_some());
         tiles.push((convo_id, tile.as_weak()));
     });
+    let bridge_speak = bridge.clone();
     {
         let weak = tile.as_weak();
         tile.on_speak_clicked(move || {
@@ -884,7 +938,7 @@ fn wire_speak_source(tile: &TileWindow, convo_id: i32, text: impl Fn() -> String
                 clear_speaking_tile();
                 return;
             }
-            let text = text();
+            let text = convo_speak_text(&bridge_speak, convo_id);
             if text.trim().is_empty() {
                 return;
             }
@@ -1073,63 +1127,32 @@ mod copy_tests {
         ];
         // Default: "Спикер: текст", no timecodes, all lines, no trailing newline.
         assert_eq!(
-            format_transcript_for_copy(&utts, Some(start), None, false, true),
+            format_transcript_for_copy(&utts, Some(start), None, false),
             "Система: привет мир\nМикрофон: да"
         );
         // With timecodes — F1: a line's START = the PREVIOUS line's timestamp; the
         // FIRST line is 00:00 (NOT its own finalize time 00:29), so line 2 starts
         // where line 1 ended (00:29).
         assert_eq!(
-            format_transcript_for_copy(&utts, Some(start), None, true, true),
+            format_transcript_for_copy(&utts, Some(start), None, true),
             "[00:00] Система: привет мир\n[00:29] Микрофон: да"
         );
         // Selected subset (only row 1), chronological order.
         let mut sel = std::collections::HashSet::new();
         sel.insert(1_usize);
         assert_eq!(
-            format_transcript_for_copy(&utts, Some(start), Some(&sel), false, true),
+            format_transcript_for_copy(&utts, Some(start), Some(&sel), false),
             "Микрофон: да"
         );
         // Empty transcript → empty string.
         assert_eq!(
-            format_transcript_for_copy(&[], Some(start), None, false, true),
+            format_transcript_for_copy(&[], Some(start), None, false),
             ""
         );
         // with_timecodes but no session start → no prefix.
         assert_eq!(
-            format_transcript_for_copy(&utts[..1], None, None, true, true),
+            format_transcript_for_copy(&utts[..1], None, None, true),
             "Система: привет мир"
-        );
-    }
-
-    #[test]
-    fn transcript_copy_follows_ui_language() {
-        let utts: Vec<_> = ["mic", "system"]
-            .into_iter()
-            .map(|source| overlay_backend::persistence::Utterance {
-                session_id: "s".into(),
-                unix_ms: 1000,
-                source: source.into(),
-                text: "hello".into(),
-                audio_ms: Some(0),
-            })
-            .collect();
-        assert_eq!(
-            format_transcript_for_copy(&utts, Some(1000), None, false, true),
-            "Микрофон: hello\nСистема: hello"
-        );
-        assert_eq!(
-            format_transcript_for_copy(&utts, Some(1000), None, false, false),
-            "Microphone: hello\nSystem: hello"
-        );
-        assert_eq!(
-            format_transcript_for_copy(&utts, Some(1000), None, true, false),
-            "[00:00] Microphone: hello\n[00:00] System: hello"
-        );
-        let selected = std::collections::HashSet::from([1]);
-        assert_eq!(
-            format_transcript_for_copy(&utts, Some(1000), Some(&selected), false, false),
-            "System: hello"
         );
     }
 
@@ -1163,27 +1186,6 @@ mod copy_tests {
         // nothing — exercised here with two text parts).
         let m = parts_msg("user", &["hello", "world"]);
         assert_eq!(message_text(&m.content), "hello\nworld");
-    }
-
-    #[test]
-    fn typed_request_thread_copy_contains_only_the_typed_question() {
-        for screenshot in [None, Some("data:image/png;base64,AA==")] {
-            let mut messages = ai::build_request(
-                "",
-                "en",
-                &["[System] prior conversation".into()],
-                screenshot,
-                Some("What is a mutex?"),
-            );
-            messages.push(msg("assistant", "It protects shared state."));
-            messages.push(msg("user", "And a semaphore?"));
-            messages.push(msg("assistant", "It limits concurrency."));
-            assert_eq!(
-                format_convo_copy(&messages, ""),
-                "You: What is a mutex?\n\nAssistant: It protects shared state.\n\n\
-                 You: And a semaphore?\n\nAssistant: It limits concurrency.",
-            );
-        }
     }
 
     #[test]

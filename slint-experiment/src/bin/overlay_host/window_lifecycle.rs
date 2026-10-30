@@ -19,8 +19,9 @@ use super::{
     enum_monitors, get_mic_active, get_sys_active, get_window_rect, grab_hwnd,
     move_window_pos_only, pick_monitor, refresh_status, set_stealth, stealth_supported, ui,
     ArchiveWindow, ComponentHandle, Duration, HelpWindow, LockModeMenuWindow, OverlayBarWindow,
-    PaletteWindow, Rc, RecoverOfferWindow, RefCell, SettingsWindow, TextAskWindow, TileWindow,
-    TileWindows, Timer, TranscriptWindow, WizardWindow, HWND_GRAB_DELAY_MS, HWND_REVEAL_FAST_MS,
+    PaletteWindow, Rc,
+    RecoverOfferWindow, RefCell, SettingsWindow, TextAskWindow, TileWindow, TileWindows, Timer,
+    TranscriptWindow, WizardWindow, HWND_GRAB_DELAY_MS, HWND_REVEAL_FAST_MS,
 };
 
 /// Phase E6 v36 — process-global tile body opacity (raw f32 bits in an
@@ -38,26 +39,41 @@ pub(crate) fn set_platform_window_position(window: &slint::Window, x: i32, y: i3
     window.set_position(slint::PhysicalPosition::new(x, y));
     #[cfg(target_os = "macos")]
     window.set_position(slint::LogicalPosition::new(x as f32, y as f32));
-    #[cfg(target_os = "linux")]
-    {
-        // Windows sentinel parking is not a Wayland operation.
-        if x > -30000 && y > -30000 {
-            if let Ok(id) = slint_replay::native::window::view_id(window) {
-                let _ = slint_replay::native::window::move_to(id, x, y);
-            }
-        }
-    }
 }
 
-/// Store the current global tile body opacity (clamped 0.5..=1.0).
+/// Store the current global tile background preset. Legacy slider values are
+/// normalized to the three supported states: opaque, 70% transparent, hidden.
 pub(crate) fn set_global_tile_opacity(value: f32) {
-    let clamped = value.clamp(0.5, 1.0);
-    TILE_BODY_OPACITY_BITS.store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    let normalized: f32 = if value <= 0.01 {
+        0.0
+    } else if value <= 0.65 {
+        0.30
+    } else {
+        1.0
+    };
+    TILE_BODY_OPACITY_BITS.store(
+        normalized.to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Read the current global tile body opacity (defaults to 1.0).
 pub(crate) fn global_tile_opacity() -> f32 {
     f32::from_bits(TILE_BODY_OPACITY_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Global compact layout preference shared by every new TileWindow.
+/// The settings toggle applies live to already-open tiles and stores the choice
+/// in config.json; this atomic supplies the preference on every spawn path.
+static TILE_READING_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_global_tile_reading_mode(value: bool) {
+    TILE_READING_MODE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn global_tile_reading_mode() -> bool {
+    TILE_READING_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// #111 — process-global stealth (WDA_EXCLUDEFROMCAPTURE) state.
@@ -72,8 +88,6 @@ static STEALTH_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 /// Store the current global stealth state.
 pub(crate) fn set_global_stealth(on: bool) {
-    #[cfg(all(target_os = "linux", feature = "remote-ui"))]
-    slint_replay::remote_ui::send_global("Suflyor", "stealth-requested", on.into());
     STEALTH_ON.store(
         on && stealth_supported(),
         std::sync::atomic::Ordering::Relaxed,
@@ -118,7 +132,7 @@ pub(crate) fn global_stealth_effective() -> bool {
 /// verifies, restoring the mic/sys truth.
 pub(crate) fn surface_stealth_unavailable(bar: &OverlayBarWindow) {
     bar.set_stealth_fault(true);
-    bar.set_status_tone(crate::ui::StatusTone::Warning);
+    bar.set_status_color(slint::Color::from_rgb_u8(0xfb, 0xbf, 0x24));
 }
 
 /// Apply a stealth toggle to the BAR — the one window outside the
@@ -221,6 +235,54 @@ pub(crate) fn global_tile_monitor() -> Option<(i32, i32)> {
     }
 }
 
+/// Optional normalized tile placement region. None = entire selected monitor.
+/// The Settings window updates this on the UI thread; individual tiles read
+/// the same value at realization. A mutex keeps the four coordinates atomic.
+static TILE_ZONE: std::sync::Mutex<Option<[u16; 4]>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_global_tile_zone(zone: Option<[u16; 4]>) {
+    let valid = zone.filter(|[x, y, w, h]| {
+        *w > 0 && *h > 0 && (*x as u32 + *w as u32) <= 1000
+            && (*y as u32 + *h as u32) <= 1000
+    });
+    if let Ok(mut stored) = TILE_ZONE.lock() {
+        *stored = valid;
+    }
+}
+
+pub(crate) fn global_tile_zone() -> Option<[u16; 4]> {
+    TILE_ZONE.lock().ok().and_then(|zone| *zone)
+}
+
+/// Process-global tile anchor. The persisted config uses stable string ids; the
+/// runtime stores a compact code because every tile realization reads it.
+pub(crate) const TILE_ANCHOR_TOP_RIGHT: u8 = 0;
+pub(crate) const TILE_ANCHOR_TOP_LEFT: u8 = 1;
+pub(crate) const TILE_ANCHOR_BOTTOM_RIGHT: u8 = 2;
+pub(crate) const TILE_ANCHOR_BOTTOM_LEFT: u8 = 3;
+static TILE_ANCHOR: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(TILE_ANCHOR_TOP_RIGHT);
+
+pub(crate) fn tile_anchor_code(value: &str) -> u8 {
+    match value {
+        "top_left" => TILE_ANCHOR_TOP_LEFT,
+        "bottom_right" => TILE_ANCHOR_BOTTOM_RIGHT,
+        "bottom_left" => TILE_ANCHOR_BOTTOM_LEFT,
+        _ => TILE_ANCHOR_TOP_RIGHT,
+    }
+}
+
+pub(crate) fn set_global_tile_anchor(value: &str) {
+    TILE_ANCHOR.store(
+        tile_anchor_code(value),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn global_tile_anchor() -> u8 {
+    TILE_ANCHOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Parse a `cfg.tile_monitor_name` pin string (`"{left},{top}"`) into coords;
 /// empty / malformed → `None` (auto). Shared by the startup seed and the
 /// Settings dropdown handler so the encode/decode lives in one place.
@@ -284,10 +346,7 @@ where
 /// visible monitor (with a small slack so a title bar dragged flush to an edge
 /// still counts). A stale position from an unplugged monitor fails → the
 /// caller centers instead. Pure — unit-tested below.
-pub(super) fn pos_on_visible_monitor(
-    pos: (i32, i32),
-    monitors: &[slint_replay::win32::MonitorRect],
-) -> bool {
+fn pos_on_visible_monitor(pos: (i32, i32), monitors: &[slint_replay::win32::MonitorRect]) -> bool {
     const SLACK: i32 = 8;
     monitors.iter().any(|m| {
         pos.0 >= m.left - SLACK
@@ -326,10 +385,6 @@ pub(crate) fn present_window_stealth_aware_at<W, F>(
     // first-realize safe (no window stranded off-screen). Stealth-safe: in EVERY
     // native path WDA is applied BEFORE a parked window is moved on-screen.
     let do_reveal: Rc<dyn Fn(&W) -> bool> = Rc::new(move |w: &W| -> bool {
-        // A retained Settings instance can be closed before its reveal tick.
-        if !w.window().is_visible() {
-            return true;
-        }
         let Ok(hwnd) = grab_hwnd(w.window()) else {
             return false;
         };
@@ -338,10 +393,9 @@ pub(crate) fn present_window_stealth_aware_at<W, F>(
             diag!("[overlay-host] macOS floating-window configuration failed: {error}");
         }
         decorate(hwnd);
-        // Linux compositor rules protect the first mapped frame even when the
-        // saved toggle is off; native presentation must apply both directions.
-        if global_stealth() || cfg!(target_os = "linux") {
-            apply_stealth_one(hwnd, global_stealth());
+        if global_stealth() {
+            // I1 — a failed exclusion is logged, never silently swallowed.
+            apply_stealth_one(hwnd, true);
         }
         // The off-screen frame is now painted + decorated (+ WDA under stealth):
         // reveal it at the RESTORED position when one is saved and still visible
@@ -377,9 +431,6 @@ pub(crate) fn present_window_stealth_aware_at<W, F>(
     // reopen to retry. Native decoration (rounded corners) is skipped in this
     // degraded path — a plain but VISIBLE window beats an invisible one.
     let fallback_reveal: Rc<dyn Fn(&W)> = Rc::new(move |w: &W| {
-        if !w.window().is_visible() {
-            return;
-        }
         if global_stealth() {
             diag!(
                 "[overlay-host] present: HWND never realized after retries; window kept \
@@ -420,63 +471,35 @@ pub(crate) fn realize_with_retries<W>(
 ) where
     W: slint::ComponentHandle + 'static,
 {
-    #[cfg(target_os = "linux")]
-    realize_wayland_window(win, attempt, fallback, 50);
-    #[cfg(not(target_os = "linux"))]
-    {
-        let weak = win.as_weak();
-        Timer::single_shot(Duration::from_millis(HWND_REVEAL_FAST_MS), move || {
-            let Some(w) = weak.upgrade() else { return };
-            if attempt(&w) {
-                return;
-            }
-            // Retry #1 SOON (80ms, not the full 200ms) — the heavy Settings window
-            // often isn't HWND-realized by the 33ms fast attempt, so the old 200ms
-            // gap was the "Settings opens with a delay" the user saw. Still only
-            // reveals once grab_hwnd succeeds (window painted off-screen → no flash).
-            let weak2 = w.as_weak();
-            let attempt2 = attempt.clone();
-            let fallback2 = fallback.clone();
-            Timer::single_shot(Duration::from_millis(80), move || {
-                let Some(w) = weak2.upgrade() else { return };
-                if attempt2(&w) {
-                    return;
-                }
-                // Retry #2 (final) at a longer delay; on a final miss, run the fallback.
-                let weak3 = w.as_weak();
-                let attempt3 = attempt2.clone();
-                let fallback3 = fallback2.clone();
-                Timer::single_shot(Duration::from_millis(HWND_GRAB_DELAY_MS * 2), move || {
-                    let Some(w) = weak3.upgrade() else { return };
-                    if !attempt3(&w) {
-                        fallback3(&w);
-                    }
-                });
-            });
-        });
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn realize_wayland_window<W>(
-    win: &W,
-    attempt: Rc<dyn Fn(&W) -> bool>,
-    fallback: Rc<dyn Fn(&W)>,
-    remaining: u32,
-) where
-    W: slint::ComponentHandle + 'static,
-{
     let weak = win.as_weak();
-    Timer::single_shot(Duration::from_millis(200), move || {
-        let Some(window) = weak.upgrade() else { return };
-        if !window.window().is_visible() || attempt(&window) {
+    Timer::single_shot(Duration::from_millis(HWND_REVEAL_FAST_MS), move || {
+        let Some(w) = weak.upgrade() else { return };
+        if attempt(&w) {
             return;
         }
-        if remaining > 1 {
-            realize_wayland_window(&window, attempt, fallback, remaining - 1);
-        } else {
-            fallback(&window);
-        }
+        // Retry #1 SOON (80ms, not the full 200ms) — the heavy Settings window
+        // often isn't HWND-realized by the 33ms fast attempt, so the old 200ms
+        // gap was the "Settings opens with a delay" the user saw. Still only
+        // reveals once grab_hwnd succeeds (window painted off-screen → no flash).
+        let weak2 = w.as_weak();
+        let attempt2 = attempt.clone();
+        let fallback2 = fallback.clone();
+        Timer::single_shot(Duration::from_millis(80), move || {
+            let Some(w) = weak2.upgrade() else { return };
+            if attempt2(&w) {
+                return;
+            }
+            // Retry #2 (final) at a longer delay; on a final miss, run the fallback.
+            let weak3 = w.as_weak();
+            let attempt3 = attempt2.clone();
+            let fallback3 = fallback2.clone();
+            Timer::single_shot(Duration::from_millis(HWND_GRAB_DELAY_MS * 2), move || {
+                let Some(w) = weak3.upgrade() else { return };
+                if !attempt3(&w) {
+                    fallback3(&w);
+                }
+            });
+        });
     });
 }
 
@@ -751,4 +774,31 @@ mod tests {
         ));
         assert!(!pos_on_visible_monitor((100, 100), &[])); // no monitors at all
     }
+}
+
+// Typography/memory controls shared by newly spawned and existing tiles.
+static TILE_FONT_BODY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(15);
+static TILE_FONT_HEADING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(22);
+static TILE_FONT_SUBHEADING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(19);
+static TILE_FONT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(13);
+static TILE_FONT_TABLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(13);
+static TILE_FONT_ALERT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(14);
+static TILE_MEMORY_STARS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub(crate) fn set_global_tile_text_preferences(sizes: [i32; 6], show_stars: bool) {
+    TILE_FONT_BODY.store(sizes[0].clamp(9, 32), std::sync::atomic::Ordering::Relaxed);
+    TILE_FONT_HEADING.store(sizes[1].clamp(9, 32), std::sync::atomic::Ordering::Relaxed);
+    TILE_FONT_SUBHEADING.store(sizes[2].clamp(9, 32), std::sync::atomic::Ordering::Relaxed);
+    TILE_FONT_CODE.store(sizes[3].clamp(9, 32), std::sync::atomic::Ordering::Relaxed);
+    TILE_FONT_TABLE.store(sizes[4].clamp(9, 32), std::sync::atomic::Ordering::Relaxed);
+    TILE_FONT_ALERT.store(sizes[5].clamp(9, 32), std::sync::atomic::Ordering::Relaxed);
+    TILE_MEMORY_STARS.store(show_stars, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn apply_global_tile_text_preferences(tile: &TileWindow) {
+    tile.set_font_body_size(TILE_FONT_BODY.load(std::sync::atomic::Ordering::Relaxed));
+    tile.set_font_heading_size(TILE_FONT_HEADING.load(std::sync::atomic::Ordering::Relaxed));
+    tile.set_font_subheading_size(TILE_FONT_SUBHEADING.load(std::sync::atomic::Ordering::Relaxed));
+    tile.set_font_code_size(TILE_FONT_CODE.load(std::sync::atomic::Ordering::Relaxed));
+    tile.set_font_table_size(TILE_FONT_TABLE.load(std::sync::atomic::Ordering::Relaxed));
+    tile.set_font_alert_size(TILE_FONT_ALERT.load(std::sync::atomic::Ordering::Relaxed));
+    tile.set_show_memory_stars(TILE_MEMORY_STARS.load(std::sync::atomic::Ordering::Relaxed));
 }

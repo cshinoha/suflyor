@@ -11,6 +11,8 @@ pub enum AiProtocol {
     /// Official Codex app-server account integration using the experimental,
     /// fail-closed no-tools permission contract.
     CodexSubscription,
+    /// ChatGPT OAuth + direct Codex Responses transport (no local Codex CLI).
+    CodexDirect,
 }
 
 impl AiProtocol {
@@ -21,6 +23,7 @@ impl AiProtocol {
             Self::OpenAiResponses => "openai-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::CodexSubscription => "codex-subscription",
+            Self::CodexDirect => "codex-direct",
         }
     }
 
@@ -28,13 +31,18 @@ impl AiProtocol {
     pub const fn supports_model_listing(self) -> bool {
         matches!(
             self,
-            Self::OpenAiCompatible | Self::OpenAiResponses | Self::CodexSubscription
+            Self::OpenAiCompatible | Self::OpenAiResponses | Self::CodexSubscription | Self::CodexDirect
         )
     }
 
     #[must_use]
     pub const fn supports_prompt_cache_control(self) -> bool {
         matches!(self, Self::OpenAiCompatible | Self::AnthropicMessages)
+    }
+
+    #[must_use]
+    pub const fn supports_live_answers(self) -> bool {
+        true
     }
 }
 
@@ -46,21 +54,26 @@ pub struct AiEndpoint {
     pub base_url: String,
     pub bearer: String,
     pub model: String,
-    /// Optional reasoning effort for the official Codex app-server. Other
+    /// Optional reasoning effort for either Codex account transport. Other
     /// protocols ignore it.
     pub reasoning_effort: Option<String>,
+    /// Optional OpenAI/Codex service tier (currently used for `fast`).
+    /// Other protocols ignore it.
+    pub service_tier: Option<String>,
     pub is_local: bool,
 }
 
 impl AiEndpoint {
     #[must_use]
     pub const fn requires_bearer(&self) -> bool {
-        !self.is_local && !matches!(self.protocol, AiProtocol::CodexSubscription)
+        !self.is_local
+            && !matches!(self.protocol, AiProtocol::CodexSubscription | AiProtocol::CodexDirect)
     }
 
     #[must_use]
     pub const fn is_unmetered(&self) -> bool {
-        self.is_local || matches!(self.protocol, AiProtocol::CodexSubscription)
+        self.is_local
+            || matches!(self.protocol, AiProtocol::CodexSubscription | AiProtocol::CodexDirect)
     }
 
     #[must_use]
@@ -76,6 +89,7 @@ impl std::fmt::Debug for AiEndpoint {
             .field("protocol", &self.protocol)
             .field("model", &self.model)
             .field("has_reasoning_effort", &self.reasoning_effort.is_some())
+            .field("has_service_tier", &self.service_tier.is_some())
             .field("is_local", &self.is_local)
             .field("has_base_url", &!self.base_url.trim().is_empty())
             .field("has_credential", &!self.bearer.trim().is_empty())
@@ -83,15 +97,12 @@ impl std::fmt::Debug for AiEndpoint {
     }
 }
 
-/// Frontend-visible event stream. `Tool` says the model called a tool
-/// (`name`) with `detail` (its query or page host); it is status only and
-/// does not change the answer text.
+/// Frontend-visible event stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AiEvent {
     Start { id: String },
     Delta { text: String },
-    Tool { name: String, detail: String },
     Done { reason: String },
     Error { message: String },
 }

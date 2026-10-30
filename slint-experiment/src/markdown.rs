@@ -15,7 +15,7 @@
 use crate::math_display::{
     looks_like_delimited_math, normalize_math_display, normalize_math_fragment,
 };
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::borrow::Cow;
 
 const INLINE_CODE_START: char = '\u{e000}';
@@ -33,6 +33,12 @@ pub mod kind {
     pub const HR: i32 = 6;
     /// GFM table rendered as an aligned monospace block (#109).
     pub const TABLE: i32 = 7;
+    // GFM alerts (single lightweight block each, also for long virtualized histories).
+    pub const NOTE: i32 = 8;
+    pub const TIP: i32 = 9;
+    pub const IMPORTANT: i32 = 10;
+    pub const WARNING: i32 = 11;
+    pub const CAUTION: i32 = 12;
 }
 
 /// Plain-Rust block record. Binaries map this to whatever Slint
@@ -237,11 +243,66 @@ fn parse_single_pass(source: &str) -> Vec<Block> {
     // swallowed Tag::Link), so AI answers lost every link. Stash on Start(Link),
     // append " (url)" on End(Link).
     let mut link_url: Option<String> = None;
+    // Remember where the alert begins; we can reuse the existing block parsing
+    // and combine the completed children into one cheap card for the ListView.
+    let mut alert_start: Option<(i32, usize)> = None;
 
     let mut options = Options::ENABLE_TABLES;
+    options.insert(Options::ENABLE_GFM);
     options.insert(Options::ENABLE_MATH);
     for event in Parser::new_ext(source, options) {
         match event {
+            Event::Start(Tag::BlockQuote(Some(style))) => {
+                flush(
+                    &mut out,
+                    &mut current_raw,
+                    &mut current_display,
+                    &mut current_kind,
+                    &mut current_lang,
+                );
+                let kind = match style {
+                    BlockQuoteKind::Note => kind::NOTE,
+                    BlockQuoteKind::Tip => kind::TIP,
+                    BlockQuoteKind::Important => kind::IMPORTANT,
+                    BlockQuoteKind::Warning => kind::WARNING,
+                    BlockQuoteKind::Caution => kind::CAUTION,
+                };
+                alert_start = Some((kind, out.len()));
+            }
+            Event::End(TagEnd::BlockQuote(Some(_))) => {
+                flush(
+                    &mut out,
+                    &mut current_raw,
+                    &mut current_display,
+                    &mut current_kind,
+                    &mut current_lang,
+                );
+                if let Some((style_kind, start)) = alert_start.take() {
+                    // Preserve multiple paragraphs/bullets within a single
+                    // alert; do not lose their source text for copy/memory.
+                    let children = out.split_off(start);
+                    let mut raw = String::new();
+                    let mut display = String::new();
+                    for child in children {
+                        if !raw.is_empty() { raw.push('\n'); }
+                        if !display.is_empty() { display.push('\n'); }
+                        if child.kind == kind::BULLET {
+                            raw.push_str("• ");
+                            display.push_str("• ");
+                        }
+                        raw.push_str(&child.text);
+                        display.push_str(&child.display_text);
+                    }
+                    if !raw.is_empty() {
+                        out.push(Block {
+                            kind: style_kind,
+                            text: raw,
+                            display_text: display,
+                            lang: String::new(),
+                        });
+                    }
+                }
+            }
             Event::Start(Tag::Heading { level, .. }) => {
                 flush(
                     &mut out,
@@ -434,11 +495,19 @@ fn parse_single_pass(source: &str) -> Vec<Block> {
             }
             Event::End(TagEnd::Table) => {
                 if !table_rows.is_empty() {
-                    out.push(Block::new(
-                        kind::TABLE,
-                        format_table(&table_rows),
-                        String::new(),
-                    ));
+                    let formatted = format_table(&table_rows);
+                    // Display text is width-limited, but keep ALL cell values
+                    // in the copy/memory text, even when visually ellipsized.
+                    let raw = table_rows
+                        .iter()
+                        .map(|row| row.join(" | "))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let mut block = Block::new(kind::TABLE, raw, String::new());
+                    let mut lines = formatted.lines();
+                    block.lang = lines.next().unwrap_or_default().to_string();
+                    block.display_text = lines.collect::<Vec<_>>().join("\n");
+                    out.push(block);
                 }
                 table_rows.clear();
             }
@@ -502,13 +571,6 @@ fn flush(
                 disp = normalize_math_display(&disp);
             }
             disp.retain(|ch| !matches!(ch, INLINE_CODE_START | INLINE_CODE_END));
-            // A fenced block ends with a newline; shown as is it adds an empty
-            // last line to the code panel. Copy still uses the raw text.
-            if k == kind::CODE {
-                while disp.ends_with('\n') {
-                    disp.pop();
-                }
-            }
             let raw_text = std::mem::take(raw);
             out.push(Block {
                 kind: k,
@@ -534,16 +596,23 @@ fn flush(
 /// glyphs; the tile renders this with `wrap: no-wrap` so the alignment
 /// holds. Over-long cells are truncated with `…` to bound the width.
 fn format_table(rows: &[Vec<String>]) -> String {
-    /// Per-column character cap so one verbose cell can't blow the width.
-    const MAX_COL: usize = 28;
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    // Prefer compact 2-3 column comparisons for the 460px tile. Other
+    // tables remain bounded, not a layout that forces the ListView wider.
+    let max_col = match ncols {
+        0 | 1 => 28,
+        2 => 20,
+        3 => 14,
+        4 => 10,
+        _ => 7,
+    };
     if ncols == 0 {
         return String::new();
     }
     let mut widths = vec![0_usize; ncols];
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
-            let w = cell.trim().chars().count().min(MAX_COL);
+            let w = cell.trim().chars().count().min(max_col);
             if w > widths[i] {
                 widths[i] = w;
             }
@@ -555,7 +624,7 @@ fn format_table(rows: &[Vec<String>]) -> String {
             .iter()
             .enumerate()
             .map(|(i, width)| {
-                let cell = truncate_cell(row.get(i).map_or("", |s| s.trim()), MAX_COL);
+                let cell = truncate_cell(row.get(i).map_or("", |s| s.trim()), max_col);
                 let pad = width.saturating_sub(cell.chars().count());
                 format!("{cell}{}", " ".repeat(pad))
             })
@@ -620,6 +689,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gfm_alerts_render_as_one_block_with_correct_kinds() {
+        for (label, expected) in [
+            ("NOTE", kind::NOTE),
+            ("TIP", kind::TIP),
+            ("IMPORTANT", kind::IMPORTANT),
+            ("WARNING", kind::WARNING),
+            ("CAUTION", kind::CAUTION),
+        ] {
+            let src = format!("> [!{label}]\n> **Главное:** строка 1\n> строка 2\n\nпосле");
+            let parsed = parse(&src);
+            assert_eq!(parsed.len(), 2, "{label}: {parsed:?}");
+            assert_eq!(parsed[0].kind, expected, "{label}: {parsed:?}");
+            assert!(parsed[0].text.contains("строка 1"));
+            assert!(parsed[0].text.contains("строка 2"));
+            assert_eq!(parsed[1].text, "после");
+        }
+    }
+
+    #[test]
+    fn gfm_alerts_keep_multiple_paragraphs_and_bullets() {
+        let src = "> [!IMPORTANT]\n> Вывод\n>\n> - Первое\n> - Второе";
+        let parsed = parse(src);
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(parsed[0].kind, kind::IMPORTANT);
+        assert!(parsed[0].display_text.contains("Вывод"));
+        assert!(parsed[0].display_text.contains("• Первое"));
+        assert!(parsed[0].display_text.contains("• Второе"));
+    }
+
+    #[test]
+    fn code_fence_is_not_an_alert() {
+        let parsed = parse("```text\n> [!WARNING]\n> just code\n```");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, kind::CODE);
+    }
+
+    #[test]
+    fn compact_comparison_has_separate_header_and_copyable_full_text() {
+        let parsed = parse("| Metric | Before | After |\n|---|---|---|\n| Open | 6.3s | 21ms |");
+        assert_eq!(parsed.len(), 1);
+        let table = &parsed[0];
+        assert_eq!(table.kind, kind::TABLE);
+        assert!(table.lang.contains("Metric"));
+        assert!(!table.display_text.contains("Metric"));
+        assert!(table.display_text.contains("21ms"));
+        assert!(table.text.contains("Metric"));
+        assert!(table.text.contains("21ms"));
+    }
+
+    #[test]
     fn link_url_is_preserved_in_text() {
         // The link TEXT already survived (inner Event::Text); the URL was being
         // dropped by the catch-all arm. Now it's appended as " (url)".
@@ -661,17 +780,13 @@ mod tests {
         let blocks = parse(md);
         let tables: Vec<&Block> = blocks.iter().filter(|b| b.kind == kind::TABLE).collect();
         assert_eq!(tables.len(), 1, "exactly one TABLE block expected");
-        let t = &tables[0].text;
-        // Header + body cells survive.
-        assert!(t.contains('A') && t.contains('B') && t.contains("333"));
-        // Box-drawing column separator + header underline are present.
-        assert!(t.contains('│'), "column separator missing: {t:?}");
-        assert!(t.contains('─'), "header underline missing: {t:?}");
-        // The raw GFM dashes separator row must NOT leak as content.
-        assert!(!t.contains("---"), "raw pipe separator leaked: {t:?}");
-        // Column A is padded so every data line starts at the same width
-        // ("333" is the widest → width 3): the "1" cell becomes "1  ".
-        assert!(t.contains("1  "), "column A not padded to width 3: {t:?}");
+        let table = tables[0];
+        let visual = format!("{}\n{}", table.lang, table.display_text);
+        assert!(table.text.contains('A') && table.text.contains('B') && table.text.contains("333"));
+        assert!(visual.contains('│'), "column separator missing: {visual:?}");
+        assert!(visual.contains('─'), "header underline missing: {visual:?}");
+        assert!(!visual.contains("---"), "raw pipe separator leaked: {visual:?}");
+        assert!(visual.contains("1  "), "column A not padded to width 3: {visual:?}");
     }
 
     #[test]
@@ -701,16 +816,12 @@ mod tests {
         let long = "x".repeat(60);
         let md = format!("| H |\n|---|\n| {long} |\n");
         let blocks = parse(&md);
-        let t = &blocks
-            .iter()
-            .find(|b| b.kind == kind::TABLE)
-            .expect("table block")
-            .text;
-        assert!(t.contains('…'), "long cell should be truncated: {t:?}");
-        // No single line should exceed the cap by much (28 + separators).
+        let table = blocks.iter().find(|b| b.kind == kind::TABLE).expect("table block");
+        assert_eq!(table.text.matches(&long).count(), 1, "raw cell must remain copyable");
+        assert!(table.display_text.contains('…'), "long visual cell should be truncated");
         assert!(
-            t.lines().all(|l| l.chars().count() <= 40),
-            "line exceeded width cap: {t:?}"
+            table.display_text.lines().all(|l| l.chars().count() <= 40),
+            "line exceeded width cap: {:?}", table.display_text
         );
     }
 
@@ -743,8 +854,7 @@ mod tests {
         assert!(blocks.iter().any(|block| {
             block.kind == kind::CODE
                 && block.text.trim_end_matches('\n') == "c_{ij} = \\sum_{k=1}^{n}"
-                // Code is shown verbatim, minus the fence's trailing newline.
-                && block.display_text == block.text.trim_end_matches('\n')
+                && block.display_text == block.text
         }));
     }
 

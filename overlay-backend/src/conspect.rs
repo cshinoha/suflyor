@@ -188,13 +188,11 @@ pub fn save(c: &Conspect) -> bool {
 fn save_in(dir: &Path, c: &Conspect) -> anyhow::Result<()> {
     let stem =
         safe_stem(&c.session_id).ok_or_else(|| anyhow::anyhow!("unsafe conspect session id"))?;
-    // SECURITY: Enforce owner-only permissions (0o700) on sidecar directory on POSIX/Unix.
-    crate::paths::ensure_private_dir(dir)?;
+    std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{stem}.json"));
     let tmp = dir.join(format!("{stem}.json.tmp"));
     let bytes = serde_json::to_vec_pretty(c)?;
-    // SECURITY: Enforce owner-only permissions (0o600) on temporary sidecar file on POSIX/Unix.
-    crate::paths::write_private(&tmp, &bytes)?;
+    std::fs::write(&tmp, &bytes)?;
     // Atomic replace — same proven pattern as config::save (MoveFileEx replace).
     std::fs::rename(&tmp, &path)?;
     prune_in(dir, KEEP_NEWEST, "json");
@@ -369,12 +367,10 @@ pub fn save_debrief(session_id: &str, text: &str) -> bool {
 
 fn save_debrief_in(dir: &Path, session_id: &str, text: &str) -> anyhow::Result<()> {
     let stem = safe_stem(session_id).ok_or_else(|| anyhow::anyhow!("unsafe debrief session id"))?;
-    // SECURITY: Enforce owner-only permissions (0o700) on sidecar directory on POSIX/Unix.
-    crate::paths::ensure_private_dir(dir)?;
+    std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{stem}.txt"));
     let tmp = dir.join(format!("{stem}.txt.tmp"));
-    // SECURITY: Enforce owner-only permissions (0o600) on temporary sidecar file on POSIX/Unix.
-    crate::paths::write_private(&tmp, text.as_bytes())?;
+    std::fs::write(&tmp, text.as_bytes())?;
     std::fs::rename(&tmp, &path)?;
     // Bound the dir to the newest N, same policy as the conspect store (a debrief
     // is written once per session, so mtime == creation order).
@@ -391,6 +387,58 @@ pub fn load_debrief(session_id: &str) -> Option<String> {
 fn load_debrief_in(dir: &Path, session_id: &str) -> Option<String> {
     let stem = safe_stem(session_id)?;
     std::fs::read_to_string(dir.join(format!("{stem}.txt"))).ok()
+}
+
+/// The mic-side transcript for a failed coaching request is retained only
+/// while the request is pending/retryable. It is separate from the successful
+/// debriefs directory so archive listings never mistake it for an answer.
+fn pending_debrief_dir() -> Option<PathBuf> {
+    crate::paths::data_root().map(|root| root.join("debrief-retry"))
+}
+
+/// Persist the *same* mic transcript that was used for the original request.
+/// A retry needs no new recording or STT. Returns false if persistence fails;
+/// callers must not show a retry action in that case.
+pub fn save_pending_debrief(session_id: &str, mic_text: &str) -> bool {
+    pending_debrief_dir()
+        .is_some_and(|dir| save_pending_debrief_in(&dir, session_id, mic_text).is_ok())
+}
+
+fn save_pending_debrief_in(dir: &Path, session_id: &str, text: &str) -> anyhow::Result<()> {
+    let stem = safe_stem(session_id).ok_or_else(|| anyhow::anyhow!("unsafe debrief session id"))?;
+    if text.trim().is_empty() {
+        anyhow::bail!("empty debrief source");
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{stem}.txt"));
+    let tmp = dir.join(format!("{stem}.txt.tmp"));
+    std::fs::write(&tmp, text.as_bytes())?;
+    std::fs::rename(&tmp, &path)?;
+    prune_in(dir, KEEP_NEWEST, "txt");
+    Ok(())
+}
+
+/// Load a saved debrief source for an explicit retry.
+pub fn load_pending_debrief(session_id: &str) -> Option<String> {
+    load_pending_debrief_in(&pending_debrief_dir()?, session_id)
+}
+
+fn load_pending_debrief_in(dir: &Path, session_id: &str) -> Option<String> {
+    let stem = safe_stem(session_id)?;
+    let text = std::fs::read_to_string(dir.join(format!("{stem}.txt"))).ok()?;
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Clear the retry payload after success or when the session is deleted.
+pub fn delete_pending_debrief(session_id: &str) -> bool {
+    let Some(dir) = pending_debrief_dir() else { return false; };
+    delete_pending_debrief_in(&dir, session_id)
+}
+
+fn delete_pending_debrief_in(dir: &Path, session_id: &str) -> bool {
+    let Some(stem) = safe_stem(session_id) else { return false; };
+    let _ = std::fs::remove_file(dir.join(format!("{stem}.txt.tmp")));
+    std::fs::remove_file(dir.join(format!("{stem}.txt"))).is_ok()
 }
 
 /// Session ids that have a saved debrief — a CHEAP dir listing (`*.txt` stems),
@@ -428,6 +476,7 @@ fn delete_debrief_in(dir: &Path, session_id: &str) -> bool {
     let Some(stem) = safe_stem(session_id) else {
         return false;
     };
+    let _ = delete_pending_debrief(session_id);
     let _ = std::fs::remove_file(dir.join(format!("{stem}.txt.tmp")));
     std::fs::remove_file(dir.join(format!("{stem}.txt"))).is_ok()
 }
@@ -603,6 +652,21 @@ mod tests {
     }
 
     #[test]
+    fn pending_debrief_round_trip_and_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let original = "Микрофон: Java и Scala\nМикрофон: Kafka";
+        assert!(load_pending_debrief_in(dir, "call-1").is_none());
+        save_pending_debrief_in(dir, "call-1", original).unwrap();
+        assert_eq!(load_pending_debrief_in(dir, "call-1").as_deref(), Some(original));
+        assert!(save_pending_debrief_in(dir, "../escape", original).is_err());
+        assert!(save_pending_debrief_in(dir, "call-2", "  ").is_err());
+        assert!(delete_pending_debrief_in(dir, "call-1"));
+        assert!(load_pending_debrief_in(dir, "call-1").is_none());
+        assert!(!delete_pending_debrief_in(dir, "call-1"));
+    }
+
+    #[test]
     fn debrief_save_load_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -760,46 +824,6 @@ mod tests {
                 .summary
                 .as_deref(),
             Some("now mapped")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn posix_sidecars_and_directories_have_mode_0600_and_0700() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("conspects");
-
-        let c = sample("s_perm");
-        save_in(&dir, &c).unwrap();
-
-        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700, "conspects dir must have mode 0o700");
-
-        let file_path = dir.join("s_perm.json");
-        let file_mode = std::fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(file_mode, 0o600, "conspect file must have mode 0o600");
-
-        let debrief_dir = tmp.path().join("debriefs");
-        save_debrief_in(&debrief_dir, "s_perm", "debrief text").unwrap();
-
-        let debrief_dir_mode = std::fs::metadata(&debrief_dir)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(debrief_dir_mode, 0o700, "debriefs dir must have mode 0o700");
-
-        let debrief_file_path = debrief_dir.join("s_perm.txt");
-        let debrief_file_mode = std::fs::metadata(&debrief_file_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            debrief_file_mode, 0o600,
-            "debrief file must have mode 0o600"
         );
     }
 }

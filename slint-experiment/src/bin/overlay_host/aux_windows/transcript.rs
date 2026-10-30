@@ -67,7 +67,6 @@ fn wire_transcript_actions(
     model: &Rc<VecModel<TranscriptLine>>,
     utts: &[Utterance],
     session_start: Option<i64>,
-    ru: bool,
 ) {
     // Reset transient UI state — the window is reused across sessions, so a fresh
     // open must not inherit the prior session's "select all" tick or "copied"
@@ -280,13 +279,8 @@ fn wire_transcript_actions(
                 return;
             }
             let with_tc = w.get_with_timecodes();
-            let text = super::tile_copy::format_transcript_for_copy(
-                &utts_c,
-                session_start,
-                None,
-                with_tc,
-                ru,
-            );
+            let text =
+                super::tile_copy::format_transcript_for_copy(&utts_c, session_start, None, with_tc);
             copy_to_clipboard_and_flash(&w, &text);
         });
     }
@@ -316,7 +310,6 @@ fn wire_transcript_actions(
                 session_start,
                 Some(&sel),
                 with_tc,
-                ru,
             );
             copy_to_clipboard_and_flash(&w, &text);
         });
@@ -356,7 +349,6 @@ fn wire_transcript_player(
     win.set_playing(false);
     win.set_progress(0.0);
     win.set_time_text(SharedString::default());
-    win.set_playback_status(SharedString::default());
     win.set_active_line(-1);
     // Reused window — reset the speed ComboBox (index 0 = 1×) + volume slider (1×) so
     // the UI matches the fresh player (reset() above dropped any prior session's
@@ -368,11 +360,6 @@ fn wire_transcript_player(
     }
 
     let id = session_id.to_string();
-    let playback_failure = if overlay_backend::config::load().ui_is_ru() {
-        "Не удалось запустить запись. Проверьте устройство вывода звука; подробности в журнале."
-    } else {
-        "Could not play the recording. Check the audio output device; details are in the log."
-    };
     {
         let weak = win.as_weak();
         let id = id.clone();
@@ -381,10 +368,7 @@ fn wire_transcript_player(
                 transcript_player::toggle();
                 if let Some(w) = weak.upgrade() {
                     w.set_playing(transcript_player::is_playing());
-                    w.set_playback_status(SharedString::default());
                 }
-            } else if let Some(w) = weak.upgrade() {
-                w.set_playback_status(SharedString::from(playback_failure));
             }
         });
     }
@@ -495,8 +479,6 @@ struct DiarJobHandles {
     /// The session the job runs for — a re-attached poll paints ONLY when the
     /// window still shows this session (it may have been repurposed mid-run).
     session_id: String,
-    engine: overlay_backend::diarize::DiarEngine,
-    cancel: Arc<AtomicBool>,
 }
 
 /// V-1 — the running model install's shared result slot. The worker
@@ -504,7 +486,7 @@ struct DiarJobHandles {
 /// the UI-thread poll ([`start_diar_install_poll`]) takes it. Cloned between
 /// the install callback, `DIAR_INSTALL_JOB`, and the poll, so a re-attached
 /// poll after a close+reopen consumes the SAME install.
-type DiarInstallSlot = Arc<Mutex<Option<Result<overlay_backend::diarize::DiarEngine, String>>>>;
+type DiarInstallSlot = Arc<Mutex<Option<Result<(), String>>>>;
 
 /// suflyor H3 — how a finished job failed, so the UI never paints a result that
 /// was NOT persisted. `Run` = the sidecar/parse failed (path-safe reason via
@@ -555,13 +537,17 @@ fn speaker_label(id: i32, names: &std::collections::BTreeMap<i32, String>) -> St
 
 /// Reset every row to the role view («Микрофон»/«Система»); the Slint side uses the
 /// theme accent for the colour in role view, so `speaker_color` is left as-is.
-fn apply_role_labels(model: &Rc<VecModel<TranscriptLine>>, utts: &[Utterance], ru: bool) {
+fn apply_role_labels(model: &Rc<VecModel<TranscriptLine>>, utts: &[Utterance]) {
     for i in 0..model.row_count() {
         let Some(mut row) = model.row_data(i) else {
             continue;
         };
         let mic = utts.get(i).map(|u| u.source == "mic").unwrap_or(false);
-        row.speaker = SharedString::from(super::tile_copy::transcript_role_label(mic, ru));
+        row.speaker = SharedString::from(if mic {
+            "Микрофон"
+        } else {
+            "Система"
+        });
         model.set_row_data(i, row);
     }
 }
@@ -573,7 +559,6 @@ fn apply_voice_labels(
     model: &Rc<VecModel<TranscriptLine>>,
     utts: &[Utterance],
     diar: &Diarization,
-    ru: bool,
 ) {
     let align = overlay_backend::diarize::align_all_speakers(utts, &diar.segments);
     for i in 0..model.row_count() {
@@ -596,7 +581,7 @@ fn apply_voice_labels(
                 neutral_speaker_color()
             };
         } else {
-            row.speaker = SharedString::from(super::tile_copy::transcript_role_label(false, ru));
+            row.speaker = SharedString::from("Система");
             row.speaker_color = neutral_speaker_color();
         }
         model.set_row_data(i, row);
@@ -632,7 +617,6 @@ fn set_speaker_list(win: &TranscriptWindow, diar: &Diarization, utts: &[Utteranc
 /// busy state instead of mislabelling another session's lines. Panic backstop:
 /// a worker that freed the latch without posting an outcome (it unwound) fails
 /// the UI clean instead of a forever-busy button.
-#[allow(clippy::too_many_arguments)]
 fn start_diar_poll(
     weak: slint::Weak<TranscriptWindow>,
     store: StoreSlot,
@@ -641,7 +625,6 @@ fn start_diar_poll(
     utts: Rc<Vec<Utterance>>,
     handles: DiarJobHandles,
     paint_session_id: String,
-    ru: bool,
 ) {
     let poll = slint::Timer::default();
     let slot = handles.slot;
@@ -688,7 +671,7 @@ fn start_diar_poll(
                         .as_ref()
                         .and_then(|st| st.get_diarization(&job_sid).ok().flatten())
                         .unwrap_or(d);
-                    apply_voice_labels(&model, &utts, &d, ru);
+                    apply_voice_labels(&model, &utts, &d);
                     set_speaker_list(&w, &d, &utts);
                     *diar.borrow_mut() = Some(d);
                     w.set_has_diarization(true);
@@ -761,9 +744,10 @@ fn start_diar_install_poll(weak: slint::Weak<TranscriptWindow>, slot: DiarInstal
             };
             w.set_installing_diar_models(false);
             match result {
-                Ok(engine) => {
-                    w.set_use_nemotron(engine == overlay_backend::diarize::DiarEngine::Nemotron3);
-                    let ready = overlay_backend::diarize::engine_ready(engine);
+                Ok(()) => {
+                    // Re-check the fs rather than assume — only enable detect if BOTH
+                    // models really landed (a partial install keeps the prompt up).
+                    let ready = overlay_backend::diarize::models_ready();
                     w.set_can_diarize(ready);
                     w.set_needs_diar_models(!ready);
                     w.set_diar_status(SharedString::default());
@@ -891,7 +875,6 @@ fn wire_transcript_diarization(
     session_finished: bool,
     utts_display: &[Utterance],
     model: &Rc<VecModel<TranscriptLine>>,
-    ru: bool,
 ) {
     // suflyor H2 — a live job (this window's or a closed one's) outlives this
     // wiring: grab its handles BEFORE dropping the poll timer so the job's poll
@@ -928,13 +911,7 @@ fn wire_transcript_diarization(
     let session_diarizable = session_finished
         && has_sys_audio_ms
         && overlay_backend::session_audio::session_has_recordings(session_id);
-    let engine = live_job
-        .as_ref()
-        .map(|job| job.engine)
-        .unwrap_or_else(overlay_backend::diarize::selected_engine);
-    win.set_nemotron_available(overlay_backend::nemotron_diar::supported());
-    win.set_use_nemotron(engine == overlay_backend::diarize::DiarEngine::Nemotron3);
-    let models_ready = overlay_backend::diarize::engine_ready(engine);
+    let models_ready = overlay_backend::diarize::models_ready();
     let can_diarize = session_diarizable && models_ready;
     let needs_diar_models = session_diarizable && !models_ready;
     // I-1: warn when the recording predates the wall-clock-padding fix — system.wav
@@ -988,7 +965,7 @@ fn wire_transcript_diarization(
     // Reset the rename list too (the window is reused) — masked while by-voice=false,
     // but defends against a stale prior-session list if the gating ever changes.
     win.set_speakers(ModelRc::from(Rc::new(VecModel::<SpeakerRow>::default())));
-    apply_role_labels(model, &utts_rc, ru);
+    apply_role_labels(model, &utts_rc);
 
     // suflyor H2 — re-attach the result poll to a job that outlived the window:
     // the worker persists the result itself, and this poll consumes it for the
@@ -1002,48 +979,12 @@ fn wire_transcript_diarization(
             utts_rc.clone(),
             handles,
             session_id.to_string(),
-            ru,
         );
     }
     // V-1 — re-attach the install poll to a download that outlived the window
     // (same lifecycle as above; the worker commits on disk window-independently).
     if let Some(slot) = live_install {
         start_diar_install_poll(win.as_weak(), slot);
-    }
-
-    {
-        let weak = win.as_weak();
-        win.on_select_diar_engine(move |use_nemotron| {
-            let Some(w) = weak.upgrade() else { return };
-            if DIAR_BUSY.load(Ordering::Acquire) || DIAR_INSTALL_BUSY.load(Ordering::Acquire) {
-                return;
-            }
-            let engine = overlay_backend::diarize::DiarEngine::from_id(if use_nemotron {
-                "nemotron3"
-            } else {
-                "pyannote"
-            });
-            if let Err(error) = overlay_backend::diarize::save_engine(engine) {
-                log::warn!("diarization preference save failed: {error}");
-                return;
-            }
-            w.set_use_nemotron(engine == overlay_backend::diarize::DiarEngine::Nemotron3);
-            let ready = overlay_backend::diarize::engine_ready(engine);
-            w.set_can_diarize(session_diarizable && ready);
-            w.set_needs_diar_models(session_diarizable && !ready);
-            w.set_diar_status(SharedString::default());
-        });
-    }
-    {
-        win.on_cancel_diarization(move || {
-            DIAR_JOB.with(|job| {
-                if let Some(job) = job.borrow().as_ref() {
-                    if job.engine == overlay_backend::diarize::DiarEngine::Nemotron3 {
-                        job.cancel.store(true, Ordering::Release);
-                    }
-                }
-            });
-        });
     }
 
     // Toggle role ↔ voice.
@@ -1058,11 +999,11 @@ fn wire_transcript_diarization(
             };
             if v {
                 if let Some(d) = diar_c.borrow().as_ref() {
-                    apply_voice_labels(&model_c, &utts_c, d, ru);
+                    apply_voice_labels(&model_c, &utts_c, d);
                     set_speaker_list(&w, d, &utts_c);
                 }
             } else {
-                apply_role_labels(&model_c, &utts_c, ru);
+                apply_role_labels(&model_c, &utts_c);
             }
             w.set_by_voice(v);
         });
@@ -1103,7 +1044,7 @@ fn wire_transcript_diarization(
                 // the speaker list here — that recreates the focused LineEdit on every keystroke and
                 // makes typing impossible. The field already shows the typed text; relabel the
                 // transcript rows live, and keep the re-detect guard in sync below.
-                apply_voice_labels(&model_c, &utts_c, d, ru);
+                apply_voice_labels(&model_c, &utts_c, d);
                 let has_names = d.speaker_names.values().any(|n| !n.trim().is_empty());
                 w.set_has_speaker_names(has_names);
                 // Clear OUR failure text once a keystroke saved again — but never
@@ -1146,14 +1087,6 @@ fn wire_transcript_diarization(
                 w.set_confirm_rediar(false);
                 return;
             };
-            let engine = overlay_backend::diarize::DiarEngine::from_id(if w.get_use_nemotron() {
-                "nemotron3"
-            } else {
-                "pyannote"
-            });
-            if !overlay_backend::diarize::engine_ready(engine) {
-                return;
-            }
             let count = w.get_speaker_count().clamp(0, 8);
             w.set_diarizing(true);
             w.set_diar_status(SharedString::from("Определение говорящих…"));
@@ -1162,14 +1095,11 @@ fn wire_transcript_diarization(
                 slot: Arc::new(Mutex::new(None)),
                 progress: Arc::new(Mutex::new(None)),
                 session_id: sid.clone(),
-                engine,
-                cancel: Arc::new(AtomicBool::new(false)),
             };
             DIAR_JOB.with(|j| *j.borrow_mut() = Some(handles.clone()));
             {
                 let slot_w = handles.slot.clone();
                 let progress_w = handles.progress.clone();
-                let cancel = handles.cancel.clone();
                 let sid_w = sid.clone();
                 let utts_owned: Vec<Utterance> = utts_c.as_ref().clone();
                 rt.spawn_blocking(move || {
@@ -1177,21 +1107,16 @@ fn wire_transcript_diarization(
                     // a panic unwinding the sidecar run (RAII; the latch can't be
                     // leaked and wedge the feature until restart).
                     let guard = guard;
-                    let outcome = match overlay_backend::diarize::run_diarization_with_engine(
+                    let outcome = match overlay_backend::diarize::run_diarization(
                         &sid_w,
                         count,
-                        engine,
                         &utts_owned,
-                        &cancel,
                         &|overlay_backend::diarize::Progress::Step(message)| {
                             if let Ok(mut value) = progress_w.lock() {
                                 *value = Some(message);
                             }
                         },
                     ) {
-                        Ok(_) if cancel.load(Ordering::Acquire) => {
-                            Err(DiarFailure::Run("Nemotron canceled".into()))
-                        }
                         Ok(d) => {
                             // Persist HERE, off the window: a worker-owned catalog
                             // handle (the archive window does the same). The poll's
@@ -1226,7 +1151,6 @@ fn wire_transcript_diarization(
                 utts_c.clone(),
                 handles,
                 sid.clone(),
-                ru,
             );
         });
     }
@@ -1255,11 +1179,6 @@ fn wire_transcript_diarization(
             w.set_installing_diar_models(true);
             w.set_diar_status(SharedString::default());
 
-            let engine = overlay_backend::diarize::DiarEngine::from_id(if w.get_use_nemotron() {
-                "nemotron3"
-            } else {
-                "pyannote"
-            });
             let slot: DiarInstallSlot = Arc::new(Mutex::new(None));
             DIAR_INSTALL_JOB.with(|j| *j.borrow_mut() = Some(slot.clone()));
             {
@@ -1272,8 +1191,7 @@ fn wire_transcript_diarization(
                     let cancel = AtomicBool::new(false);
                     // ponytail: no per-file progress marshalling — the button's
                     // "Downloading…" state is enough for a one-time ~30 MB fetch.
-                    let r = overlay_backend::diarize::install_engine(engine, &cancel, &|_| {})
-                        .map(|()| engine)
+                    let r = overlay_backend::diar_install::install_models(&cancel, &|_| {})
                         .map_err(|e| format!("{e:#}"));
                     if let Ok(mut g) = slot_w.lock() {
                         *g = Some(r);
@@ -1298,15 +1216,15 @@ pub(in super::super) fn open_transcript(
     utts: &[Utterance],
     store: &StoreSlot,
     rt_handle: &tokio::runtime::Handle,
-    ru: bool,
 ) {
     // Build the model once — shared by the reuse + first-open paths.
+    let model_started = std::time::Instant::now();
     let session_start = session.and_then(|s| s.started_at_ms).filter(|&ms| ms > 0);
     // D3 — a finished session is a precondition to diarize (a live session's WAV is
     // unfinalized). `crashed`/`active` sessions can't.
     let session_finished = session.map(|s| s.status == "completed").unwrap_or(false);
     let heading = session
-        .map(|s| session_title(s.started_at_ms, &s.id, ru))
+        .map(|s| session_title(s.started_at_ms, &s.id))
         .unwrap_or_default();
     // C1/P2 — compute each utterance's display offset in ORIGINAL order (the F1 fallback reads the
     // PREVIOUS utterance), THEN sort utterances + rows TOGETHER by the displayed clock (audio start).
@@ -1328,6 +1246,7 @@ pub(in super::super) fn open_transcript(
         })
         .collect();
     indexed.sort_by_key(|(off, _)| off.unwrap_or(0));
+    let sort_ms = model_started.elapsed().as_millis();
     // The sorted utterances that BACK the rows — pass THESE (not raw `utts`) to the copy/selection
     // wiring so a checked row index maps to the right utterance.
     let utts_display: Vec<Utterance> = indexed.iter().map(|(_, u)| (*u).clone()).collect();
@@ -1335,10 +1254,11 @@ pub(in super::super) fn open_transcript(
         .iter()
         .map(|(off, u)| TranscriptLine {
             offset_label: off.map(fmt_offset).unwrap_or_default().into(),
-            speaker: SharedString::from(super::tile_copy::transcript_role_label(
-                u.source == "mic",
-                ru,
-            )),
+            speaker: SharedString::from(if u.source == "mic" {
+                "Микрофон"
+            } else {
+                "Система"
+            }),
             // Role view uses the theme accent (Slint side); this is only read in the
             // «По голосам» view, where `rebuild_speaker_labels` overwrites it.
             speaker_color: slint::Color::from_rgb_u8(0, 0, 0),
@@ -1354,6 +1274,11 @@ pub(in super::super) fn open_transcript(
         .collect();
     // Utterances hidden by the display cap — the footer discloses this (Copy all
     // still exports every line). 0 when the whole transcript fits under the cap.
+    let row_ms = model_started.elapsed().as_millis();
+    eprintln!(
+        "[overlay-host] history/transcript model: utterances={} displayed={} sort_ms={sort_ms} rows_total_ms={row_ms}",
+        utts.len(), lines.len()
+    );
     let overflow = utts.len().saturating_sub(TRANSCRIPT_DISPLAY_CAP) as i32;
     let session_id = session.map(|s| s.id.clone()).unwrap_or_default();
     // Drop any prior session's player + poll timer — the window is reused, so a
@@ -1364,6 +1289,7 @@ pub(in super::super) fn open_transcript(
     // and re-focus via the borrowed strong handle. Slint handles are NOT `Clone`,
     // so the single strong handle stays in the slot and closures use weak handles.
     if let Some(win) = slot.borrow().as_ref() {
+        let publish_started = std::time::Instant::now();
         win.global::<ui::Theme>()
             .set_scheme(clamp_scheme(global_scheme()));
         win.set_heading(SharedString::from(heading));
@@ -1371,7 +1297,7 @@ pub(in super::super) fn open_transcript(
         let model = Rc::new(VecModel::from(lines));
         win.set_lines(ModelRc::from(model.clone()));
         win.set_overflow_count(overflow);
-        wire_transcript_actions(win, &model, &utts_display, session_start, ru);
+        wire_transcript_actions(win, &model, &utts_display, session_start);
         wire_transcript_player(win, &session_id, &model);
         wire_transcript_search(win, &model);
         wire_transcript_diarization(
@@ -1382,9 +1308,12 @@ pub(in super::super) fn open_transcript(
             session_finished,
             &utts_display,
             &model,
-            ru,
         );
         let _ = win.show();
+        eprintln!(
+            "[overlay-host] history/transcript reused: publish_show_ms={} rows={}",
+            publish_started.elapsed().as_millis(), utts_display.len()
+        );
         if let Ok(hwnd) = grab_hwnd(win.window()) {
             focus_window(hwnd);
         }
@@ -1392,6 +1321,7 @@ pub(in super::super) fn open_transcript(
     }
 
     // First open: create, populate, wire (weak closures), present, then store.
+    let create_started = std::time::Instant::now();
     let win = match TranscriptWindow::new() {
         Ok(w) => w,
         Err(e) => {
@@ -1399,6 +1329,8 @@ pub(in super::super) fn open_transcript(
             return;
         }
     };
+    let create_ms = create_started.elapsed().as_millis();
+    let publish_started = std::time::Instant::now();
     win.global::<ui::Theme>()
         .set_scheme(clamp_scheme(global_scheme()));
     win.global::<ui::Platform>()
@@ -1408,7 +1340,7 @@ pub(in super::super) fn open_transcript(
     let model = Rc::new(VecModel::from(lines));
     win.set_lines(ModelRc::from(model.clone()));
     win.set_overflow_count(overflow);
-    wire_transcript_actions(&win, &model, &utts_display, session_start, ru);
+    wire_transcript_actions(&win, &model, &utts_display, session_start);
     wire_transcript_player(&win, &session_id, &model);
     wire_transcript_search(&win, &model);
     wire_transcript_diarization(
@@ -1419,7 +1351,6 @@ pub(in super::super) fn open_transcript(
         session_finished,
         &utts_display,
         &model,
-        ru,
     );
 
     {
@@ -1470,59 +1401,16 @@ pub(in super::super) fn open_transcript(
         focus_window(hwnd);
     });
     *slot.borrow_mut() = Some(win);
+    eprintln!(
+        "[overlay-host] history/transcript first_open: create_ms={create_ms} publish_show_ms={}",
+        publish_started.elapsed().as_millis()
+    );
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-
-    #[test]
-    fn transcript_role_labels_follow_ui_language() {
-        let label = super::tile_copy::transcript_role_label;
-        assert_eq!(label(true, true), "Микрофон");
-        assert_eq!(label(false, true), "Система");
-        assert_eq!(label(true, false), "Microphone");
-        assert_eq!(label(false, false), "System");
-
-        let utts: Vec<_> = ["mic", "system"]
-            .into_iter()
-            .map(|source| Utterance {
-                session_id: "s".into(),
-                unix_ms: 1000,
-                source: source.into(),
-                text: "hello".into(),
-                audio_ms: Some(0),
-            })
-            .collect();
-        let model = Rc::new(VecModel::from(vec![
-            TranscriptLine::default(),
-            TranscriptLine::default(),
-        ]));
-        let diar = Diarization {
-            session_id: "s".into(),
-            created_at_ms: 0,
-            num_speakers: 0,
-            model_id: "test".into(),
-            segments: Vec::new(),
-            speaker_names: std::collections::BTreeMap::new(),
-        };
-        for ru in [true, false] {
-            apply_role_labels(&model, &utts, ru);
-            assert_eq!(model.row_data(0).unwrap().speaker.as_str(), label(true, ru));
-            assert_eq!(
-                model.row_data(1).unwrap().speaker.as_str(),
-                label(false, ru)
-            );
-            apply_voice_labels(&model, &utts, &diar, ru);
-            assert_eq!(
-                model.row_data(1).unwrap().speaker.as_str(),
-                label(false, ru)
-            );
-            apply_role_labels(&model, &utts, ru);
-            assert_eq!(model.row_data(0).unwrap().speaker.as_str(), label(true, ru));
-        }
-    }
 
     /// Pins the one-job contract on a private atomic, so parallel tests never
     /// touch either process-global latch.

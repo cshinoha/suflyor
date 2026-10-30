@@ -12,6 +12,40 @@ use super::*;
 /// one `release` in the worker's completion path. (Same pattern as `MIC_BUSY`.)
 static RETRANSCRIBE_BUSY: AtomicBool = AtomicBool::new(false);
 
+/// Measure UI-thread responsiveness for ten seconds after opening a history
+/// window. A delayed 50ms timer indicates a busy event loop, NOT GPU frame time.
+/// Do not log private session titles, utterances, or IDs.
+pub(super) fn history_ui_lag_probe(label: &'static str, remaining: u16, worst_ms: u128, stalls: u16) {
+    let scheduled = std::time::Instant::now();
+    slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
+        let late_ms = scheduled
+            .elapsed()
+            .saturating_sub(std::time::Duration::from_millis(50))
+            .as_millis();
+        let worst_ms = worst_ms.max(late_ms);
+        let stalls = stalls + u16::from(late_ms >= 100);
+        if late_ms >= 100 {
+            eprintln!("[overlay-host] history/ui-lag: view={label} late_ms={late_ms}");
+        }
+        if remaining > 1 {
+            history_ui_lag_probe(label, remaining - 1, worst_ms, stalls);
+        } else {
+            eprintln!(
+                "[overlay-host] history/ui-lag summary: view={label} samples=200 worst_late_ms={worst_ms} stalls_100ms={stalls}"
+            );
+        }
+    });
+}
+
+fn history_ui_next_turn(label: &'static str, started: std::time::Instant) {
+    slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+        eprintln!(
+            "[overlay-host] history/ui-next-turn: view={label} delay_ms={}",
+            started.elapsed().as_millis()
+        );
+    });
+}
+
 // ============================================================================
 // Session archive (Phase 3a) — browse + FTS-search the SQLite catalog.
 // ============================================================================
@@ -40,6 +74,7 @@ pub(in super::super) fn open_archive(
     rt_handle: &tokio::runtime::Handle,
     slint_rt: &SharedSlintRuntime,
 ) {
+    let archive_started = std::time::Instant::now();
     {
         let slot = archive_ref.borrow();
         if let Some(existing) = slot.as_ref() {
@@ -92,7 +127,12 @@ pub(in super::super) fn open_archive(
 
     // One recordings snapshot for this browse session (v0.17.1 — was a
     // filesystem stat PER ROW per rebuild; see recording_ids_snapshot).
+    let snapshot_started = std::time::Instant::now();
     let recordings = Rc::new(recording_ids_snapshot());
+    eprintln!(
+        "[overlay-host] history/archive snapshot: recordings_ms={}",
+        snapshot_started.elapsed().as_millis()
+    );
 
     // Row wording language, snapshotted for this browse session (mirrors the
     // other per-open snapshots; a language switch applies on the next open).
@@ -113,6 +153,7 @@ pub(in super::super) fn open_archive(
         let active_id_load = active_id.clone();
         let archive_enabled = cfg.read().session_archive_enabled;
         std::thread::spawn(move || {
+            let worker_started = std::time::Instant::now();
             // Reindex SWEEP first (gated on the archive toggle), so the list below
             // catches anything finished since the launch-time sweep.
             if archive_enabled {
@@ -124,6 +165,7 @@ pub(in super::super) fn open_archive(
                     Err(e) => eprintln!("[overlay-host] archive: reindex on open failed: {e:#}"),
                 }
             }
+            let reindex_ms = worker_started.elapsed().as_millis();
             // Open the read handle OFF the event loop (it runs migrations + WAL
             // setup) and build the initial rows from it.
             let opened: Option<Store> = match open_default_store() {
@@ -133,6 +175,8 @@ pub(in super::super) fn open_archive(
                     None
                 }
             };
+            let open_ms = worker_started.elapsed().as_millis() - reindex_ms;
+            let list_started = std::time::Instant::now();
             let initial: Option<(Vec<ArchiveRow>, usize)> = opened.as_ref().map(|st| {
                 let sessions = st.list_sessions().unwrap_or_default();
                 let total = sessions.len();
@@ -146,6 +190,14 @@ pub(in super::super) fn open_archive(
                     .collect();
                 (rows, total)
             });
+            let rows_ms = list_started.elapsed().as_millis();
+            let row_count = initial.as_ref().map_or(0, |(rows, _)| rows.len());
+            let total = initial.as_ref().map_or(0, |(_, total)| *total);
+            eprintln!(
+                "[overlay-host] history/archive worker: reindex_ms={reindex_ms} db_open_ms={open_ms} rows_ms={rows_ms} rows={row_count} total={total} elapsed_ms={}",
+                worker_started.elapsed().as_millis()
+            );
+            let queued = std::time::Instant::now();
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(p) = weak_load.upgrade() else {
                     return;
@@ -154,10 +206,15 @@ pub(in super::super) fn open_archive(
                     Some(s) => *lock_store(&slot_load) = Some(s),
                     None => p.set_unavailable(true),
                 }
+                let apply_started = std::time::Instant::now();
                 if let Some((rows, total)) = initial {
                     p.set_summary(SharedString::from(total.to_string()));
                     p.set_results(ModelRc::new(VecModel::from(rows)));
                 }
+                eprintln!(
+                    "[overlay-host] history/archive UI: queue_ms={} model_set_ms={} rows={row_count}",
+                    queued.elapsed().as_millis(), apply_started.elapsed().as_millis()
+                );
             });
         });
     }
@@ -169,6 +226,7 @@ pub(in super::super) fn open_archive(
         let store_q = store.clone();
         let recordings_q = recordings.clone();
         win.on_query_changed(move |q| {
+            let query_started = std::time::Instant::now();
             let Some(p) = weak.upgrade() else {
                 return;
             };
@@ -206,7 +264,12 @@ pub(in super::super) fn open_archive(
             // so cancel any in-progress edit (else ✓ would persist to whatever
             // session now occupies that row index — a silent mis-rename).
             p.set_renaming_index(-1);
+            let row_count = rows.len();
             p.set_results(ModelRc::new(VecModel::from(rows)));
+            eprintln!(
+                "[overlay-host] history/archive search: query_chars={} rows={row_count} ui_ms={}",
+                q.chars().count(), query_started.elapsed().as_millis()
+            );
         });
     }
 
@@ -219,6 +282,7 @@ pub(in super::super) fn open_archive(
         let state_c = state.clone();
         let wov = weak_overlay.clone();
         win.on_result_activated(move |idx| {
+            let opened_at = std::time::Instant::now();
             let Some(p) = weak.upgrade() else {
                 return;
             };
@@ -227,6 +291,7 @@ pub(in super::super) fn open_archive(
                 return;
             };
             let sid = row.id.to_string();
+            let read_started = std::time::Instant::now();
             let (session, utts, turns) = {
                 let slot = lock_store(&store_a);
                 let Some(st) = slot.as_ref() else {
@@ -238,9 +303,24 @@ pub(in super::super) fn open_archive(
                     st.session_ai_turns(&sid).unwrap_or_default(),
                 )
             };
-            let title = session_title(session.as_ref().and_then(|s| s.started_at_ms), &sid, ru);
-            let md = build_session_markdown(session.as_ref(), &utts, &turns, ru);
+            let read_ms = read_started.elapsed().as_millis();
+            let text_bytes = utts.iter().map(|u| u.text.len()).sum::<usize>()
+                + turns.iter().map(|t| t.question.len() + t.answer.len()).sum::<usize>();
+            let title = session_title(session.as_ref().and_then(|s| s.started_at_ms), &sid);
+            let markdown_started = std::time::Instant::now();
+            let md = build_session_markdown(session.as_ref(), &utts, &turns);
+            let markdown_ms = markdown_started.elapsed().as_millis();
+            eprintln!(
+                "[overlay-host] history/detail: read_ms={read_ms} markdown_ms={markdown_ms} utterances={} ai_turns={} text_bytes={text_bytes} markdown_bytes={}",
+                utts.len(), turns.len(), md.len()
+            );
             spawn_content_tile(&title, "archive", &md, &tiles_c, &state_c, &wov);
+            eprintln!(
+                "[overlay-host] history/detail: total_ui_ms={}",
+                opened_at.elapsed().as_millis()
+            );
+            history_ui_next_turn("detail", opened_at);
+            history_ui_lag_probe("detail", 200, 0, 0);
         });
     }
 
@@ -320,42 +400,17 @@ pub(in super::super) fn open_archive(
                     .map(|u| u.text.clone())
                     .collect()
             };
-            p.set_notice(SharedString::default());
             if lines.is_empty() {
-                show_notice(
-                    &p,
-                    &cfg_g,
-                    "This session has no transcript to make a name from.",
-                    "В этой сессии нет текста, по которому можно придумать название.",
-                );
                 return;
             }
             let ep = cfg_g.read().ai_endpoint(true);
             if !ep.is_local {
-                // local-only naming — never spend cloud money on a title
-                show_notice(
-                    &p,
-                    &cfg_g,
-                    "Names are generated by the local AI only. Choose a local provider in Settings → AI providers.",
-                    "Названия придумывает только локальный AI. Выберите локального провайдера в разделе «Настройки → AI-провайдеры».",
-                );
-                return;
+                return; // local-only naming — never spend cloud money on a title
             }
             let weak2 = weak.clone();
-            let cfg_task = cfg_g.clone();
             rth_g.spawn(async move {
                 let Some(name) = slint_replay::session_namer::generate_name(&ep, &lines).await
                 else {
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(p) = weak2.upgrade() {
-                            show_notice(
-                                &p,
-                                &cfg_task,
-                                "The AI did not return a name. Try again.",
-                                "AI не вернул название. Попробуйте ещё раз.",
-                            );
-                        }
-                    });
                     return;
                 };
                 overlay_backend::session_names::set(
@@ -382,12 +437,10 @@ pub(in super::super) fn open_archive(
     {
         let weak = win.as_weak();
         let active_del = active_id.clone();
-        let cfg_n = cfg.clone();
         win.on_delete_requested(move |idx| {
             let Some(p) = weak.upgrade() else {
                 return;
             };
-            p.set_notice(SharedString::default());
             let results = p.get_results();
             let Some(row) = archive_row_at(&results, idx) else {
                 return;
@@ -396,12 +449,7 @@ pub(in super::super) fn open_archive(
                 return;
             }
             if active_del.as_deref() == Some(row.id.as_str()) {
-                show_notice(
-                    &p,
-                    &cfg_n,
-                    "The session that is running now cannot be deleted.",
-                    "Активную сессию удалить нельзя.",
-                );
+                p.set_retranscribe_status(SharedString::from("Активную сессию удалить нельзя"));
                 return;
             }
             // Show the in-app confirm overlay; the actual delete is in delete-confirmed.
@@ -413,7 +461,6 @@ pub(in super::super) fn open_archive(
         let weak = win.as_weak();
         let store_d = store.clone();
         let active_del = active_id.clone();
-        let cfg_n = cfg.clone();
         win.on_delete_confirmed(move |idx| {
             let Some(p) = weak.upgrade() else {
                 return;
@@ -436,18 +483,12 @@ pub(in super::super) fn open_archive(
             let outcome = {
                 let mut slot = lock_store(&store_d);
                 match slot.as_mut() {
-                    Some(st) => overlay_backend::session_admin::delete_session_everywhere(st, &sid)
-                        .map(|()| st.list_sessions().map(|all| all.len()).ok()),
+                    Some(st) => overlay_backend::session_admin::delete_session_everywhere(st, &sid),
                     None => return,
                 }
             };
             match outcome {
-                Ok(total) => {
-                    // The heading carries the session count; it was set once at
-                    // load and stayed at the old number after a delete.
-                    if let Some(total) = total {
-                        p.set_summary(SharedString::from(total.to_string()));
-                    }
+                Ok(()) => {
                     // (debrief sidecar cleanup lives in delete_session_everywhere)
                     // Rebuild the list (the row is gone); also resets edit-state.
                     let q = p.get_query();
@@ -455,12 +496,9 @@ pub(in super::super) fn open_archive(
                 }
                 Err(e) => {
                     eprintln!("[overlay-host] archive: delete {sid} failed: {e:#}");
-                    show_notice(
-                        &p,
-                        &cfg_n,
-                        "The session could not be deleted (a file may be in use). Try again.",
-                        "Удаление не удалось (возможно, файл занят). Повторите.",
-                    );
+                    p.set_retranscribe_status(SharedString::from(
+                        "Удаление не удалось (файл занят?) — повторите",
+                    ));
                 }
             }
         });
@@ -483,6 +521,7 @@ pub(in super::super) fn open_archive(
         let tslot = transcript_slot.clone();
         let rt_t = rt_handle.clone();
         win.on_transcript_requested(move |idx| {
+            let opened_at = std::time::Instant::now();
             let Some(p) = weak.upgrade() else {
                 return;
             };
@@ -494,6 +533,7 @@ pub(in super::super) fn open_archive(
             if sid.is_empty() {
                 return;
             }
+            let read_started = std::time::Instant::now();
             let (session, utts) = {
                 let slot = lock_store(&store_t);
                 let Some(st) = slot.as_ref() else {
@@ -504,20 +544,18 @@ pub(in super::super) fn open_archive(
                     st.session_utterances(&sid).unwrap_or_default(),
                 )
             };
-            open_transcript(&tslot, session.as_ref(), &utts, &store_t, &rt_t, ru);
-        });
-    }
-
-    {
-        let weak = win.as_weak();
-        let tslot = transcript_slot.clone();
-        win.on_play_recording_requested(move |index| {
-            if let Some(w) = weak.upgrade() {
-                w.invoke_transcript_requested(index);
-                if let Some(transcript) = tslot.borrow().as_ref() {
-                    transcript.invoke_toggle_play();
-                }
-            }
+            let read_ms = read_started.elapsed().as_millis();
+            eprintln!(
+                "[overlay-host] history/transcript read: db_ms={read_ms} utterances={} text_bytes={}",
+                utts.len(), utts.iter().map(|u| u.text.len()).sum::<usize>()
+            );
+            open_transcript(&tslot, session.as_ref(), &utts, &store_t, &rt_t);
+            eprintln!(
+                "[overlay-host] history/transcript: total_ui_ms={}",
+                opened_at.elapsed().as_millis()
+            );
+            history_ui_next_turn("transcript", opened_at);
+            history_ui_lag_probe("transcript", 200, 0, 0);
         });
     }
 
@@ -557,9 +595,7 @@ pub(in super::super) fn open_archive(
             let Some(rt_guard) = try_acquire_busy(&RETRANSCRIBE_BUSY) else {
                 return;
             };
-            let ru = cfg_c.read().ui_is_ru();
             p.set_retranscribe_busy(true);
-            p.set_notice(SharedString::default());
             // ТЗ3 — a session with NO saved recordings can't be re-STT'd, so
             // summarize from the saved catalog transcript, else the journal's
             // ai_request prompts (summary_source). run_meeting_summary spawns its
@@ -575,20 +611,10 @@ pub(in super::super) fn open_archive(
                 let Some(transcript) = src else {
                     drop(rt_guard);
                     p.set_retranscribe_busy(false);
-                    p.set_retranscribe_status(SharedString::default());
-                    show_notice(
-                        &p,
-                        &cfg_c,
-                        "There is not enough saved data to build a summary.",
-                        "Недостаточно данных для сводки.",
-                    );
+                    p.set_retranscribe_status(SharedString::from("Недостаточно данных для сводки"));
                     return;
                 };
-                p.set_retranscribe_status(SharedString::from(if ru {
-                    "Составление сводки…"
-                } else {
-                    "Building summary…"
-                }));
+                p.set_retranscribe_status(SharedString::from("Building summary…"));
                 let weak_done = weak.clone();
                 let cfg_job = cfg_c.clone();
                 let events_job = events_c.clone();
@@ -609,11 +635,7 @@ pub(in super::super) fn open_archive(
                 });
                 return;
             }
-            p.set_retranscribe_status(SharedString::from(if ru {
-                "Запуск…"
-            } else {
-                "starting…"
-            }));
+            p.set_retranscribe_status(SharedString::from("starting…"));
             let weak_job = weak.clone();
             let cfg_job = cfg_c.clone();
             let events_job = events_c.clone();
@@ -636,7 +658,6 @@ pub(in super::super) fn open_archive(
                     events_job,
                     cfg_job,
                     &sid,
-                    ru,
                     &on_progress,
                 )
                 .await;
@@ -732,7 +753,6 @@ pub(in super::super) fn open_archive(
             let Some(p) = weak.upgrade() else {
                 return;
             };
-            p.set_notice(SharedString::default());
             let results = p.get_results();
             let Some(row) = archive_row_at(&results, idx) else {
                 return;
@@ -743,13 +763,10 @@ pub(in super::super) fn open_archive(
             }
             match overlay_backend::conspect::load(&sid).and_then(|c| c.final_summary) {
                 Some(text) if !text.trim().is_empty() => {
-                    let (stealth, ui_is_ru) = {
-                        let c = cfg_c.read();
-                        (c.stealth_enabled, c.ui_is_ru())
-                    };
+                    let stealth = cfg_c.read().stealth_enabled;
                     let _ = events_c.spawn_tile_full(
                         overlay_backend::events::TileSpec {
-                            question: summary_tile_title(row.title.as_str(), ui_is_ru),
+                            question: format!("Сводка · {}", row.title),
                             answer: text,
                             source: "summary".into(),
                             is_translation: false,
@@ -762,12 +779,7 @@ pub(in super::super) fn open_archive(
                     );
                 }
                 _ => {
-                    show_notice(
-                        &p,
-                        &cfg_c,
-                        "The saved summary is empty. Build it again from the session row.",
-                        "Сохранённая сводка пуста. Сформируйте её заново из строки сессии.",
-                    );
+                    p.set_retranscribe_status(SharedString::from("Сводка пуста — нажмите ↻"));
                 }
             }
         });
@@ -875,6 +887,12 @@ pub(in super::super) fn open_archive(
         o.set_archive_open(true);
     }
     *archive_ref.borrow_mut() = Some(win);
+    eprintln!(
+        "[overlay-host] history/archive visible: setup_ui_ms={}",
+        archive_started.elapsed().as_millis()
+    );
+    history_ui_next_turn("archive", archive_started);
+    history_ui_lag_probe("archive", 200, 0, 0);
 }
 
 /// Spawn a standard read-only content tile (shared by the KB palette + the
@@ -889,6 +907,7 @@ pub(super) fn spawn_content_tile(
     state: &slint_replay::app_state::SharedState,
     weak_overlay: &slint::Weak<OverlayBarWindow>,
 ) {
+    let tile_started = std::time::Instant::now();
     let seq = {
         let mut st = match state.lock() {
             Ok(g) => g,
@@ -908,7 +927,12 @@ pub(super) fn spawn_content_tile(
     tile.set_tile_title(SharedString::from(title.to_string()));
     tile.set_source_label(SharedString::from(source_label.to_string()));
     wire_tile_drag(&tile);
-    let blocks: Vec<MarkdownBlock> = markdown::parse(body_md)
+    let parse_started = std::time::Instant::now();
+    let parsed = markdown::parse(body_md);
+    let parse_ms = parse_started.elapsed().as_millis();
+    let parsed_count = parsed.len();
+    let conversion_started = std::time::Instant::now();
+    let blocks: Vec<MarkdownBlock> = parsed
         .into_iter()
         .map(|b| MarkdownBlock {
             kind: b.kind,
@@ -918,23 +942,29 @@ pub(super) fn spawn_content_tile(
             marked: false,
         })
         .collect();
+    let conversion_ms = conversion_started.elapsed().as_millis();
+    let model_started = std::time::Instant::now();
     tile.set_blocks(ModelRc::new(VecModel::from(blocks)));
-    let speaker_id = tile_copy::wire_speak_text(&tile, body_md);
+    let model_set_ms = model_started.elapsed().as_millis();
+    eprintln!(
+        "[overlay-host] history/tile model: source={source_label} markdown_bytes={} parsed_blocks={parsed_count} parse_ms={parse_ms} conversion_ms={conversion_ms} model_set_ms={model_set_ms}",
+        body_md.len()
+    );
 
     let weak_tile = tile.as_weak();
     let vec_for_close = tiles.clone();
     let weak_overlay_close = weak_overlay.clone();
     tile.on_close_clicked(move || {
         if let Some(t) = weak_tile.upgrade() {
-            crate::abort_tile_stream(t.get_tile_id());
-            tile_copy::stop_if_speaking(speaker_id);
-            let sequence = t.get_sequence();
+            let close_hwnd = grab_hwnd(t.window()).ok();
             let _ = t.hide();
             slint_replay::win32::force_hide(t.window());
-            vec_for_close
-                .borrow_mut()
-                .retain(|item| item.get_sequence() != sequence);
-            refresh_open_tiles(&weak_overlay_close, &vec_for_close);
+            if let Some(target) = close_hwnd {
+                vec_for_close
+                    .borrow_mut()
+                    .retain(|item| grab_hwnd(item.window()).ok() != Some(target));
+                refresh_open_tiles(&weak_overlay_close, &vec_for_close);
+            }
         }
     });
     let weak_pin = tile.as_weak();
@@ -954,7 +984,12 @@ pub(super) fn spawn_content_tile(
         }
     });
 
+    let show_started = std::time::Instant::now();
     present_tile_window(&tile);
+    eprintln!(
+        "[overlay-host] history/tile present: source={source_label} show_ms={} total_ui_ms={}",
+        show_started.elapsed().as_millis(), tile_started.elapsed().as_millis()
+    );
     apply_tile_hwnd_with_monitor(&tile);
     tiles.borrow_mut().push(tile);
     refresh_open_tiles(weak_overlay, tiles);
@@ -962,23 +997,6 @@ pub(super) fn spawn_content_tile(
 
 /// Bounds-checked row lookup into the archive results model (mirror of the
 /// palette's `results_index`).
-/// A line the archive shows above the list until the next search or action.
-/// (`retranscribe-status` is drawn only while a job runs, so a message for a
-/// request that could not start has to go here to be seen.)
-fn show_notice(
-    win: &ArchiveWindow,
-    cfg: &overlay_backend::config::SharedConfig,
-    en: &str,
-    ru: &str,
-) {
-    let text = if cfg.read().ui_is_ru() { ru } else { en };
-    win.set_notice(SharedString::from(text));
-}
-
-fn summary_tile_title(title: &str, ui_is_ru: bool) -> String {
-    format!("{} · {title}", if ui_is_ru { "Сводка" } else { "Summary" })
-}
-
 fn archive_row_at(model: &slint::ModelRc<ArchiveRow>, idx: i32) -> Option<ArchiveRow> {
     use slint::Model;
     if idx < 0 {
@@ -1021,12 +1039,12 @@ fn pretty_session_label(id: &str) -> String {
 /// fall back to parsing the id stamp (old rows, FTS hits — which carry only
 /// the id). Both paths convert at DISPLAY time, so ALREADY-RECORDED sessions
 /// show МСК retroactively; ids/dirs stay UTC (opaque join keys).
-fn archive_time_label(started_at_ms: Option<i64>, id: &str, ru: bool) -> String {
+fn archive_time_label(started_at_ms: Option<i64>, id: &str) -> String {
     if let Some(ms) = started_at_ms.filter(|ms| *ms > 0) {
-        return overlay_backend::journal::format_msk_label(ms, ru);
+        return overlay_backend::journal::format_msk_label(ms);
     }
     match overlay_backend::journal::stamp_to_unix_secs(id) {
-        Some(secs) => overlay_backend::journal::format_msk_label((secs as i64) * 1000, ru),
+        Some(secs) => overlay_backend::journal::format_msk_label((secs as i64) * 1000),
         // Not a stamp-shaped id — show it as before rather than guessing.
         None => pretty_session_label(id),
     }
@@ -1077,9 +1095,8 @@ fn recording_ids_snapshot() -> std::collections::HashSet<String> {
 
 /// The archive display title for a session: the persisted session NAME (v0.22.0
 /// `session_names` sidecar) if any, else the МСК time label.
-pub(super) fn session_title(started_at_ms: Option<i64>, id: &str, ru: bool) -> String {
-    overlay_backend::session_names::get(id)
-        .unwrap_or_else(|| archive_time_label(started_at_ms, id, ru))
+pub(super) fn session_title(started_at_ms: Option<i64>, id: &str) -> String {
+    overlay_backend::session_names::get(id).unwrap_or_else(|| archive_time_label(started_at_ms, id))
 }
 
 /// Map an indexed [`Session`] to an archive list row. Counts + status use
@@ -1095,7 +1112,7 @@ fn session_to_row(
     debriefs: &std::collections::HashSet<String>,
     ru: bool,
 ) -> ArchiveRow {
-    let time = archive_time_label(s.started_at_ms, &s.id, ru);
+    let time = archive_time_label(s.started_at_ms, &s.id);
     let name = overlay_backend::session_names::get(&s.id);
     // Prefer the session NAME (v0.22.0) as the row title; fall back to the
     // time. The title carries NO status prefix — an abnormal state is flagged
@@ -1106,7 +1123,7 @@ fn session_to_row(
     } else {
         "Transcript"
     };
-    let ai_word = "AI";
+    let ai_word = if ru { "ИИ" } else { "AI" };
     // Subtitle = time (when a NAME is the title) · transcript count · AI count
     // · model (only when known) · status (only when abnormal).
     let mut parts: Vec<String> = Vec::new();
@@ -1165,7 +1182,7 @@ fn hit_to_row(
     let name = overlay_backend::session_names::get(&h.session_id);
     let label = name
         .clone()
-        .unwrap_or_else(|| archive_time_label(None, &h.session_id, ru));
+        .unwrap_or_else(|| archive_time_label(None, &h.session_id));
     let kind_word = match h.kind.as_str() {
         "question" => {
             if ru {
@@ -1220,19 +1237,15 @@ fn build_session_markdown(
     session: Option<&Session>,
     utterances: &[Utterance],
     ai_turns: &[AiTurn],
-    ru: bool,
 ) -> String {
     let mut out = String::new();
     if let Some(s) = session {
-        out.push_str(&format!(
-            "# {}\n\n",
-            session_title(s.started_at_ms, &s.id, ru)
-        ));
+        out.push_str(&format!("# {}\n\n", session_title(s.started_at_ms, &s.id)));
         // The SAME human wording as the archive rows (the body is Russian,
         // like the rest of this markdown) — no code-like `lines N · ai N`
         // metadata and no "—" dash for an unknown model.
         out.push_str(&format!("Стенограмма: {}", s.transcript_lines));
-        out.push_str(&format!(" · AI: {}", s.ai_turns_count));
+        out.push_str(&format!(" · ИИ: {}", s.ai_turns_count));
         if let Some(model) = s.ai_model.as_deref().filter(|m| !m.is_empty()) {
             out.push_str(&format!(" · {model}"));
         }
@@ -1250,10 +1263,14 @@ fn build_session_markdown(
     // (derived from the session start) and the two-way channel label.
     let session_start = session.and_then(|s| s.started_at_ms).filter(|&ms| ms > 0);
     if utterances.is_empty() {
-        out.push_str("_Стенограмма не сохранена_\n\n");
+        out.push_str("_Транскрипт не сохранён_\n\n");
     } else {
         for (i, u) in utterances.iter().enumerate() {
-            let label = super::tile_copy::transcript_role_label(u.source == "mic", ru);
+            let label = if u.source == "mic" {
+                "Микрофон"
+            } else {
+                "Система"
+            };
             // Collapse internal whitespace/newlines so one utterance = one line.
             let text = overlay_backend::text::collapse_ws(&u.text);
             // F1: start = previous line's timestamp (first = origin); see session_audio.
@@ -1287,12 +1304,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn summary_tile_title_follows_ui_language() {
-        assert_eq!(summary_tile_title("Meeting", false), "Summary · Meeting");
-        assert_eq!(summary_tile_title("Встреча", true), "Сводка · Встреча");
-    }
-
-    #[test]
     fn pretty_label_parses_stem() {
         assert_eq!(
             pretty_session_label("2026-06-04_10-00-00_ab12"),
@@ -1310,42 +1321,21 @@ mod tests {
     fn archive_time_label_prefers_started_at_then_id_then_raw() {
         // Real start time wins (UTC ms → МСК).
         assert_eq!(
-            archive_time_label(Some(1_779_580_800_000), "2026-06-04_09-30-00_zz", true),
+            archive_time_label(Some(1_779_580_800_000), "2026-06-04_09-30-00_zz"),
             "24.05.2026 03:00:00 (МСК)"
         );
         // No indexed time (old rows / FTS hits) → parse the UTC id stamp.
         assert_eq!(
-            archive_time_label(None, "2026-06-04_09-30-00_zz", true),
+            archive_time_label(None, "2026-06-04_09-30-00_zz"),
             "04.06.2026 12:30:00 (МСК)"
         );
         // Zero/garbage started_at_ms falls through to the id.
         assert_eq!(
-            archive_time_label(Some(0), "2026-06-04_09-30-00_zz", true),
+            archive_time_label(Some(0), "2026-06-04_09-30-00_zz"),
             "04.06.2026 12:30:00 (МСК)"
         );
         // Non-stamp id → raw, as before.
-        assert_eq!(archive_time_label(None, "weird", true), "weird");
-    }
-
-    #[test]
-    fn archive_time_label_follows_ui_language() {
-        let id = "2026-06-04_09-30-00_zz";
-        for (started_at_ms, label) in [
-            (Some(1_779_580_800_000), "24.05.2026 03:00:00"),
-            (None, "04.06.2026 12:30:00"),
-            (Some(0), "04.06.2026 12:30:00"),
-        ] {
-            assert_eq!(
-                archive_time_label(started_at_ms, id, true),
-                format!("{label} (МСК)")
-            );
-            assert_eq!(
-                archive_time_label(started_at_ms, id, false),
-                format!("{label} (MSK)")
-            );
-        }
-        assert_eq!(archive_time_label(None, "weird", true), "weird");
-        assert_eq!(archive_time_label(None, "weird", false), "weird");
+        assert_eq!(archive_time_label(None, "weird"), "weird");
     }
 
     #[test]
@@ -1396,7 +1386,7 @@ mod tests {
         );
         // UX-clarity — short LOCALIZED labels instead of code-like metadata.
         assert!(row.subtitle.as_str().contains("Стенограмма: 12"));
-        assert!(row.subtitle.as_str().contains("AI: 3"));
+        assert!(row.subtitle.as_str().contains("ИИ: 3"));
         assert!(row.subtitle.as_str().contains("gemma"));
         assert_eq!(row.meta.as_str(), ""); // zero cost → blank meta
 
@@ -1407,7 +1397,6 @@ mod tests {
             &no_recordings(),
             false,
         );
-        assert!(en.title.as_str().starts_with("24.05.2026 03:00:00 (MSK)"));
         assert!(en.subtitle.as_str().contains("Transcript: 12"));
         assert!(en.subtitle.as_str().contains("AI: 3"));
     }
@@ -1516,7 +1505,7 @@ mod tests {
         assert!(
             en.title
                 .as_str()
-                .starts_with("Search: 04.06.2026 12:30:00 (MSK)"),
+                .starts_with("Search: 04.06.2026 12:30:00 (МСК)"),
             "got {:?}",
             en.title
         );
@@ -1542,14 +1531,14 @@ mod tests {
             latency_ms: None,
             attached_screenshot: false,
         }];
-        let md = build_session_markdown(None, &utts, &turns, true);
+        let md = build_session_markdown(None, &utts, &turns);
         assert!(md.contains("Микрофон: hello there")); // session None → no timecode
         assert!(md.contains("Question: **what is it?**"));
         assert!(md.contains("Answer: an answer."));
     }
 
     #[test]
-    fn session_markdown_transcript_follows_ui_language() {
+    fn session_markdown_transcript_has_timecodes_and_ru_labels() {
         let s = sample_session(); // started_at_ms = Some(1_779_580_800_000)
         let start = 1_779_580_800_000_i64;
         let utts = vec![
@@ -1568,19 +1557,16 @@ mod tests {
                 audio_ms: None,
             },
         ];
-        let md = build_session_markdown(Some(&s), &utts, &[], true);
+        let md = build_session_markdown(Some(&s), &utts, &[]);
         // F1: a line's START = the PREVIOUS line's timestamp; the FIRST line is 00:00
         // (NOT its own finalize time 00:29), so line 2 starts where line 1 ended (00:29).
         assert!(md.contains("[00:00] Система: привет"), "got: {md}");
         assert!(md.contains("[00:29] Микрофон: да слышу"), "got: {md}");
-        let en = build_session_markdown(Some(&s), &utts, &[], false);
-        assert!(en.contains("[00:00] System: привет"), "got: {en}");
-        assert!(en.contains("[00:29] Microphone: да слышу"), "got: {en}");
     }
 
     #[test]
     fn session_markdown_empty_shows_not_saved_notice() {
-        let md = build_session_markdown(None, &[], &[], true);
-        assert!(md.contains("Стенограмма не сохранена"), "got: {md}");
+        let md = build_session_markdown(None, &[], &[]);
+        assert!(md.contains("Транскрипт не сохранён"), "got: {md}");
     }
 }

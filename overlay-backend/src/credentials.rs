@@ -1,8 +1,8 @@
 //! Windows Credential Manager storage for direct cloud-provider API keys.
 //!
 //! Legacy bridge/STT/Hermes secrets intentionally remain in the existing
-//! config format for compatibility. New OpenAI and Anthropic keys never enter
-//! `Config`, config exports, backups, or diagnostics.
+//! config format for compatibility. New OpenAI/Anthropic keys and direct
+//! Codex OAuth tokens never enter `Config`, config exports, backups, or diagnostics.
 
 #[cfg(windows)]
 use anyhow::Context;
@@ -12,6 +12,8 @@ use anyhow::{anyhow, Result};
 pub enum SecretSlot {
     OpenAi,
     Anthropic,
+    CodexDirectAccess,
+    CodexDirectRefresh,
 }
 
 impl SecretSlot {
@@ -20,6 +22,8 @@ impl SecretSlot {
         match self {
             Self::OpenAi => "suflyor/ai/openai/v1",
             Self::Anthropic => "suflyor/ai/anthropic/v1",
+            Self::CodexDirectAccess => "suflyor/ai/codex-direct/access/v1",
+            Self::CodexDirectRefresh => "suflyor/ai/codex-direct/refresh/v1",
         }
     }
 }
@@ -235,6 +239,11 @@ mod tests {
         assert_eq!(SecretSlot::OpenAi.target(), "suflyor/ai/openai/v1");
         assert_eq!(SecretSlot::Anthropic.target(), "suflyor/ai/anthropic/v1");
         assert_ne!(SecretSlot::OpenAi.target(), SecretSlot::Anthropic.target());
+        assert_ne!(
+            SecretSlot::CodexDirectAccess.target(),
+            SecretSlot::CodexDirectRefresh.target()
+        );
+        assert_ne!(SecretSlot::OpenAi.target(), SecretSlot::CodexDirectAccess.target());
     }
 
     #[cfg(unix)]

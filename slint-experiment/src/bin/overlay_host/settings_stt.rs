@@ -15,7 +15,8 @@
 //! NOT moved (different domain, left in `open_settings`): the Audio-device mic
 //! callbacks `on_mic_device_selected` / `on_mic_test_clicked`.
 //!
-//! SECURITY: the STT test-result tile keeps generic messages so
+//! SECURITY (unchanged by this mechanical move): the STT test-result tile keeps
+//! its GENERIC messages (`[ok] …` / `[err] …`, error chain capped at 90 chars) so
 //! no `base_url` / LAN IP leaks into a screen-shared Settings window. The endpoint
 //! resolves via `cfg.stt_backend()` exactly as before.
 //!
@@ -24,6 +25,7 @@
 //! `overlay_backend` config + stt helpers). That is intentional for the move;
 //! imports narrow in a later pass.
 use super::{ComponentHandle, SettingsWindow, SharedString};
+use slint::{Model, ModelRc, VecModel};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -58,6 +60,9 @@ pub(crate) fn stt_provider_index(provider: &str) -> i32 {
     match provider {
         "gigaam" => 1,
         "whisper" => 2,
+        "speechmatics" => 3,
+        "elevenlabs" => 4,
+        "deepgram" => 5,
         _ => 0,
     }
 }
@@ -67,8 +72,28 @@ pub(crate) fn stt_provider_from_index(idx: i32) -> &'static str {
     match idx {
         1 => "gigaam",
         2 => "whisper",
+        3 => "speechmatics",
+        4 => "elevenlabs",
+        5 => "deepgram",
         _ => "cloud",
     }
+}
+
+/// Resolve a fallback selector (0=off; remaining indices are primary + 1).
+fn fallback_index(id: &str) -> i32 {
+    if matches!(id, "cloud" | "gigaam" | "whisper" | "speechmatics" | "elevenlabs" | "deepgram") {
+        stt_provider_index(id) + 1
+    } else { 0 }
+}
+
+pub(crate) fn show_stt_fallbacks(win: &SettingsWindow, cfg: &overlay_backend::config::Config) {
+    let slots = &cfg.stt_fallbacks;
+    let idx = |n: usize| fallback_index(slots.get(n).map(String::as_str).unwrap_or(""));
+    win.set_stt_fallback_1_index(idx(0));
+    win.set_stt_fallback_2_index(idx(1));
+    win.set_stt_fallback_3_index(idx(2));
+    win.set_stt_fallback_4_index(idx(3));
+    win.set_stt_fallback_5_index(idx(4));
 }
 
 fn managed_gigaam_dir() -> PathBuf {
@@ -82,19 +107,6 @@ pub(crate) fn installed_gigaam_dir(saved: &str) -> Option<PathBuf> {
     }
     let managed = managed_gigaam_dir();
     overlay_backend::local_ai::gigaam_model_present(&managed).then_some(managed)
-}
-
-/// A model folder other than the managed install. "Check files" verifies the
-/// managed copy only, so it stays off for such a folder.
-pub(crate) fn is_custom_gigaam_dir(dir: &Path) -> bool {
-    dir != managed_gigaam_dir()
-}
-
-/// Show the GigaAM state of the saved folder on the STT tab.
-fn show_gigaam_state(w: &SettingsWindow, saved: &str) {
-    let installed = installed_gigaam_dir(saved);
-    w.set_stt_gigaam_installed(installed.is_some());
-    w.set_stt_gigaam_custom(installed.as_deref().is_some_and(is_custom_gigaam_dir));
 }
 
 fn format_mebibytes(bytes: u64) -> String {
@@ -137,7 +149,6 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
             w.set_stt_gigaam_install_progress(0.0);
             let weak_done = w.as_weak();
             let cfg_t = cfg_c.clone();
-            let cfg_state = cfg_c.clone();
             let cancel_t = cancel.clone();
             std::thread::spawn(move || {
                 let options = overlay_backend::local_ai::InstallOptions {
@@ -190,12 +201,8 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
                     w.set_stt_gigaam_install_failed(result.is_err() && !cancelled);
                     if let Ok(dir) = result {
                         w.set_stt_gigaam_installed(true);
-                        w.set_stt_gigaam_custom(false);
                         w.set_stt_gigaam_dir_input(SharedString::from(dir));
                         w.set_stt_provider_index(1);
-                    } else {
-                        // A failed check may have removed a damaged file.
-                        show_gigaam_state(&w, &cfg_state.read().stt_gigaam_dir);
                     }
                 });
             });
@@ -224,26 +231,9 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_stt_test_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else { return };
-            w.set_stt_test_result(SharedString::from(if ru {
-                "Проверка…"
-            } else {
-                "Checking…"
-            }));
+            w.set_stt_test_result(SharedString::from("testing…"));
             let backend = cfg_c.read().stt_backend();
-            let local_model = matches!(
-                backend,
-                overlay_backend::config::SttBackendCfg::Gigaam { .. }
-            );
-            // Name the button the tab shows for this folder in the failure text.
-            let action = match installed_gigaam_dir(&cfg_c.read().stt_gigaam_dir) {
-                Some(dir) if is_custom_gigaam_dir(&dir) => {
-                    super::status_copy::GigaamAction::OwnFolder
-                }
-                Some(_) => super::status_copy::GigaamAction::CheckFiles,
-                None => super::status_copy::GigaamAction::Download,
-            };
             let weak_res = w.as_weak();
             std::thread::spawn(move || {
                 let msg = match tokio::runtime::Builder::new_current_thread()
@@ -252,26 +242,11 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
                 {
                     Ok(rt) => {
                         match rt.block_on(overlay_backend::stt::test_connection_backend(&backend)) {
-                            Ok(_) if local_model => if ru {
-                                "Модель загружена, распознавание готово"
-                            } else {
-                                "The model loaded; recognition is ready"
-                            }
-                            .to_string(),
-                            Ok(_) => {
-                                if ru {
-                                    "Подключение работает".to_string()
-                                } else {
-                                    "Connection works".to_string()
-                                }
-                            }
-                            Err(e) if local_model => {
-                                super::status_copy::gigaam_check_failed(ru, &format!("{e:#}"), action)
-                            }
-                            Err(e) => super::status_copy::connection_failed(ru, &format!("{e:#}")),
+                            Ok(s) => format!("[ok] {s}"),
+                            Err(e) => format!("[err] {e:#}").chars().take(90).collect(),
                         }
                     }
-                    Err(e) => super::status_copy::check_not_started(ru, &e),
+                    Err(e) => format!("[err] runtime: {e}"),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak_res.upgrade() {
@@ -290,12 +265,18 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
             let provider = stt_provider_from_index(idx);
             let mut c = cfg_c.write();
             c.stt_provider = provider.to_string();
+            for name in &mut c.stt_fallbacks {
+                if name == provider { name.clear(); }
+            }
+            if let Some(w) = weak.upgrade() { show_stt_fallbacks(&w, &c); }
             if provider == "gigaam" {
                 if let Some(dir) = installed_gigaam_dir(&c.stt_gigaam_dir) {
                     c.stt_gigaam_dir = dir.to_string_lossy().into_owned();
                     if let Some(w) = weak.upgrade() {
-                        w.set_stt_gigaam_dir_input(SharedString::from(c.stt_gigaam_dir.clone()));
-                        show_gigaam_state(&w, &c.stt_gigaam_dir);
+                        w.set_stt_gigaam_dir_input(SharedString::from(
+                            c.stt_gigaam_dir.clone(),
+                        ));
+                        w.set_stt_gigaam_installed(true);
                     }
                 }
             }
@@ -305,6 +286,179 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
                 return;
             }
             diag!("stt_provider -> {provider}");
+            drop(c);
+            if let Some(w) = weak.upgrade() { refresh_active_stt_models(&w, &cfg_c); }
+        });
+    }
+    // The five reserve slots are stored in config.json in explicit priority
+    // order. Selecting a duplicate moves it to the newly chosen position.
+    {
+        let cfg_c = cfg.clone();
+        let weak = win.as_weak();
+        win.on_stt_fallback_changed(move |slot, selected_idx| {
+            if !(0..5).contains(&slot) || !(0..=6).contains(&selected_idx) { return; }
+            let chosen = if selected_idx == 0 { "" }
+                else { stt_provider_from_index(selected_idx - 1) };
+            let mut c = cfg_c.write();
+            let previous = c.stt_fallbacks.clone();
+            c.stt_fallbacks.resize(5, String::new());
+            if !chosen.is_empty() {
+                for (i, name) in c.stt_fallbacks.iter_mut().enumerate() {
+                    if i != slot as usize && name == chosen { name.clear(); }
+                }
+            }
+            c.stt_fallbacks[slot as usize] = if chosen == c.stt_provider { "".into() }
+                else { chosen.to_string() };
+            if let Err(e) = overlay_backend::config::save(&c) {
+                c.stt_fallbacks = previous;
+                eprintln!("[overlay-host] STT fallback save failed: {e:#}");
+            }
+            if let Some(w) = weak.upgrade() { show_stt_fallbacks(&w, &c); }
+        });
+    }
+    // New cloud engines keep independent API keys and model identifiers.
+    // Never emit secret values into logs or Slint-visible properties.
+    {
+        let cfg_c = cfg.clone(); let weak = win.as_weak();
+        win.on_stt_speechmatics_key_save(move |value| {
+            let v = value.trim();
+            if v.is_empty() { return; }
+            let mut c = cfg_c.write(); c.stt_speechmatics_key = v.to_owned();
+            if overlay_backend::config::save(&c).is_ok() {
+                if let Some(w) = weak.upgrade() { w.set_stt_speechmatics_key_status("[ok] stored".into()); }
+                drop(c);
+                if cfg_c.read().stt_provider == "speechmatics" {
+                    if let Some(w) = weak.upgrade() { refresh_active_stt_models(&w, &cfg_c); }
+                }
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone(); let weak = win.as_weak();
+        win.on_stt_elevenlabs_key_save(move |value| {
+            let v = value.trim();
+            if v.is_empty() { return; }
+            let mut c = cfg_c.write(); c.stt_elevenlabs_key = v.to_owned();
+            if overlay_backend::config::save(&c).is_ok() {
+                if let Some(w) = weak.upgrade() { w.set_stt_elevenlabs_key_status("[ok] stored".into()); }
+                drop(c);
+                if cfg_c.read().stt_provider == "elevenlabs" {
+                    if let Some(w) = weak.upgrade() { refresh_active_stt_models(&w, &cfg_c); }
+                }
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone(); let weak = win.as_weak();
+        win.on_stt_deepgram_key_save(move |value| {
+            let v = value.trim();
+            if v.is_empty() { return; }
+            let mut c = cfg_c.write(); c.stt_deepgram_key = v.to_owned();
+            if overlay_backend::config::save(&c).is_ok() {
+                if let Some(w) = weak.upgrade() { w.set_stt_deepgram_key_status("[ok] stored".into()); }
+                drop(c);
+                if cfg_c.read().stt_provider == "deepgram" {
+                    if let Some(w) = weak.upgrade() { refresh_active_stt_models(&w, &cfg_c); }
+                }
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_stt_speechmatics_model_save(move |value| {
+            let v = value.trim(); if v.is_empty() { return; }
+            let mut c = cfg_c.write(); c.stt_speechmatics_model = v.to_owned();
+            let _ = overlay_backend::config::save(&c);
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_stt_elevenlabs_model_save(move |value| {
+            let v = value.trim(); if v.is_empty() { return; }
+            let mut c = cfg_c.write(); c.stt_elevenlabs_model = v.to_owned();
+            let _ = overlay_backend::config::save(&c);
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_stt_deepgram_model_save(move |value| {
+            let v = value.trim(); if v.is_empty() { return; }
+            let mut c = cfg_c.write(); c.stt_deepgram_model = v.to_owned();
+            let _ = overlay_backend::config::save(&c);
+        });
+    }
+
+    // All model combo selections persist immediately, like the Groq model picker.
+    {
+        let weak = win.as_weak(); let cfg_c = cfg.clone();
+        win.on_stt_speechmatics_model_changed(move |index| {
+            let Some(w) = weak.upgrade() else { return; };
+            if index < 0 { return; }
+            let Some(model) = w.get_stt_speechmatics_models().row_data(index as usize) else { return; };
+            let previous = cfg_c.read().stt_speechmatics_model.clone();
+            let mut c = cfg_c.write(); c.stt_speechmatics_model = model.to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                c.stt_speechmatics_model = previous.clone();
+                eprintln!("[overlay-host] speechmatics model save failed: {e:#}");
+                drop(c);
+                let choices = w.get_stt_speechmatics_models();
+                let old_index = choices.iter().position(|m| m.as_str() == previous.as_str()).unwrap_or(0);
+                w.set_stt_speechmatics_model_index(old_index as i32);
+            }
+        });
+    }
+    {
+        let weak = win.as_weak(); let cfg_c = cfg.clone();
+        win.on_stt_speechmatics_models_refresh(move || {
+            if let Some(w) = weak.upgrade() { refresh_stt_models(&w, &cfg_c, "speechmatics"); }
+        });
+    }
+    {
+        let weak = win.as_weak(); let cfg_c = cfg.clone();
+        win.on_stt_elevenlabs_model_changed(move |index| {
+            let Some(w) = weak.upgrade() else { return; };
+            if index < 0 { return; }
+            let Some(model) = w.get_stt_elevenlabs_models().row_data(index as usize) else { return; };
+            let previous = cfg_c.read().stt_elevenlabs_model.clone();
+            let mut c = cfg_c.write(); c.stt_elevenlabs_model = model.to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                c.stt_elevenlabs_model = previous.clone();
+                eprintln!("[overlay-host] elevenlabs model save failed: {e:#}");
+                drop(c);
+                let choices = w.get_stt_elevenlabs_models();
+                let old_index = choices.iter().position(|m| m.as_str() == previous.as_str()).unwrap_or(0);
+                w.set_stt_elevenlabs_model_index(old_index as i32);
+            }
+        });
+    }
+    {
+        let weak = win.as_weak(); let cfg_c = cfg.clone();
+        win.on_stt_elevenlabs_models_refresh(move || {
+            if let Some(w) = weak.upgrade() { refresh_stt_models(&w, &cfg_c, "elevenlabs"); }
+        });
+    }
+    {
+        let weak = win.as_weak(); let cfg_c = cfg.clone();
+        win.on_stt_deepgram_model_changed(move |index| {
+            let Some(w) = weak.upgrade() else { return; };
+            if index < 0 { return; }
+            let Some(model) = w.get_stt_deepgram_models().row_data(index as usize) else { return; };
+            let previous = cfg_c.read().stt_deepgram_model.clone();
+            let mut c = cfg_c.write(); c.stt_deepgram_model = model.to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                c.stt_deepgram_model = previous.clone();
+                eprintln!("[overlay-host] deepgram model save failed: {e:#}");
+                drop(c);
+                let choices = w.get_stt_deepgram_models();
+                let old_index = choices.iter().position(|m| m.as_str() == previous.as_str()).unwrap_or(0);
+                w.set_stt_deepgram_model_index(old_index as i32);
+            }
+        });
+    }
+    {
+        let weak = win.as_weak(); let cfg_c = cfg.clone();
+        win.on_stt_deepgram_models_refresh(move || {
+            if let Some(w) = weak.upgrade() { refresh_stt_models(&w, &cfg_c, "deepgram"); }
         });
     }
     // Cloud recognition model (stt_model): 0=turbo (fast), 1=large-v3 (accurate).
@@ -348,7 +502,6 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
     }
     {
         let cfg_c = cfg.clone();
-        let weak = win.as_weak();
         win.on_stt_gigaam_dir_save(move |v| {
             let trimmed = v.trim().to_string();
             let mut c = cfg_c.write();
@@ -357,9 +510,6 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
             if let Err(e) = overlay_backend::config::save(&c) {
                 eprintln!("[overlay-host] stt_gigaam_dir save failed: {e:#}");
                 return;
-            }
-            if let Some(w) = weak.upgrade() {
-                show_gigaam_state(&w, &trimmed);
             }
             diag!("stt_gigaam_dir saved ({} chars)", trimmed.len());
         });
@@ -405,6 +555,87 @@ pub(crate) fn wire_stt_settings(win: &SettingsWindow, cfg: &overlay_backend::con
     }
 }
 
+
+/// Fetch model choices asynchronously; never place API keys into Slint properties.
+/// A failed refresh preserves the saved model and currently displayed choices.
+pub(crate) fn refresh_active_stt_models(
+    win: &SettingsWindow, cfg: &overlay_backend::config::SharedConfig,
+) {
+    let provider = cfg.read().stt_provider.clone();
+    if matches!(provider.as_str(), "speechmatics" | "elevenlabs" | "deepgram") {
+        refresh_stt_models(win, cfg, &provider);
+    }
+}
+
+fn refresh_stt_models(
+    win: &SettingsWindow, cfg: &overlay_backend::config::SharedConfig, provider: &str,
+) {
+    let (key, saved) = {
+        let c = cfg.read();
+        match provider {
+            "speechmatics" => (c.stt_speechmatics_key.clone(), c.stt_speechmatics_model.clone()),
+            "elevenlabs" => (c.stt_elevenlabs_key.clone(), c.stt_elevenlabs_model.clone()),
+            "deepgram" => (c.stt_deepgram_key.clone(), c.stt_deepgram_model.clone()),
+            _ => return,
+        }
+    };
+    match provider {
+        "speechmatics" => win.set_stt_speechmatics_models_status("Загрузка моделей...".into()),
+        "elevenlabs" => win.set_stt_elevenlabs_models_status("Загрузка моделей...".into()),
+        "deepgram" => win.set_stt_deepgram_models_status("Загрузка моделей...".into()),
+        _ => {}
+    }
+    let provider = provider.to_string();
+    let weak = win.as_weak();
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .map_err(anyhow::Error::from)
+            .and_then(|rt| rt.block_on(overlay_backend::stt::fetch_stt_model_catalog(&provider, &key)));
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(w) = weak.upgrade() else { return; };
+            let (list, selected, status) = match result {
+                Ok(catalog) => {
+                    let mut list = catalog.ids;
+                    // Preserve a previously selected model even if provider's public list
+                    // does not include account-specific or retired models.
+                    let in_catalog = list.contains(&saved);
+                    if !saved.is_empty() && !in_catalog { list.insert(0, saved.clone()); }
+                    let index = list.iter().position(|m| m == &saved).unwrap_or(0) as i32;
+                    let status = if !saved.is_empty() && !in_catalog {
+                        format!("{}; сохранённая модель отсутствует в каталоге", catalog.source)
+                    } else { catalog.source };
+                    (Some(list), index, status)
+                }
+                Err(e) => (None, 0, format!("Не удалось загрузить модели: {e:#}").chars().take(140).collect()),
+            };
+            match provider.as_str() {
+                "speechmatics" => {
+                    if let Some(list) = list {
+                        w.set_stt_speechmatics_models(ModelRc::new(VecModel::from(list.into_iter().map(SharedString::from).collect::<Vec<_>>() )));
+                        w.set_stt_speechmatics_model_index(selected);
+                    }
+                    w.set_stt_speechmatics_models_status(SharedString::from(status));
+                }
+                "elevenlabs" => {
+                    if let Some(list) = list {
+                        w.set_stt_elevenlabs_models(ModelRc::new(VecModel::from(list.into_iter().map(SharedString::from).collect::<Vec<_>>() )));
+                        w.set_stt_elevenlabs_model_index(selected);
+                    }
+                    w.set_stt_elevenlabs_models_status(SharedString::from(status));
+                }
+                "deepgram" => {
+                    if let Some(list) = list {
+                        w.set_stt_deepgram_models(ModelRc::new(VecModel::from(list.into_iter().map(SharedString::from).collect::<Vec<_>>() )));
+                        w.set_stt_deepgram_model_index(selected);
+                    }
+                    w.set_stt_deepgram_models_status(SharedString::from(status));
+                }
+                _ => {}
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -428,10 +659,16 @@ mod tests {
         assert_eq!(stt_provider_index("cloud"), 0);
         assert_eq!(stt_provider_index("gigaam"), 1);
         assert_eq!(stt_provider_index("whisper"), 2);
+        assert_eq!(stt_provider_index("speechmatics"), 3);
+        assert_eq!(stt_provider_index("elevenlabs"), 4);
+        assert_eq!(stt_provider_index("deepgram"), 5);
         assert_eq!(stt_provider_index("retired-provider"), 0);
         assert_eq!(stt_provider_from_index(0), "cloud");
         assert_eq!(stt_provider_from_index(1), "gigaam");
         assert_eq!(stt_provider_from_index(2), "whisper");
+        assert_eq!(stt_provider_from_index(3), "speechmatics");
+        assert_eq!(stt_provider_from_index(4), "elevenlabs");
+        assert_eq!(stt_provider_from_index(5), "deepgram");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::control::{
-    apply_local_no_think, apply_managed_gemma_sampler, apply_prompt_cache, apply_reasoning_effort,
-    http_client, resolve_managed_mlx_endpoint, transport_failure_kind, PROMPT_CACHE,
+    acquire_exclusive_ai, apply_local_no_think, apply_managed_gemma_sampler, apply_prompt_cache,
+    http_client, resolve_managed_mlx_endpoint, transport_failure_kind, AI_SEMAPHORE, PROMPT_CACHE,
 };
 use super::pricing::TokenUsage;
 use super::provider;
@@ -34,14 +34,19 @@ pub async fn complete_with_usage_endpoint(
     messages: Vec<ChatMessage>,
     max_tokens: u32,
 ) -> Result<(String, TokenUsage)> {
+    if endpoint.protocol == AiProtocol::CodexDirect {
+        return crate::codex_direct::complete_turn(endpoint, &messages).await;
+    }
     if endpoint.protocol == AiProtocol::CodexSubscription {
         let model = endpoint.model.clone();
         let reasoning_effort = endpoint.reasoning_effort.clone();
+        let service_tier = endpoint.service_tier.clone();
         return tokio::task::spawn_blocking(move || {
             let mut text = String::new();
             let usage = crate::codex_subscription::run_turn(
                 &model,
                 reasoning_effort.as_deref(),
+                service_tier.as_deref(),
                 &messages,
                 |event| {
                     if let crate::codex_subscription::TurnEvent::Delta { text: delta } = event {
@@ -94,7 +99,10 @@ pub async fn complete_endpoint(
     messages: Vec<ChatMessage>,
     max_tokens: u32,
 ) -> Result<String> {
-    if endpoint.protocol == AiProtocol::CodexSubscription {
+    if matches!(
+        endpoint.protocol,
+        AiProtocol::CodexSubscription | AiProtocol::CodexDirect
+    ) {
         return complete_with_usage_endpoint(endpoint, messages, max_tokens)
             .await
             .map(|(text, _)| text);
@@ -113,61 +121,18 @@ pub async fn complete_endpoint(
     .map(|(text, _)| text)
 }
 
-/// Complete under the two permits already held by `ManagedPrepSession`.
-pub(crate) async fn complete_exclusive(
+pub async fn complete_exclusive(
     base_url: &str,
     bearer: &str,
     model: &str,
     messages: Vec<ChatMessage>,
     max_tokens: u32,
 ) -> Result<String> {
-    complete_with_usage_unlocked(
-        AiProtocol::OpenAiCompatible,
-        base_url,
-        bearer,
-        model,
-        messages,
-        max_tokens,
-        true,
-    )
-    .await
-    .map(|(text, _)| text)
+    let _permit = acquire_exclusive_ai().await?;
+    complete(base_url, bearer, model, messages, max_tokens).await
 }
 
 pub(crate) async fn complete_with_usage_inner(
-    protocol: AiProtocol,
-    base_url: &str,
-    bearer: &str,
-    model: &str,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-    force_no_think: bool,
-) -> Result<(String, TokenUsage)> {
-    check_deep_lock(base_url)?;
-    // Keep the permit through retries, as in v0.38.0.
-    let _permit = super::queue::acquire()
-        .await
-        .map_err(|_| anyhow!("AI request replaced by a newer one"))?;
-    complete_with_usage_unlocked(
-        protocol,
-        base_url,
-        bearer,
-        model,
-        messages,
-        max_tokens,
-        force_no_think,
-    )
-    .await
-}
-
-fn check_deep_lock(base_url: &str) -> Result<()> {
-    if crate::deep_lock::endpoint_blocked(crate::deep_lock::deep_lock_active(), base_url) {
-        return Err(anyhow!(crate::deep_lock::BLOCKED_ERROR));
-    }
-    Ok(())
-}
-
-async fn complete_with_usage_unlocked(
     protocol: AiProtocol,
     base_url: &str,
     bearer: &str,
@@ -180,18 +145,18 @@ async fn complete_with_usage_unlocked(
     let mut last_err = None;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        check_deep_lock(base_url)?;
         let (endpoint, _mlx_lease) = resolve_managed_mlx_endpoint(AiEndpoint {
             protocol,
             base_url: base_url.to_string(),
             bearer: bearer.to_string(),
             model: model.to_string(),
             reasoning_effort: None,
+            service_tier: None,
             is_local: false,
         })
         .await?;
 
-        check_deep_lock(&endpoint.base_url)?;
+        let _permit = AI_SEMAPHORE.acquire().await.ok();
         match complete_once(
             endpoint.protocol,
             &endpoint.base_url,
@@ -230,9 +195,6 @@ async fn complete_with_usage_unlocked(
 }
 
 pub fn is_permanent_ai_error(msg: &str) -> bool {
-    if crate::deep_lock::is_blocked_error(msg) {
-        return true;
-    }
     if let Some(rest) = msg.split("HTTP ").nth(1) {
         let code: u16 = rest
             .chars()
@@ -268,16 +230,11 @@ pub(crate) async fn complete_once(
         && protocol.supports_prompt_cache_control();
     let mut body =
         provider::request_body(protocol, model, &messages, max_tokens, false, prompt_cache)?;
-    apply_reasoning_effort(&mut body, protocol, base_url);
     if protocol == AiProtocol::OpenAiCompatible {
         apply_prompt_cache(&mut body);
         apply_local_no_think(&mut body, force_no_think);
         apply_managed_gemma_sampler(&mut body, base_url, model);
-        if let Some(kind) = super::local_server::known_kind(base_url) {
-            super::local_server::apply_kind_hints(&mut body, kind);
-        }
     }
-    let _done = super::local_server::request_started(base_url, &messages);
 
     log::info!(
         "AI complete → provider (protocol={}, model={}, msgs={})",
@@ -289,18 +246,16 @@ pub(crate) async fn complete_once(
     let request = client
         .post(&url)
         .timeout(std::time::Duration::from_secs(180));
-    let resp = match provider::authorize(request, protocol, bearer)
-        .json(&body)
-        .send()
+    let resp = match crate::network::send(provider::authorize(request, protocol, bearer).json(&body))
         .await
     {
         Ok(r) => r,
-        Err(error) => {
-            // The kind (timeout, connect, ...) carries no address, so the tile
-            // can tell "did not answer in time" from "could not connect".
-            let kind = transport_failure_kind(&error);
-            log::warn!("AI complete transport error ({kind})");
-            return Err(anyhow!("AI connection error ({kind})"));
+        Err(_error) => {
+            log::warn!(
+                "AI complete transport error ({})",
+                "network route failure"
+            );
+            return Err(anyhow!("AI connection error"));
         }
     };
     if !resp.status().is_success() {
@@ -338,12 +293,11 @@ pub async fn count_chat_tokens(
     apply_prompt_cache(&mut body);
     apply_local_no_think(&mut body, true);
     apply_managed_gemma_sampler(&mut body, base_url, model);
-    let response = http_client()
+    let response = crate::network::send(http_client()
         .post(url)
         .timeout(std::time::Duration::from_secs(30))
         .bearer_auth(bearer)
-        .json(&body)
-        .send()
+        .json(&body))
         .await
         .context("count local prompt tokens")?;
     if !response.status().is_success() {

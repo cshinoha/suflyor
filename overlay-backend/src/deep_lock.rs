@@ -45,14 +45,12 @@ pub fn is_blocked_error(msg: &str) -> bool {
 }
 
 /// Pure guard predicate used by [`crate::ai`]: block only when the deep lock
-/// is active AND the target is an app-managed engine (loopback llama.cpp,
-/// Strata on :8090, MLX). Cloud, external Ollama, whisper :8081 and any other
-/// URL pass through untouched.
+/// is active AND the target is the app-managed loopback llama endpoint. Cloud,
+/// external Ollama, whisper :8081 and any other URL pass through untouched.
 #[must_use]
 pub fn endpoint_blocked(deep_lock: bool, base_url: &str) -> bool {
     deep_lock
         && (crate::local_ai::is_managed_llama_endpoint(base_url)
-            || crate::local_ai::is_managed_strata_endpoint(base_url)
             || crate::mlx_runtime::is_owned_endpoint(base_url))
 }
 
@@ -68,8 +66,7 @@ pub const fn lifecycle_launch_allowed(deep_lock: bool, explicit_unlock: bool) ->
 #[must_use]
 pub fn cfg_is_managed_local(cfg: &crate::config::Config) -> bool {
     (cfg.ai_provider == "local"
-        && (crate::local_ai::is_managed_llama_endpoint(&cfg.ai_local_base_url)
-            || crate::local_ai::is_managed_strata_endpoint(&cfg.ai_local_base_url)))
+        && crate::local_ai::is_managed_llama_endpoint(&cfg.ai_local_base_url))
         || (cfg.ai_provider == "mlx" && cfg!(target_os = "macos"))
 }
 
@@ -82,9 +79,6 @@ pub enum LockAction {
     /// Cloud / external (e.g. Ollama) endpoint: the legacy two-state toggle of
     /// `suppress_tiles` only. External processes are never stopped.
     ToggleSuppress,
-    /// Deep lock persisted from a managed local server while the active endpoint
-    /// is no longer one; nothing to start or stop, just clear the flag.
-    ReleaseStaleLock,
     /// Managed local, unlocked → enable listening mode (`suppress_tiles` on).
     EnableListening,
     /// Managed local, listening → enter deep lock: keep `suppress_tiles` on
@@ -117,9 +111,6 @@ pub fn lock_mode_action(
     deep_lock: bool,
     requested: LockMode,
 ) -> LockAction {
-    if !is_managed_local && deep_lock {
-        return LockAction::ReleaseStaleLock;
-    }
     match requested {
         LockMode::Normal if deep_lock => LockAction::Unlock,
         LockMode::Normal if suppress_tiles => LockAction::ToggleSuppress,
@@ -146,11 +137,7 @@ pub fn next_lock_action(
     deep_lock: bool,
 ) -> LockAction {
     if !is_managed_local {
-        return if deep_lock {
-            LockAction::ReleaseStaleLock
-        } else {
-            LockAction::ToggleSuppress
-        };
+        return LockAction::ToggleSuppress;
     }
     if deep_lock {
         LockAction::Unlock
@@ -177,19 +164,19 @@ pub fn state_hint(ru: bool, managed: bool, suppress_tiles: bool, deep_lock: bool
     match (ru, deep_lock, suppress_tiles) {
         (_, true, _) => {
             if ru {
-                "Глубокая блокировка: локальный AI выгружен. Нажмите, чтобы запустить модель и снять блокировку"
+                "Глубокая блокировка: локальный ИИ выгружен. Нажмите, чтобы запустить модель и снять блокировку"
             } else {
                 "Deep lock: local AI is unloaded. Press to start the model and unlock"
             }
         }
         (true, false, true) => {
-            "Режим прослушивания включён. Нажмите ещё раз для глубокой блокировки (локальный AI будет выгружен)"
+            "Режим прослушивания включён. Нажмите ещё раз для глубокой блокировки (локальный ИИ будет выгружен)"
         }
         (false, false, true) => {
             "Listening mode on. Press again to deep-lock (the local AI will be unloaded)"
         }
         (true, false, false) => {
-            "Блокировка тайлов: первое нажатие — режим прослушивания, второе — глубокая блокировка с выгрузкой локального AI"
+            "Блокировка тайлов: первое нажатие — режим прослушивания, второе — глубокая блокировка с выгрузкой локального ИИ"
         }
         (false, false, false) => {
             "Lock tiles: first press enables listening mode, second press deep-locks and unloads the local AI"
@@ -216,15 +203,15 @@ pub fn status_text(ru: bool, status: LockStatus) -> &'static str {
         (false, LockStatus::ListeningOn) => "listening",
         (true, LockStatus::ListeningOff) => "разблокировано",
         (false, LockStatus::ListeningOff) => "unlocked",
-        (true, LockStatus::Unloading) => "выгрузка AI…",
+        (true, LockStatus::Unloading) => "выгрузка ИИ…",
         (false, LockStatus::Unloading) => "unloading AI…",
-        (true, LockStatus::Unloaded) => "AI выгружен",
+        (true, LockStatus::Unloaded) => "ИИ выгружен",
         (false, LockStatus::Unloaded) => "AI unloaded",
         (true, LockStatus::Unlocking) => "запуск модели…",
         (false, LockStatus::Unlocking) => "starting model…",
-        (true, LockStatus::UnlockReady) => "AI готов",
+        (true, LockStatus::UnlockReady) => "ИИ готов",
         (false, LockStatus::UnlockReady) => "AI ready",
-        (true, LockStatus::UnlockFailed) => "не удалось запустить AI",
+        (true, LockStatus::UnlockFailed) => "не удалось запустить ИИ",
         (false, LockStatus::UnlockFailed) => "AI start failed",
     }
 }
@@ -234,7 +221,7 @@ pub fn status_text(ru: bool, status: LockStatus) -> &'static str {
 #[must_use]
 pub fn blocked_notice(ru: bool) -> &'static str {
     if ru {
-        "Локальный AI заблокирован (значок замка на панели). Снимите блокировку, чтобы получать ответы."
+        "Локальный ИИ заблокирован (значок замка на панели). Снимите блокировку, чтобы получать ответы."
     } else {
         "Local AI is deep-locked (the bar's lock chip). Unlock it to get answers."
     }
@@ -251,9 +238,9 @@ pub fn blocked_test_result(ru: bool, msg: &str) -> Option<String> {
 #[must_use]
 pub fn unlock_failed_notice(ru: bool) -> &'static str {
     if ru {
-        "Не удалось запустить локальный AI — блокировка сохранена. Проверьте установку в Настройки → AI-провайдеры и попробуйте ещё раз."
+        "Не удалось запустить локальный ИИ — блокировка сохранена. Проверьте установку в Настройки → AI и попробуйте ещё раз."
     } else {
-        "Couldn't start the local AI — the lock is kept. Check Settings → AI providers and try again."
+        "Couldn't start the local AI — the lock is kept. Check Settings → AI and try again."
     }
 }
 
@@ -288,14 +275,6 @@ mod tests {
             "local",
             "http://127.0.0.1:8080/v1"
         )));
-        // Strata on its own loopback port is an app-managed engine too.
-        assert!(cfg_is_managed_local(&cfg(
-            "local",
-            "http://127.0.0.1:8090/v1"
-        )));
-        assert!(endpoint_blocked(true, "http://127.0.0.1:8090/v1"));
-        assert!(!endpoint_blocked(false, "http://127.0.0.1:8090/v1"));
-        assert!(!endpoint_blocked(true, "http://127.0.0.1:11434/v1"));
         // External Ollama on the same provider stays two-state.
         assert!(!cfg_is_managed_local(&cfg(
             "local",
@@ -342,40 +321,12 @@ mod tests {
             next_lock_action(false, true, false),
             LockAction::ToggleSuppress
         );
-    }
-
-    #[test]
-    fn non_managed_menu_releases_stale_deep_lock_for_every_mode() {
-        for suppress_tiles in [false, true] {
-            for requested in [LockMode::Normal, LockMode::Listening, LockMode::Deep] {
-                assert_eq!(
-                    lock_mode_action(false, suppress_tiles, true, requested),
-                    LockAction::ReleaseStaleLock
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn non_managed_click_releases_stale_deep_lock() {
-        for suppress_tiles in [false, true] {
-            assert_eq!(
-                next_lock_action(false, suppress_tiles, true),
-                LockAction::ReleaseStaleLock
-            );
-        }
-    }
-
-    #[test]
-    fn non_managed_hint_ignores_stale_deep_lock() {
-        for ru in [false, true] {
-            for suppress_tiles in [false, true] {
-                assert_eq!(
-                    state_hint(ru, false, suppress_tiles, true),
-                    state_hint(ru, false, suppress_tiles, false)
-                );
-            }
-        }
+        // Even if a stale deep_lock flag is present, a cloud/external chip
+        // never runs the managed machine.
+        assert_eq!(
+            next_lock_action(false, true, true),
+            LockAction::ToggleSuppress
+        );
     }
 
     #[test]
@@ -458,8 +409,6 @@ mod tests {
             }
         }
         assert_ne!(blocked_notice(true), blocked_notice(false));
-        assert!(unlock_failed_notice(true).contains("Настройки → AI-провайдеры"));
-        assert!(unlock_failed_notice(false).contains("Settings → AI providers"));
         assert_ne!(
             status_text(true, LockStatus::Unloaded),
             status_text(false, LockStatus::Unloaded)

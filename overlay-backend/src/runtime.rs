@@ -43,7 +43,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 mod summary_plan;
-mod terms;
 mod trigger_detect;
 
 #[cfg(test)]
@@ -58,14 +57,9 @@ use summary_plan::{
     SUMMARY_INPUT_BUDGET_CLOUD_CHARS, SUMMARY_INPUT_BUDGET_LOCAL_CHARS, SUMMARY_MAX_TOKENS,
     SUMMARY_PARTIAL_MAX_TOKENS,
 };
-pub use terms::{
-    build_term_prompts, hide_terms_line_while_streaming, new_terms, split_terms_line, term_rows,
-    TERM_DEFINITION_MAX_TOKENS,
-};
 pub use trigger_detect::{
-    build_auto_tile_prompts, build_fast_auto_tile_prompts, detect_trigger,
-    extract_question_candidate, looks_like_real_speech, select_conversation_lines,
-    strip_filler_prefix, Trigger, FAST_ANSWER_FORMAT, FAST_USER_HEAD,
+    build_auto_tile_prompts, detect_trigger, extract_question_candidate, looks_like_real_speech,
+    strip_filler_prefix, Trigger,
 };
 
 /// Post-meeting debrief — run Sonnet over the user's MIC-side
@@ -84,6 +78,41 @@ pub async fn run_post_meeting_debrief(
     transcript: Vec<TranscriptLine>,
     session_id: String,
 ) {
+    let mic_text: String = transcript
+        .iter()
+        .filter(|l| matches!(l.source, AudioSource::Mic))
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    run_post_meeting_debrief_text(events, cfg, mic_text, session_id).await;
+}
+
+/// Retry coaching on the original, persisted MIC transcript. Uses the CURRENT
+/// AI endpoint/settings; does not rerun STT or depend on the live session.
+pub async fn retry_post_meeting_debrief(
+    events: Arc<dyn RuntimeEvents>,
+    cfg: SharedConfig,
+    session_id: String,
+) {
+    let Some(mic_text) = conspect::load_pending_debrief(&session_id) else {
+        log::warn!("post-meeting debrief retry: source missing for session");
+        let msg = if cfg.read().ui_is_ru() {
+            "Повтор невозможен: исходная транскрипция разбора не сохранена."
+        } else {
+            "Cannot retry: original coaching transcript is unavailable."
+        };
+        spawn_debrief_notice(events.as_ref(), &cfg, msg.to_owned());
+        return;
+    };
+    run_post_meeting_debrief_text(events, cfg, mic_text, session_id).await;
+}
+
+async fn run_post_meeting_debrief_text(
+    events: Arc<dyn RuntimeEvents>,
+    cfg: SharedConfig,
+    mic_text: String,
+    session_id: String,
+) {
     let (endpoint, response_language, ui_is_ru, preferred_monitor, stealth) = {
         let c = cfg.read();
         // Resolve the ACTIVE endpoint (local vs cloud) like every other ask path
@@ -99,14 +128,6 @@ pub async fn run_post_meeting_debrief(
             c.stealth_enabled,
         )
     };
-    // Mic-only transcript for "you" coaching. Snapshot is already capped
-    // at TRANSCRIPT_MAX_LINES (=80) upstream so no second cap needed.
-    let mic_text: String = transcript
-        .iter()
-        .filter(|l| matches!(l.source, AudioSource::Mic))
-        .map(|l| l.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
     // Generated coaching follows the AI response language; deterministic tile
     // chrome and notices follow the independent application UI language.
     let is_ru = response_language == "ru";
@@ -129,6 +150,15 @@ pub async fn run_post_meeting_debrief(
          No empty praise, no filler. Respond in English."
             .to_string()
     };
+    // Persist BEFORE the request so an AI failure remains repeatable. Do not
+    // rewrite an identical payload on retry (Windows rename isn't guaranteed to
+    // replace an existing destination).
+    let retryable = !session_id.trim().is_empty()
+        && (conspect::load_pending_debrief(&session_id).as_deref() == Some(mic_text.as_str())
+            || conspect::save_pending_debrief(&session_id, &mic_text));
+    if !session_id.trim().is_empty() && !retryable {
+        log::warn!("post-meeting debrief source could not be persisted; retry unavailable");
+    }
     let messages = vec![
         ai::ChatMessage {
             role: "system".into(),
@@ -139,8 +169,7 @@ pub async fn run_post_meeting_debrief(
             content: ai::MessageContent::Text(mic_text),
         },
     ];
-    let request = ai::complete_endpoint(&endpoint, messages, 1024);
-    let answer = match ai::with_priority(ai::AiPriority::Background, request).await {
+    let answer = match ai::complete_endpoint(&endpoint, messages, 1024).await {
         Ok(text) => text,
         Err(e) => {
             log::warn!("post-meeting debrief AI call failed: {e:#}");
@@ -151,15 +180,23 @@ pub async fn run_post_meeting_debrief(
             let body = if crate::deep_lock::is_blocked_error(&chain) {
                 crate::deep_lock::blocked_notice(ui_is_ru).to_string()
             } else if ui_is_ru {
-                "Не удалось сформировать разбор (ошибка AI). Подробности — в логе («Собрать логи» в Диагностике).".to_string()
+                "Не удалось сформировать разбор (ошибка ИИ). Подробности — в логе («Собрать логи» в Диагностике).".to_string()
             } else {
                 "Couldn't generate the debrief (AI error). Details in the log (Diagnostics → Collect logs).".to_string()
             };
-            spawn_debrief_notice(events.as_ref(), &cfg, body);
+            spawn_debrief_error(
+                events.as_ref(),
+                &cfg,
+                body,
+                retryable.then_some(session_id.clone()),
+            );
             return;
         }
     };
     log::info!("post-meeting debrief landed: {} chars", answer.len());
+    if retryable {
+        conspect::delete_pending_debrief(&session_id);
+    }
     // D — persist the debrief so it's re-viewable in the archive ("Коучинг"
     // button), next to the summary. Empty session_id = ephemeral (test sentinel)
     // → skip. Best-effort: the live tile shows regardless.
@@ -197,6 +234,37 @@ pub async fn run_post_meeting_debrief(
         TileKind::Debrief,
     ) {
         log::warn!("post-meeting debrief tile spawn failed: {e}");
+    }
+}
+
+/// Spawn an error tile with retry metadata only when the transcript was saved.
+/// Uses the existing summary_session carrier; the tile source disambiguates
+/// coaching retry from the meeting-summary retry in the Windows UI.
+fn spawn_debrief_error(
+    events: &dyn RuntimeEvents,
+    cfg: &SharedConfig,
+    body: String,
+    session_id: Option<String>,
+) {
+    let (ui_is_ru, preferred_monitor, stealth) = {
+        let c = cfg.read();
+        (c.ui_is_ru(), c.tile_monitor_name.clone(), c.stealth_enabled)
+    };
+    let monitor_hint = monitor_hint_from(preferred_monitor.as_deref());
+    if let Err(e) = events.spawn_tile_full(
+        TileSpec {
+            question: if ui_is_ru { "Разбор" } else { "Debrief" }.into(),
+            answer: body,
+            source: "debrief".into(),
+            is_translation: false,
+            highlights: vec![],
+            summary_session: session_id,
+        },
+        monitor_hint,
+        stealth,
+        TileKind::Error,
+    ) {
+        log::warn!("post-meeting debrief error tile spawn failed: {e}");
     }
 }
 
@@ -436,7 +504,7 @@ pub async fn retry_meeting_summary(
 }
 
 struct ManagedPrepSession {
-    _ai: ai::AiPermit,
+    _ai: tokio::sync::SemaphorePermit<'static>,
     _lifecycle: tokio::sync::OwnedSemaphorePermit,
     root: std::path::PathBuf,
     model: crate::local_ai::ManagedModel,
@@ -590,16 +658,20 @@ async fn summary_complete(
     if exclusive {
         ai::complete_exclusive(base_url, bearer, model, messages, max_tokens).await
     } else {
-        let endpoint = ai::AiEndpoint {
-            protocol,
-            base_url: base_url.to_string(),
-            bearer: bearer.to_string(),
-            model: model.to_string(),
-            reasoning_effort: None,
-            is_local: false,
-        };
-        let request = ai::complete_endpoint(&endpoint, messages, max_tokens);
-        ai::with_priority(ai::AiPriority::Background, request).await
+        ai::complete_endpoint(
+            &ai::AiEndpoint {
+                protocol,
+                base_url: base_url.to_string(),
+                bearer: bearer.to_string(),
+                model: model.to_string(),
+                reasoning_effort: None,
+                service_tier: None,
+                is_local: false,
+            },
+            messages,
+            max_tokens,
+        )
+        .await
     }
 }
 
@@ -1118,10 +1190,10 @@ fn spawn_summary_error_tile(
 ) {
     let msg = if ui_is_ru {
         "Не получилось составить summary — AI недоступен. \
-         Проверьте Настройки → AI-провайдеры и попробуйте ещё раз."
+         Проверьте Настройки → AI и попробуйте ещё раз."
     } else {
         "Couldn't build the summary — the AI endpoint is unavailable. \
-         Check Settings → AI providers and try again."
+         Check Settings → AI and try again."
     };
     if let Err(e2) = events.spawn_tile_full(
         TileSpec {
@@ -1154,7 +1226,7 @@ fn spawn_summary_error_tile(
 pub struct ReaskInputs {
     /// Last AI question shown to the user. Raw on first F3 of a
     /// session (set by ask/manual_ask/maybe_spawn_tile);
-    /// "Re-ask: …" form on subsequent F3s (set by this port's
+    /// "🔁 reask: …" form on subsequent F3s (set by this port's
     /// own writeback). Required — port short-circuits with
     /// `tile:error` if absent.
     pub last_question: Option<String>,
@@ -1186,22 +1258,6 @@ pub struct ReaskOutcome {
     /// add on the shim side). Zero only if the model returned
     /// zero-token usage (degenerate).
     pub cost_microcents_delta: u64,
-}
-
-/// Title of a re-ask tile, also stored as the new last question. A question
-/// that is already a re-ask keeps its title, so repeated F3 does not stack the
-/// prefix.
-fn reask_title(last_q: &str, is_ru: bool) -> String {
-    let prefix = if is_ru {
-        "Уточнение: "
-    } else {
-        "Re-ask: "
-    };
-    if last_q.starts_with(prefix) {
-        last_q.to_string()
-    } else {
-        format!("{prefix}{last_q}")
-    }
 }
 
 /// F3 Reask: builds a fresh AI call using the LAST question + previous
@@ -1243,6 +1299,7 @@ pub async fn reask_last(
         bearer,
         model,
         reasoning_effort,
+        service_tier,
         is_local,
         response_language,
         ui_is_ru,
@@ -1258,6 +1315,7 @@ pub async fn reask_last(
             ep.bearer,
             ep.model,
             ep.reasoning_effort,
+            ep.service_tier,
             ep.is_local,
             c.response_language.clone(),
             c.ui_is_ru(),
@@ -1330,6 +1388,7 @@ pub async fn reask_last(
         bearer,
         model: model.clone(),
         reasoning_effort,
+        service_tier,
         is_local,
     };
     let (answer, usage) = match ai::complete_with_usage_endpoint(&endpoint, messages, 512).await {
@@ -1367,9 +1426,9 @@ pub async fn reask_last(
                         answer: if crate::deep_lock::is_blocked_error(&format!("{e:#}")) {
                             crate::deep_lock::blocked_notice(ui_is_ru)
                         } else if ui_is_ru {
-                            "Не удалось получить ответ от AI. Проверьте, что выбранный провайдер запущен (Настройки → AI-провайдеры)."
+                            "Не удалось получить ответ от AI. Проверьте, что выбранный провайдер запущен (Настройки → AI)."
                         } else {
-                            "Couldn't get a response from AI. Check that the selected provider is running (Settings → AI providers)."
+                            "Couldn't get a response from AI. Check that the selected provider is running (Settings → AI)."
                         }
                         .into(),
                         source: "reask".into(),
@@ -1389,7 +1448,12 @@ pub async fn reask_last(
     };
     // Local inference is free — don't bill it at the cloud fallback rate
     // (cost_microcents maps an unknown local model id to Sonnet pricing).
-    let micro = if is_local || protocol == ai::AiProtocol::CodexSubscription {
+    let micro = if is_local
+        || matches!(
+            protocol,
+            ai::AiProtocol::CodexSubscription | ai::AiProtocol::CodexDirect
+        )
+    {
         0
     } else {
         ai::cost_microcents(&model, usage.input, usage.output)
@@ -1422,7 +1486,7 @@ pub async fn reask_last(
     // tile chrome is preserved. (Per port #1 review-agent note,
     // a future polish round will give the adapter real per-kind
     // branches.)
-    let display_q = reask_title(&last_q, ui_is_ru);
+    let display_q = format!("🔁 reask: {last_q}");
     let answer_trimmed = answer.trim().to_string();
     if let Err(e) = events.spawn_tile_full(
         TileSpec {
@@ -1518,6 +1582,7 @@ pub async fn manual_spawn_tile(
         bearer,
         model,
         reasoning_effort,
+        service_tier,
         is_local,
         response_language,
         ui_is_ru,
@@ -1534,6 +1599,7 @@ pub async fn manual_spawn_tile(
             ep.bearer,
             ep.model,
             ep.reasoning_effort,
+            ep.service_tier,
             ep.is_local,
             c.response_language.clone(),
             c.ui_is_ru(),
@@ -1589,7 +1655,7 @@ pub async fn manual_spawn_tile(
                 }
                 .into(),
                 answer: if ui_is_ru {
-                    "Стенограмма пустая — нечего спрашивать. Запустите сессию (захват аудио), дождитесь реплик и снова нажмите F6."
+                    "Транскрипт пустой — нечего спрашивать. Запустите сессию (захват аудио), дождитесь реплик и снова нажмите F6."
                 } else {
                     "Transcript is empty — nothing to ask. Start a session (audio capture), wait for lines, then press F6 again."
                 }
@@ -1657,6 +1723,7 @@ pub async fn manual_spawn_tile(
         bearer,
         model: model.clone(),
         reasoning_effort,
+        service_tier,
         is_local,
     };
     let (answer, usage) = match ai::complete_with_usage_endpoint(&endpoint, messages, 512).await {
@@ -1686,9 +1753,9 @@ pub async fn manual_spawn_tile(
                         answer: if crate::deep_lock::is_blocked_error(&format!("{e:#}")) {
                             crate::deep_lock::blocked_notice(ui_is_ru)
                         } else if ui_is_ru {
-                            "Не удалось получить ответ от AI. Проверьте, что выбранный провайдер запущен (Настройки → AI-провайдеры)."
+                            "Не удалось получить ответ от AI. Проверьте, что выбранный провайдер запущен (Настройки → AI)."
                         } else {
-                            "Couldn't get a response from AI. Check that the selected provider is running (Settings → AI providers)."
+                            "Couldn't get a response from AI. Check that the selected provider is running (Settings → AI)."
                         }
                         .into(),
                         source: "manual_spawn".into(),
@@ -1705,7 +1772,12 @@ pub async fn manual_spawn_tile(
     };
     // Local inference is free (see reask_last) — zero it so F6 on a local
     // model doesn't inflate the session cost meter / trip the cap.
-    let micro = if is_local || protocol == ai::AiProtocol::CodexSubscription {
+    let micro = if is_local
+        || matches!(
+            protocol,
+            ai::AiProtocol::CodexSubscription | ai::AiProtocol::CodexDirect
+        )
+    {
         0
     } else {
         ai::cost_microcents(&model, usage.input, usage.output)

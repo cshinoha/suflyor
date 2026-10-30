@@ -28,13 +28,6 @@ pub trait RuntimeEvents: Send + Sync {
     /// "health:update" / "session:started" / "session:stopped".
     fn emit(&self, channel: &str, payload: serde_json::Value);
 
-    /// Whether a streamed placeholder still belongs to the UI. Closing it must
-    /// cancel generation, not just discard rendered deltas. Headless sinks keep
-    /// their existing behavior.
-    fn tile_request_open(&self, _label: &str) -> bool {
-        true
-    }
-
     /// Spawn a tile window with the full set of placement fields.
     /// Returns the assigned tile label/identifier (e.g. "tile-42")
     /// for downstream `pin_tile` / `close_tile` calls. For headless
@@ -79,11 +72,11 @@ pub struct TileSpec {
     /// `spawn_tile_with_highlights` trait method.
     pub highlights: Vec<String>,
     /// v0.18.6 — the meeting-summary session id this tile belongs to, when any.
-    /// Set ONLY on Summary / summary-Error tiles (the resumable-summary path);
-    /// `None` for every other tile kind. On an Error tile a `Some` value makes
-    /// the UI show a working «Повторить» button wired to
-    /// `runtime::retry_meeting_summary`, which resumes from the persisted
-    /// conspect instead of re-mapping or asking the user to paste anything.
+    /// Retry session id for Summary / summary-Error tiles and failed Debrief
+    /// tiles. On Error tiles a `Some` value enables «Повторить». The `source`
+    /// distinguishes the meeting summary (persisted conspect) from the
+    /// post-meeting coaching (persisted mic-side transcript). `None` on other
+    /// kinds and non-retryable notices.
     pub summary_session: Option<String>,
 }
 

@@ -27,12 +27,51 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 /// stores a single per-window filter, so re-installing replaces it (nothing else uses it).
 #[cfg(windows)]
 pub(crate) fn install(win: &slint::Window) {
+    install_with_middle(win, None);
+}
+
+// All kinds of tiles use the same close callback. Winit receives middle clicks
+// before child widgets, so selection and left/right mouse interaction are intact.
+#[cfg(windows)]
+pub(crate) fn install_tile(tile: &crate::ui::TileWindow) {
+    use slint::ComponentHandle;
+    install_with_middle(tile.window(), Some(tile.as_weak()));
+}
+
+#[cfg(windows)]
+fn install_with_middle(
+    win: &slint::Window,
+    middle_close: Option<slint::Weak<crate::ui::TileWindow>>,
+) {
     use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
     use winit::event::{ElementState, WindowEvent};
     use winit::keyboard::Key;
     use winit::platform::scancode::PhysicalKeyExtScancode;
 
-    win.on_winit_window_event(|slint_win, ev| {
+    win.on_winit_window_event(move |slint_win, ev| {
+        if let WindowEvent::MouseInput {
+            button: winit::event::MouseButton::Middle,
+            state: ElementState::Released,
+            ..
+        } = ev {
+            if let Some(tile_weak) = middle_close.as_ref() {
+                let weak = tile_weak.clone();
+                let dispatched = std::time::Instant::now();
+                // Do not drop the Window inside winit event dispatch.
+                let _ = slint::invoke_from_event_loop(move || {
+                    let queue_ms = dispatched.elapsed().as_millis();
+                    if queue_ms >= 16 {
+                        slint_replay::logging::line(&format!(
+                            "[perf] ui.tile.middle_click_queue_ms={queue_ms}"
+                        ));
+                    }
+                    if let Some(tile) = weak.upgrade() {
+                        tile.invoke_close_clicked();
+                    }
+                });
+                return EventResult::PreventDefault;
+            }
+        }
         let WindowEvent::KeyboardInput {
             event,
             is_synthetic: false,
@@ -89,50 +128,14 @@ fn vk_to_letter(vk: u32) -> Option<char> {
         .map(|b| b.to_ascii_lowercase() as char)
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn install(win: &slint::Window) {
-    use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
-    use winit::event::{ElementState, WindowEvent};
-    use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
-    let modifiers = std::cell::Cell::new(ModifiersState::empty());
-    win.on_winit_window_event(move |window, event| {
-        if let WindowEvent::ModifiersChanged(value) = event {
-            modifiers.set(value.state());
-        }
-        let WindowEvent::KeyboardInput {
-            event,
-            is_synthetic: false,
-            ..
-        } = event
-        else {
-            return EventResult::Propagate;
-        };
-        if modifiers.get() != ModifiersState::CONTROL
-            || matches!(&event.logical_key, Key::Character(c) if c.is_ascii())
-        {
-            return EventResult::Propagate;
-        }
-        let text = match event.physical_key {
-            PhysicalKey::Code(KeyCode::KeyA) => "a",
-            PhysicalKey::Code(KeyCode::KeyC) => "c",
-            PhysicalKey::Code(KeyCode::KeyV) => "v",
-            PhysicalKey::Code(KeyCode::KeyX) => "x",
-            PhysicalKey::Code(KeyCode::KeyZ) => "z",
-            PhysicalKey::Code(KeyCode::KeyY) => "y",
-            _ => return EventResult::Propagate,
-        }
-        .into();
-        let event = match event.state {
-            ElementState::Pressed => slint::platform::WindowEvent::KeyPressed { text },
-            ElementState::Released => slint::platform::WindowEvent::KeyReleased { text },
-        };
-        let _ = window.try_dispatch_event(event);
-        EventResult::PreventDefault
-    });
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(windows))]
 pub(crate) fn install(_win: &slint::Window) {}
+
+#[cfg(not(windows))]
+pub(crate) fn install_tile(tile: &crate::ui::TileWindow) {
+    use slint::ComponentHandle;
+    install(tile.window());
+}
 
 #[cfg(test)]
 #[cfg(windows)]

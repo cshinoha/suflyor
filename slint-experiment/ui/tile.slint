@@ -5,7 +5,7 @@
 // CommonMark via slint_replay::markdown::parse() and pushes the
 // resulting Vec<Block> into the `blocks` property.
 
-import { Button, LineEdit, ScrollView, TextEdit, Palette } from "std-widgets.slint";
+import { Button, LineEdit, ListView, TextEdit, Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Metrics } from "metrics.slint";
 import { CloseButton, DragGrip, SelectableText } from "controls.slint";
@@ -24,17 +24,14 @@ export struct MarkdownBlock {
 
 // A2 (ТЗ 2026-07-02) — the quiet «⭐ В память» mark: a MUTED outline star (SVG so it
 // colorizes — the U+2B50 emoji the tester found "too bright" cannot). Accent + full
-// opacity when marked; quiet at rest; full on hover. Click toggles.
+// opacity when marked; muted + dim (0.35) at rest; full on hover. Click toggles.
 component StarMark inherits Rectangle {
     in property <bool> marked;
     // P5: carries whether SHIFT was held, for range-marking. `clicked` gives no modifiers, so latch
     // the shift state on pointer-DOWN and fire it on `clicked` — this keeps proper click semantics
     // (fires only on down+up BOTH in-area; a drag-release-outside or a cancel does NOT toggle).
     callback clicked(bool /* shift */);
-    // 24 px wide target; one text line high so list rows keep their pitch.
-    width: Metrics.space-xl;
-    height: 18px;
-    horizontal-stretch: 0;
+    width: 20px;
     ta := TouchArea {
         property <bool> shift-latched;
         pointer-event(e) => {
@@ -47,7 +44,7 @@ component StarMark inherits Rectangle {
     Image {
         source: @image-url("../assets/icons/star.svg");
         colorize: root.marked ? Theme.accent : Theme.text-muted;
-        opacity: root.marked ? 1.0 : (ta.has-hover ? 1.0 : 0.55);
+        opacity: root.marked ? 1.0 : (ta.has-hover ? 1.0 : 0.35);
         width: 13px;
         height: 13px;
         image-fit: contain;
@@ -59,6 +56,53 @@ component StarMark inherits Rectangle {
 // `SelectableText` (ТЗ 2026-07-03) now lives in controls.slint — shared with the
 // transcript viewer (imported below).
 
+// Fast path for long histories: render plain text while scrolling, but keep
+// the existing text selection/context menu available after clicking a block.
+// The read-only TextInput used by SelectableText is expensive to create on
+// every virtual-row replacement, especially for wrapped Markdown paragraphs.
+component DeferredSelectableText inherits Rectangle {
+    in property <bool> defer-interaction: false;
+    in property <string> text;
+    in property <string> source-text: root.text;
+    in property <length> font-size: 12px;
+    in property <int> font-weight: 400;
+    in property <brush> text-color;
+    in property <TextWrap> wrap: word-wrap;
+    in property <string> mono-family;
+    callback capture(int, int);
+    private property <bool> activated: false;
+
+    // Width-constrained text measurement keeps variable-height ListView rows
+    // stable before and after activation of the original selection control.
+    height: plain.preferred-height;
+    plain := Text {
+        width: parent.width;
+        text: root.text;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        font-family: root.mono-family;
+        color: root.text-color;
+        wrap: root.wrap;
+        vertical-alignment: top;
+        opacity: root.defer-interaction && !root.activated ? 1.0 : 0.0;
+    }
+    if !root.defer-interaction || root.activated : SelectableText {
+        width: parent.width;
+        text: root.text;
+        source-text: root.source-text;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        text-color: root.text-color;
+        wrap: root.wrap;
+        mono-family: root.mono-family;
+        capture(a, b) => { root.capture(a, b); }
+    }
+    if root.defer-interaction && !root.activated : TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated = true; }
+    }
+}
+
 // One row in a tile's «⋯» overflow popup — icon + label, hover-highlighted.
 component TileMenuRow inherits Rectangle {
     in property <image> icon;
@@ -68,9 +112,9 @@ component TileMenuRow inherits Rectangle {
     border-radius: 6px;
     background: rowta.has-hover ? Theme.bg-elevated : transparent;
     HorizontalLayout {
-        padding-left: Metrics.space-sm;
-        padding-right: Metrics.space-md;
-        spacing: Metrics.space-sm;
+        padding-left: 8px;
+        padding-right: 12px;
+        spacing: 8px;
         alignment: start;
         VerticalLayout {
             alignment: center;
@@ -84,7 +128,7 @@ component TileMenuRow inherits Rectangle {
         }
         Text {
             text: root.label;
-            font-size: Metrics.font-label;
+            font-size: 11px;
             color: Theme.text-secondary;
             vertical-alignment: center;
         }
@@ -131,65 +175,10 @@ component TilePlayerButton inherits Rectangle {
     if root.label != "" : Text {
         text: root.label;
         color: root.icon-color;
-        font-size: Metrics.font-caption;
+        font-size: 10px;
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
-    }
-}
-
-// What a tile's trigger badge marks, named by the host (see `trigger-color`).
-export enum TileTone { accent, violet, sky, green, cyan, red, orange }
-
-// One row of term buttons. Slint has no wrapping row, so the host splits the
-// terms into rows that fit the tile.
-export struct TermRow {
-    items: [string],
-}
-
-// A term the listener can open: an outlined pill, filled while it is open.
-component TermChip inherits Rectangle {
-    in property <string> text;
-    in property <bool> current: false;
-    callback clicked();
-
-    accessible-role: button;
-    accessible-label: root.text;
-    height: Metrics.control-sm;
-    width: chip-label.preferred-width + 2 * Metrics.space-sm;
-    horizontal-stretch: 0;
-    border-radius: Metrics.radius-pill;
-    border-width: Metrics.border-thin;
-    border-color: root.current || chip-touch.has-hover ? Theme.on-tint(Theme.cat-violet) : Theme.border-strong;
-    background: root.current ? Theme.tint(Theme.cat-violet) : chip-touch.has-hover ? Theme.bg-elevated : transparent;
-
-    chip-label := Text {
-        text: root.text;
-        font-size: Metrics.font-label;
-        color: root.current ? Theme.on-tint(Theme.cat-violet) : Theme.text-secondary;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    chip-touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-}
-
-component TermRows inherits VerticalLayout {
-    in property <[TermRow]> rows;
-    in property <string> current;
-    callback picked(string);
-
-    spacing: Metrics.space-xs;
-    for row in root.rows: HorizontalLayout {
-        alignment: start;
-        spacing: Metrics.space-xs;
-        for term in row.items: TermChip {
-            text: term;
-            current: term == root.current;
-            clicked => { root.picked(term); }
-        }
     }
 }
 
@@ -212,48 +201,33 @@ export component TileWindow inherits Window {
     min-height: 200px;
 
     in-out property <string> tile-title: "Untitled tile";
-    // The full question an answer replies to, shown wrapped under the header;
-    // the header then shows only the tile number.
-    in-out property <string> question-text: "";
-    // Terms named under the answer, and the chain of definitions opened from
-    // them: term-path is Answer › term › term…, the definition is of its last.
-    in-out property <[TermRow]> answer-terms: [];
-    in-out property <[string]> term-path: [];
-    in-out property <string> term-definition: "";
-    in-out property <[TermRow]> term-subterms: [];
-    in-out property <bool> term-busy: false;
-    // A term clicked under the answer (false) or inside the open definition (true).
-    callback term-opened(string, bool);
-    // Back to the definition at this place in term-path.
-    callback term-crumb(int);
-    callback term-closed();
     in-out property <int> sequence: 0;
     in-out property <[MarkdownBlock]> blocks: [];
     // Source label shown in chrome row (e.g. "ai", "kb", "snippet").
     in-out property <string> source-label: "—";
-    // A notice or an error has nothing worth keeping in memory: no stars.
-    in-out property <bool> plain-notice: false;
     // Phase E6 v12 — trigger badge.
     in-out property <string> trigger-label: "";
-    // The host names the badge category; the hue comes from the theme.
-    in-out property <TileTone> trigger-tone: TileTone.accent;
-    property <color> trigger-color: root.trigger-tone == TileTone.violet ? Theme.cat-violet
-        : root.trigger-tone == TileTone.sky ? Theme.cat-sky
-        : root.trigger-tone == TileTone.green ? Theme.cat-green
-        : root.trigger-tone == TileTone.cyan ? Theme.cat-cyan
-        : root.trigger-tone == TileTone.red ? Theme.cat-red
-        : root.trigger-tone == TileTone.orange ? Theme.cat-orange
-        : Theme.accent;
+    in-out property <color> trigger-color: Theme.accent;
     // Phase E6 v17 — pinned bool: changes pin button visual; Rust
     // toggles on click. Maximize bool: Rust resizes window via Win32.
     in-out property <bool> pinned: false;
     in-out property <bool> tile-maximized: false;
-    // Phase E6 v20 — body opacity (0.5..1.0). Lets the user see
-    // through tiles to the meeting window underneath. Wired to
-    // cfg.tile_body_opacity via Settings → Stealth slider.
-    // Cherry-picked from Anthropic design bundle 2 (only this prop;
-    // no other design changes — see chat thread cycle 26).
+    // Tile background opacity only. 1.0 = opaque, 0.30 = 70% transparent,
+    // 0.0 = hidden mode (the Rust host hides the native window). Text and
+    // controls stay fully opaque so transparency never makes the answer pale.
     in-out property <float> body-opacity: 1.0;
+    // Per-tile reading mode: keep only the answer and a slim restore/drag strip.
+    // Does not change the conversation or discard the draft follow-up text.
+    in-out property <bool> reading-mode: false;
+    in-out property <bool> show-memory-stars: true;
+    callback save-whole-answer();
+    in-out property <int> font-body-size: 15;
+    in-out property <int> font-heading-size: 22;
+    in-out property <int> font-subheading-size: 19;
+    in-out property <int> font-code-size: 13;
+    in-out property <int> font-table-size: 13;
+    in-out property <int> font-alert-size: 14;
+
     // Phase E6 v45 (continue-dialog) — conversation key for this tile.
     // >= 0 means the tile supports follow-up questions (the input row at
     // the bottom is shown). -1 = no dialog (KB / snippet / auto tiles).
@@ -343,8 +317,6 @@ export component TileWindow inherits Window {
     in-out property <string> speak-speed-label: "1.0x";
     // Bound to the follow-up LineEdit so do-submit() can read + clear it.
     in-out property <string> followup-text;
-    // Share one scrollbar gutter with the follow-up row.
-    property <length> content-gutter: Metrics.space-md + Metrics.border-focus;
 
     callback close-clicked();
     callback pin-clicked();
@@ -390,19 +362,37 @@ export component TileWindow inherits Window {
     }
 
     Rectangle {
-        // Near-opaque (was 0.92): at 8% see-through a tile CASCADED behind this
-        // one bled its text through as faint ghosting over the answer (user's
-        // screenshot). 0.98 kills the visible bleed but keeps a hint of depth;
-        // the body-opacity slider below still gives an INTENTIONAL fade.
-        background: Theme.bg-surface.with-alpha(0.98);
+        // The window itself is transparent; the tile body is the background.
+        // Set its opacity without touching text and interactive controls.
+        // Exact background alpha. Do not apply `opacity` to the whole tile:
+        // the answer text and the controls must remain fully opaque.
+        background: Theme.bg-surface.with-alpha(root.body-opacity);
         border-radius: Metrics.radius-control;
-        border-width: Metrics.border-thin;
-        border-color: Theme.border;
-        opacity: root.body-opacity;
+        border-width: root.reading-mode ? 0px : Metrics.border-thin;
+        border-color: Theme.border.with-alpha(root.body-opacity > 0.0 ? 1.0 : 0.0);
+
+        // Background-only drag target. Interactive children (text selection,
+        // scroll area, buttons, follow-up input) are painted above it and
+        // retain their own mouse events. In addition to the title handle,
+        // bare padding and empty parts of the tile may be grabbed.
+        background-drag := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            mouse-cursor: grab;
+            pointer-event(ev) => {
+                if (ev.button == PointerEventButton.left
+                    && ev.kind == PointerEventKind.down) {
+                    root.drag-start-requested();
+                }
+            }
+            moved => {
+                if (self.pressed) { root.drag-moved(); }
+            }
+        }
 
         VerticalLayout {
-            padding: Metrics.space-md;
-            spacing: Metrics.space-sm;
+            padding: root.reading-mode ? 4px : Metrics.space-md;
+            spacing: root.reading-mode ? 2px : Metrics.space-sm;
 
             // ===== Chrome row =====
             // Phase E6 v8 — RESTRUCTURED to fix the "pin/X buttons
@@ -414,7 +404,7 @@ export component TileWindow inherits Window {
             // a sub-Rectangle that only covers the title+spacer
             // region; buttons live OUTSIDE that Rectangle so their
             // internal TouchArea is the only one in the click path.
-            HorizontalLayout {
+            if !root.reading-mode : HorizontalLayout {
                 spacing: Metrics.space-sm;
                 height: 30px;
                 // Title + drag-handle area — stretches to fill
@@ -442,8 +432,8 @@ export component TileWindow inherits Window {
                     }
                     Text {
                         x: 17px;
-                        text: root.question-text != "" ? @tr("#{}", root.sequence) : @tr("#{}  {}", root.sequence, root.tile-title);
-                        font-size: Metrics.font-body;
+                        text: @tr("#{}  {}", root.sequence, root.tile-title);
+                        font-size: root.font-body-size * 1px;
                         font-weight: 700;
                         color: Theme.text-primary;
                         vertical-alignment: center;
@@ -451,31 +441,26 @@ export component TileWindow inherits Window {
                         width: parent.width - 17px;
                     }
                 }
-                // The layout centres the 20px pill on the 30px row; a fixed-height
-                // child placed directly in the row sits at its top.
-                if root.source-label != "" : VerticalLayout {
-                    alignment: center;
+                if root.source-label != "" : Rectangle {
+                    background: transparent;
+                    border-color: Theme.border-strong;
+                    border-width: 1px;
+                    border-radius: 8px;
+                    height: 20px;
                     horizontal-stretch: 0;
                     // Cap + elide: a long source-label (e.g. a full local-model .gguf path)
                     // must NOT push the fixed-width header buttons — including Close — off the
                     // right edge. Bounded here so the window controls always stay visible.
                     max-width: 150px;
-                    Rectangle {
-                        background: transparent;
-                        border-color: Theme.border-strong;
-                        border-width: 1px;
-                        border-radius: Metrics.radius-field;
-                        height: 20px;
-                        HorizontalLayout {
-                            padding-left: 6px;
-                            padding-right: 6px;
-                            Text {
-                                text: root.source-label;
-                                font-size: Metrics.font-caption;
-                                color: Theme.text-muted;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        Text {
+                            text: root.source-label;
+                            font-size: 10px;
+                            color: Theme.text-muted;
+                            vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
                 }
@@ -558,9 +543,9 @@ export component TileWindow inherits Window {
                             background: Theme.bg-elevated;
                             border-color: Theme.border-strong;
                             border-width: 1px;
-                            border-radius: Metrics.radius-field;
+                            border-radius: 8px;
                             VerticalLayout {
-                                padding: Metrics.space-xs;
+                                padding: 4px;
                                 spacing: 2px;
                                 // R1 (retest v0.28.0) — toggle whole-answer «Выделить текст» mode.
                                 TileMenuRow {
@@ -569,6 +554,23 @@ export component TileWindow inherits Window {
                                     clicked => {
                                         root.toggle-select-mode();
                                         overflow-popup.close();
+                                    }
+                                }
+                                if !root.show-memory-stars : TileMenuRow {
+                                    icon: @image-url("../assets/icons/archive.svg");
+                                    label: @tr("Save whole answer to memory");
+                                    clicked => {
+                                        root.save-whole-answer();
+                                        overflow-popup.close();
+                                    }
+                                }
+                                // Hide chrome + follow-up editor in this tile.
+                                // The 16px strip remains so this is always reversible.
+                                TileMenuRow {
+                                    icon: @image-url("../assets/icons/maximize.svg");
+                                    label: @tr("Reading mode");
+                                    clicked => {
+                                        root.reading-mode = true;
                                     }
                                 }
                                 if root.can-regenerate: TileMenuRow {
@@ -680,71 +682,43 @@ export component TileWindow inherits Window {
                 }
             }
 
-            Rectangle {
+            if !root.reading-mode : Rectangle {
                 background: Theme.border;
                 height: 1px;
             }
 
             if root.speak-error : Text {
                 text: @tr("Read-aloud is unavailable. Check the installed voice and try again.");
-                font-size: Metrics.font-label;
+                font-size: 11px;
                 color: Theme.danger;
                 wrap: word-wrap;
-            }
-
-            // ===== Question =====
-            // The whole question, wrapped: the header has room for a few words
-            // only, and the listener has to see what the answer replies to.
-            // A Rectangle does not size to its children: the height comes from
-            // the layout inside, as for the user bubble below.
-            if root.question-text != "" : Rectangle {
-                height: question-layout.preferred-height;
-                vertical-stretch: 0;
-                background: Theme.tint(Theme.cat-sky);
-                border-radius: Metrics.radius-field;
-                question-layout := VerticalLayout {
-                    padding-left: Metrics.space-sm;
-                    padding-right: Metrics.space-sm;
-                    padding-top: Metrics.space-xs;
-                    padding-bottom: Metrics.space-xs;
-                    Text {
-                        text: root.question-text;
-                        font-size: Metrics.font-body;
-                        font-weight: 600;
-                        color: Theme.text-primary;
-                        wrap: word-wrap;
-                        overflow: elide;
-                        max-height: 5 * 16px;
-                    }
-                }
             }
 
             // ===== Trigger badge =====
             // Phase E6 v12 — colored pill below chrome row shows what
             // detector trigger spawned this tile (Keyword "docker",
             // Question "...", every-line). Hidden when trigger-label
-            // is empty (manual F9 ask or F6 spawn) or just repeats the title.
-            if root.trigger-label != ""
-                && root.trigger-label.to-lowercase() != root.tile-title.to-lowercase() : Rectangle {
+            // is empty (manual F9 ask or F6 spawn).
+            if root.trigger-label != "" && !root.reading-mode : Rectangle {
                 height: 22px;
                 horizontal-stretch: 1;
                 HorizontalLayout {
                     alignment: start;
                     Rectangle {
-                        background: Theme.tint(root.trigger-color);
-                        border-color: Theme.on-tint(root.trigger-color);
+                        background: root.trigger-color.with-alpha(0.18);
+                        border-color: root.trigger-color;
                         border-width: 1px;
                         border-radius: 9px;
                         height: 20px;
                         horizontal-stretch: 0;
                         HorizontalLayout {
-                            padding-left: Metrics.space-sm;
-                            padding-right: Metrics.space-sm;
+                            padding-left: 8px;
+                            padding-right: 8px;
                             Text {
                                 text: root.trigger-label;
-                                font-size: Metrics.font-caption;
+                                font-size: 10px;
                                 font-weight: 700;
-                                color: Theme.on-tint(root.trigger-color);
+                                color: root.trigger-color;
                                 vertical-alignment: center;
                             }
                         }
@@ -752,58 +726,55 @@ export component TileWindow inherits Window {
                 }
             }
 
-            // ===== Markdown body (kind-discriminant renderer) =====
-            // Phase E6 fix — viewport-width and explicit Text width
-            // force `wrap: word-wrap` to actually engage. Without the
-            // viewport-width hint, ScrollView lets content render
-            // unconstrained → long Russian paragraphs overflowed the
-            // dark fill area (user complaint "текст выходит за края").
-            if !root.select-mode : ScrollView {
+            // ===== Virtualized Markdown body (kind-discriminant renderer) =====
+            // The archive can contain hundreds of Markdown blocks. A ScrollView
+            // eagerly instantiated every SelectableText/ContextMenuArea, taking
+            // seconds to show the tile and blocking the UI thread afterwards.
+            // ListView only instantiates visible blocks and supports variable
+            // row heights (headings, wrapped paragraphs, code, and tables).
+            if !root.select-mode : ListView {
                 vertical-stretch: 1;
                 horizontal-stretch: 1;
-                viewport-width: self.width;
-                min-height: 0px; // RS2: scroll inside the fixed tile, never grow the window (see below)
-                VerticalLayout {
-                    spacing: Metrics.space-xs;
-                    // Keep the final answer block scrollable above the fixed player.
-                    padding-bottom: root.speak-active ? 44px : 0px;
-                    // A2 fix (retest r2): right inset so the per-block ⭐ gutter clears the
-                    // ScrollView scrollbar on long/scrolling answers (tester: the stars
-                    // "compete with the scroll" and get hard to click).
-                    padding-right: root.content-gutter;
-                    // Per-block wrapper is a LAYOUT, not a bare Rectangle.
-                    // A Rectangle does NOT size its height to non-layout
-                    // children, so long Text blocks collapsed to ~0px and
-                    // painted on top of the next block. A VerticalLayout
-                    // sizes to its one active child → blocks stack cleanly.
-                    // User: "текст наслаивается друг на друге".
-                    for block[i] in root.blocks: VerticalLayout {
+                min-height: 0px;
+                // ListView needs the repeating row as a DIRECT child to
+                // virtualize it; don't wrap the `for` in a VerticalLayout.
+                for block[i] in root.blocks: VerticalLayout {
+                    width: parent.width;
+                    padding-right: root.show-memory-stars ? 14px : 0px; // No star gutter in clean mode.
+                    // Keep the final block scrollable above the player, while
+                    // preserving the old inter-block spacing.
+                    padding-bottom: i == root.blocks.length - 1
+                        ? (root.speak-active ? 44px : 0px)
+                        : Metrics.space-xs;
 
                         // H1
-                        if block.kind == 1 : SelectableText {
+                        if block.kind == 1 : DeferredSelectableText {
+                            defer-interaction: root.blocks.length >= 100;
                             text: block.display-text;
                             source-text: block.text;
-                            font-size: Metrics.font-heading;
+                            font-size: root.font-heading-size * 1px;
                             font-weight: 700;
                             text-color: Theme.text-primary;
                             wrap: word-wrap;
                             capture(a, c) => { root.capture-selection(i, a, c); }
                         }
                         // H2
-                        if block.kind == 2 : SelectableText {
+                        if block.kind == 2 : DeferredSelectableText {
+                            defer-interaction: root.blocks.length >= 100;
                             text: block.display-text;
                             source-text: block.text;
-                            font-size: 15px;
+                            font-size: root.font-subheading-size * 1px;
                             font-weight: 700;
                             text-color: Theme.text-secondary;
                             wrap: word-wrap;
                             capture(a, c) => { root.capture-selection(i, a, c); }
                         }
                         // H3
-                        if block.kind == 3 : SelectableText {
+                        if block.kind == 3 : DeferredSelectableText {
+                            defer-interaction: root.blocks.length >= 100;
                             text: block.display-text;
                             source-text: block.text;
-                            font-size: 13px;
+                            font-size: root.font-subheading-size * 1px;
                             font-weight: 700;
                             text-color: Theme.text-secondary;
                             wrap: word-wrap;
@@ -811,41 +782,43 @@ export component TileWindow inherits Window {
                         }
                         // Paragraph (+ A2 star gutter on the right)
                         if block.kind == 0 : HorizontalLayout {
-                            spacing: Metrics.space-xs;
-                            SelectableText {
+                            spacing: 4px;
+                            DeferredSelectableText {
+                                defer-interaction: root.blocks.length >= 100;
                                 text: block.display-text;
                                 source-text: block.text;
-                                font-size: Metrics.font-body;
+                                font-size: root.font-body-size * 1px;
                                 text-color: Theme.text-secondary;
                                 wrap: word-wrap;
                                 horizontal-stretch: 1;
                                 capture(a, c) => { root.capture-selection(i, a, c); }
                             }
-                            if !root.plain-notice : StarMark {
+                            if root.show-memory-stars : StarMark {
                                 marked: block.marked;
                                 clicked(shift) => { root.toggle-block-marked(i, shift); }
                             }
                         }
                         // Bullet
                         if block.kind == 4 : HorizontalLayout {
-                            padding-left: Metrics.space-md;
+                            padding-left: 12px;
                             spacing: Metrics.space-sm;
                             Text {
                                 text: "•";
-                                font-size: Metrics.font-body;
+                                font-size: root.font-body-size * 1px;
                                 color: Theme.accent;
                                 width: 10px;
                             }
-                            SelectableText {
+                            DeferredSelectableText {
+                                defer-interaction: root.blocks.length >= 100;
                                 text: block.display-text;
                                 source-text: block.text;
-                                font-size: Metrics.font-body;
+                                font-size: root.font-body-size * 1px;
                                 text-color: Theme.text-secondary;
                                 wrap: word-wrap;
                                 horizontal-stretch: 1;
                                 capture(a, c) => { root.capture-selection(i, a, c); }
                             }
-                            if !root.plain-notice : StarMark {
+                            if root.show-memory-stars : StarMark {
                                 marked: block.marked;
                                 clicked(shift) => { root.toggle-block-marked(i, shift); }
                             }
@@ -862,17 +835,18 @@ export component TileWindow inherits Window {
                             border-color: Theme.accent.with-alpha(0.55);
                             user-layout := VerticalLayout {
                                 padding: Metrics.space-sm;
-                                spacing: Metrics.space-xs;
+                                spacing: 4px;
                                 Text {
                                     text: @tr("You");
-                                    font-size: Metrics.font-caption;
+                                    font-size: 10px;
                                     font-weight: 700;
                                     color: Theme.accent;
                                 }
-                                SelectableText {
+                                DeferredSelectableText {
+                                    defer-interaction: root.blocks.length >= 100;
                                     text: block.display-text;
                                     source-text: block.text;
-                                    font-size: Metrics.font-body;
+                                    font-size: root.font-body-size * 1px;
                                     text-color: Theme.text-primary;
                                     wrap: word-wrap;
                                     capture(a, c) => { root.capture-selection(i, a, c); }
@@ -881,16 +855,13 @@ export component TileWindow inherits Window {
                         }
                         // Code block
                         if block.kind == 5 && block.lang != "user" : Rectangle {
-                            height: code-layout.preferred-height;
-                            vertical-stretch: 0;
-                            background: Theme.code-bg;
+                            background: Theme.code-bg.with-alpha(root.body-opacity >= 0.99 ? 1.0 : 0.14 * root.body-opacity);
                             border-radius: 4px;
                             border-width: 1px;
                             border-color: Theme.border;
                             clip: true;
-                            code-layout := VerticalLayout {
+                            VerticalLayout {
                                 padding: Metrics.space-sm;
-                                padding-right: 0px;
                                 spacing: Metrics.space-xs;
                                 // Header: language label (left) + per-block copy
                                 // button (right). The button copies THIS block's
@@ -925,7 +896,7 @@ export component TileWindow inherits Window {
                                             y: (parent.height - self.height) / 2;
                                         }
                                     }
-                                    StarMark {
+                                    if root.show-memory-stars : StarMark {
                                         marked: block.marked;
                                         clicked(shift) => { root.toggle-block-marked(i, shift); }
                                     }
@@ -934,17 +905,15 @@ export component TileWindow inherits Window {
                                 // don't reflow and lose meaning; long lines
                                 // clip at the box edge (clip:true) — maximize
                                 // the tile (maximize button) to read them in full.
-                                HorizontalLayout {
-                                    padding-right: Metrics.space-sm;
-                                    SelectableText {
-                                        text: block.display-text;
-                                        source-text: block.text;
-                                        font-size: Metrics.font-label;
-                                        text-color: Theme.code-text;
-                                        mono-family: Theme.font-mono;
-                                        wrap: no-wrap;
-                                        capture(a, c) => { root.capture-selection(i, a, c); }
-                                    }
+                                DeferredSelectableText {
+                                    defer-interaction: root.blocks.length >= 100;
+                                    text: block.display-text;
+                                    source-text: block.text;
+                                    font-size: root.font-code-size * 1px;
+                                    text-color: Theme.code-text;
+                                    mono-family: Theme.font-mono;
+                                    wrap: no-wrap;
+                                    capture(a, c) => { root.capture-selection(i, a, c); }
                                 }
                             }
                         }
@@ -953,21 +922,77 @@ export component TileWindow inherits Window {
                             background: Theme.border;
                             height: 1px;
                         }
-                        // Table (kind 7) — aligned monospace block (#109).
-                        // no-wrap preserves column alignment; very wide
-                        // tables clip on the right rather than scrambling
-                        // (maximize the tile to see them in full).
-                        if block.kind == 7 : Rectangle {
-                            background: Theme.code-bg;
-                            border-radius: 4px;
+                        // GitHub-style Alerts. Keep one virtual row per alert.
+                        if block.kind >= 8 && block.kind <= 12 : Rectangle {
+                            height: alert-body.preferred-height + 12px;
+                            background: Theme.bg-elevated.with-alpha(root.body-opacity >= 0.99 ? 1.0 : 0.14 * root.body-opacity);
                             border-width: 1px;
                             border-color: Theme.border;
+                            border-radius: 6px;
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                padding-right: 8px;
+                                spacing: 8px;
+                                Rectangle {
+                                    width: 3px;
+                                    background: block.kind == 9 ? Theme.success
+                                        : block.kind == 11 ? Theme.warning
+                                        : block.kind == 12 ? Theme.danger
+                                        : Theme.accent;
+                                }
+                                alert-body := VerticalLayout {
+                                    spacing: 3px;
+                                    Text {
+                                        text: block.kind == 8 ? "NOTE"
+                                            : block.kind == 9 ? "TIP"
+                                            : block.kind == 10 ? "IMPORTANT"
+                                            : block.kind == 11 ? "WARNING" : "CAUTION";
+                                        color: block.kind == 9 ? Theme.success
+                                            : block.kind == 11 ? Theme.warning
+                                            : block.kind == 12 ? Theme.danger
+                                            : Theme.accent;
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                    }
+                                    DeferredSelectableText {
+                                        defer-interaction: root.blocks.length >= 100;
+                                        text: block.display-text;
+                                        source-text: block.text;
+                                        font-size: root.font-alert-size * 1px;
+                                        text-color: Theme.text-primary;
+                                        wrap: word-wrap;
+                                        horizontal-stretch: 1;
+                                        capture(a, c) => { root.capture-selection(i, a, c); }
+                                    }
+                                }
+                            }
+                        }
+                        // Compact comparison table: highlighted header, aligned data.
+                        // The full raw text stays available for copy/memory.
+                        if block.kind == 7 : Rectangle {
+                            background: Theme.code-bg.with-alpha(root.body-opacity >= 0.99 ? 1.0 : 0.14 * root.body-opacity);
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            clip: true;
                             VerticalLayout {
                                 padding: Metrics.space-sm;
-                                SelectableText {
+                                spacing: 2px;
+                                Text {
+                                    text: block.lang;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    font-family: Theme.font-mono;
+                                    color: Theme.text-primary;
+                                    wrap: no-wrap;
+                                    overflow: elide;
+                                }
+                                DeferredSelectableText {
+                                    defer-interaction: root.blocks.length >= 100;
                                     text: block.display-text;
                                     source-text: block.text;
-                                    font-size: Metrics.font-label;
+                                    font-size: root.font-table-size * 1px;
                                     text-color: Theme.code-text;
                                     mono-family: Theme.font-mono;
                                     wrap: no-wrap;
@@ -975,94 +1000,6 @@ export component TileWindow inherits Window {
                                 }
                             }
                         }
-                    }
-                    // Terms the listener may not know; a click opens the
-                    // definition below the answer.
-                    if root.answer-terms.length > 0 : VerticalLayout {
-                        padding-top: Metrics.space-sm;
-                        spacing: Metrics.space-xs;
-                        Text {
-                            text: @tr("Terms");
-                            font-size: Metrics.font-caption;
-                            color: Theme.text-muted;
-                        }
-                        TermRows {
-                            rows: root.answer-terms;
-                            current: root.term-path.length > 0 ? root.term-path[0] : "";
-                            picked(term) => { root.term-opened(term, false); }
-                        }
-                    }
-                }
-            }
-
-            // ===== Definition of the open term =====
-            // Stays in view under the answer; its own terms go one level deeper,
-            // the path above goes back.
-            if root.term-path.length > 0 && !root.select-mode : Rectangle {
-                // Half of a default tile at most; a fixed size (not the
-                // window's height) so the window layout does not depend on itself.
-                height: min(card-layout.preferred-height, 180px);
-                vertical-stretch: 0;
-                background: Theme.bg-elevated;
-                border-radius: Metrics.radius-field;
-                border-width: Metrics.border-thin;
-                border-color: Theme.border;
-                clip: true;
-                card-layout := VerticalLayout {
-                    padding: Metrics.space-sm;
-                    spacing: Metrics.space-xs;
-                    HorizontalLayout {
-                        spacing: Metrics.space-xs;
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            clip: true;
-                            height: 22px;
-                            HorizontalLayout {
-                                alignment: start;
-                                spacing: Metrics.space-xs;
-                                for crumb[i] in root.term-path: HorizontalLayout {
-                                    spacing: Metrics.space-xs;
-                                    if i > 0 : Text {
-                                        text: "›";
-                                        font-size: Metrics.font-label;
-                                        color: Theme.text-muted;
-                                        vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: crumb;
-                                        max-width: 140px;
-                                        overflow: elide;
-                                        font-size: Metrics.font-label;
-                                        font-weight: i == root.term-path.length - 1 ? 700 : 400;
-                                        color: i == root.term-path.length - 1 ? Theme.text-primary : Theme.accent;
-                                        vertical-alignment: center;
-                                        TouchArea {
-                                            enabled: i < root.term-path.length - 1;
-                                            mouse-cursor: self.enabled ? pointer : default;
-                                            clicked => { root.term-crumb(i); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        CloseButton {
-                            box: 22px;
-                            glyph: 12px;
-                            a11y: @tr("Close the definition");
-                            clicked => { root.term-closed(); }
-                        }
-                    }
-                    Text {
-                        text: root.term-definition != "" ? root.term-definition : root.term-busy ? "…" : "";
-                        font-size: Metrics.font-body;
-                        color: Theme.text-secondary;
-                        wrap: word-wrap;
-                        overflow: elide;
-                    }
-                    if root.term-subterms.length > 0 && !root.term-busy : TermRows {
-                        rows: root.term-subterms;
-                        picked(term) => { root.term-opened(term, true); }
-                    }
                 }
             }
 
@@ -1081,7 +1018,7 @@ export component TileWindow inherits Window {
                 text: root.select-text;
                 read-only: true;
                 wrap: word-wrap;
-                font-size: Metrics.font-body;
+                font-size: root.font-body-size * 1px;
                 key-pressed(e) => {
                     if (e.modifiers.control && !e.modifiers.shift) {
                         if (e.text == "с" || e.text == "С") { self.copy(); return accept; }
@@ -1095,7 +1032,7 @@ export component TileWindow inherits Window {
             // marked. N==1 exposes the edit buffer (trim-before-save, the flow the
             // tester accepted on the transcript); N>1 saves each marked block as its
             // own fact (edit later in Настройки → Память).
-            if root.marked-count >= 1 || root.capture-pending : VerticalLayout {
+            if (root.show-memory-stars && root.marked-count >= 1) || root.capture-pending : VerticalLayout {
                 spacing: Metrics.space-xs;
                 // Editor: the single-mark trim buffer OR a pending selection. A BOUNDED, scrollable
                 // multi-line TextEdit (was a LineEdit) — a big captured selection is editable + scrolls
@@ -1138,20 +1075,20 @@ export component TileWindow inherits Window {
             // to Settings or another tile.
             if root.speak-active : Rectangle {
                 height: 60px;
-                background: Theme.bg-elevated;
+                background: Theme.bg-elevated.with-alpha(root.body-opacity >= 0.99 ? 1.0 : 0.14 * root.body-opacity);
                 border-color: Theme.border-strong;
                 border-width: 1px;
                 border-radius: 7px;
                 VerticalLayout {
-                    padding-top: Metrics.space-sm;
-                    padding-bottom: Metrics.space-sm;
-                    padding-left: Metrics.space-sm;
-                    padding-right: Metrics.space-sm;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    padding-left: 8px;
+                    padding-right: 8px;
                     spacing: 3px;
                     Text {
                         text: root.speak-loading ? @tr("Preparing voice...") : @tr("Reading aloud");
                         color: root.speak-loading ? Theme.accent : Theme.text-muted;
-                        font-size: Metrics.font-caption;
+                        font-size: 10px;
                         overflow: elide;
                         vertical-alignment: center;
                         height: 11px;
@@ -1160,7 +1097,7 @@ export component TileWindow inherits Window {
                         height: 30px;
                         transport := HorizontalLayout {
                             horizontal-stretch: 0;
-                            spacing: Metrics.space-xs;
+                            spacing: 4px;
                             TilePlayerButton {
                                 label: "-10";
                                 quiet: true;
@@ -1204,7 +1141,7 @@ export component TileWindow inherits Window {
                                 Text {
                                     text: root.speak-speed-label;
                                     color: Theme.text-secondary;
-                                    font-size: Metrics.font-caption;
+                                    font-size: 10px;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -1223,8 +1160,7 @@ export component TileWindow inherits Window {
             // (F9 / push-to-record answers; convo-id >= 0). Enter or the
             // → button sends; both are disabled while the answer streams.
             // User: "нет возможности продолжить диалог в рамках тайла".
-            if root.convo-id >= 0 : HorizontalLayout {
-                padding-right: root.content-gutter;
+            if root.convo-id >= 0 && !root.reading-mode : HorizontalLayout {
                 spacing: Metrics.space-sm;
                 LineEdit {
                     placeholder-text: @tr("Continue the dialog…");
@@ -1322,6 +1258,30 @@ export component TileWindow inherits Window {
                         root.do-submit();
                     }
                 }
+            }
+        }
+        // Borderless reading mode: no header row or 16px strip.
+        // A small overlay control restores full controls without taking layout space.
+        if root.reading-mode : Rectangle {
+            x: parent.width - 27px;
+            y: 3px;
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            background: reading-restore.has-hover ? Theme.bg-elevated : Theme.bg-surface.with-alpha(0.65);
+            accessible-role: button;
+            accessible-label: @tr("Restore tile controls");
+            Image {
+                source: @image-url("../assets/icons/restore.svg");
+                colorize: Theme.text-secondary;
+                width: 14px;
+                height: 14px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+            reading-restore := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.reading-mode = false; }
             }
         }
     }

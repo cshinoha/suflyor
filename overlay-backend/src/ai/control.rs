@@ -4,8 +4,11 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-pub async fn acquire_exclusive_ai() -> Result<super::queue::AiPermit> {
-    super::queue::acquire_exclusive()
+pub(crate) static AI_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+pub async fn acquire_exclusive_ai() -> Result<tokio::sync::SemaphorePermit<'static>> {
+    AI_SEMAPHORE
+        .acquire_many(2)
         .await
         .map_err(|_| anyhow!("AI request queue closed"))
 }
@@ -60,41 +63,6 @@ pub(crate) fn apply_prompt_cache(body: &mut Value) {
                 }]);
             }
         }
-    }
-}
-
-/// Reasoning level per (protocol, base URL) of the remote profiles, set from
-/// the config at start and on every change in Settings.
-static REASONING_EFFORTS: std::sync::RwLock<Vec<(AiProtocol, String, String)>> =
-    std::sync::RwLock::new(Vec::new());
-
-pub fn set_reasoning_efforts(efforts: Vec<(AiProtocol, String, String)>) {
-    *REASONING_EFFORTS.write().unwrap_or_else(|p| p.into_inner()) = efforts;
-}
-
-/// Add the configured reasoning level for this endpoint to a request body:
-/// `reasoning_effort` for Chat Completions, `reasoning.effort` for Responses.
-/// Other protocols and endpoints without a level are left unchanged.
-pub(crate) fn apply_reasoning_effort(body: &mut Value, protocol: AiProtocol, base_url: &str) {
-    let url = base_url.trim().trim_end_matches('/');
-    let efforts = REASONING_EFFORTS.read().unwrap_or_else(|p| p.into_inner());
-    let Some((_, _, effort)) = efforts
-        .iter()
-        .find(|(p, u, _)| *p == protocol && u.trim_end_matches('/') == url)
-    else {
-        return;
-    };
-    let Some(obj) = body.as_object_mut() else {
-        return;
-    };
-    match protocol {
-        AiProtocol::OpenAiCompatible => {
-            obj.insert("reasoning_effort".to_string(), json!(effort));
-        }
-        AiProtocol::OpenAiResponses => {
-            obj.insert("reasoning".to_string(), json!({ "effort": effort }));
-        }
-        AiProtocol::AnthropicMessages | AiProtocol::CodexSubscription => {}
     }
 }
 

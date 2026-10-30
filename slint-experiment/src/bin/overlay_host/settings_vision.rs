@@ -11,7 +11,8 @@
 //! same bodies, byte-for-byte identical behavior. `open_settings` now only
 //! CALLS `wire_vision_settings(&win, cfg)` at the same spot.
 //!
-//! SECURITY: the vision test-result tile keeps generic messages so
+//! SECURITY (unchanged by this mechanical move): the vision test-result tile
+//! keeps its GENERIC messages (`[ok] …` / `[err] …` / `[--] vision is off`) so
 //! no `base_url` / LAN IP leaks into a screen-shared Settings window. The
 //! endpoint resolves via `cfg.vision_endpoint()` exactly as before.
 //!
@@ -20,25 +21,6 @@
 //! `overlay_backend` config + ai helpers). That is intentional for the move;
 //! imports narrow in a later pass.
 use super::{ComponentHandle, SettingsWindow, SharedString};
-
-/// The direct API profile that "Same as the answer model" stands for when the
-/// answers go through OpenAI or Anthropic. The Vision entries for those APIs
-/// already reuse the key, address and model from AI providers, so choosing
-/// "same" saves that entry instead of asking for the connection again.
-pub(crate) fn same_choice_direct_provider(
-    c: &overlay_backend::config::Config,
-) -> Option<&'static str> {
-    match c.ai_provider.as_str() {
-        "openai" => Some("openai"),
-        "anthropic" => Some("anthropic"),
-        _ => None,
-    }
-}
-
-/// Whether "Same as the answer model" can be chosen for screenshots.
-pub(crate) fn same_choice_available(c: &overlay_backend::config::Config) -> bool {
-    c.same_text_model_accepts_images_declared() || same_choice_direct_provider(c).is_some()
-}
 
 pub(crate) fn vision_provider_index_from_id(provider: &str) -> i32 {
     match provider {
@@ -84,10 +66,7 @@ pub(crate) fn wire_vision_settings(
                     return;
                 }
             }
-            let direct_same = (idx == 1)
-                .then(|| same_choice_direct_provider(&cfg_c.read()))
-                .flatten();
-            let provider = direct_same.unwrap_or(match idx {
+            let provider = match idx {
                 0 => "off",
                 1 => "same",
                 2 => "cloud",
@@ -96,7 +75,7 @@ pub(crate) fn wire_vision_settings(
                 5 => "anthropic",
                 6 => "codex",
                 _ => "off",
-            });
+            };
             let (leaving_mlx, text_uses_mlx) = {
                 let current = cfg_c.read();
                 (
@@ -104,7 +83,10 @@ pub(crate) fn wire_vision_settings(
                     current.ai_provider == "mlx",
                 )
             };
-            if leaving_mlx && !text_uses_mlx && !overlay_backend::mlx_runtime::stop_if_idle() {
+            if leaving_mlx
+                && !text_uses_mlx
+                && !overlay_backend::mlx_runtime::stop_if_idle()
+            {
                 if let Some(window) = weak.upgrade() {
                     window.set_vision_provider_index(6);
                 }
@@ -115,6 +97,11 @@ pub(crate) fn wire_vision_settings(
                 c.vision_provider = provider.to_string();
                 if provider == "same" && c.ai_provider == "codex" {
                     c.codex_vision_model = c.codex_model.clone();
+                    c.codex_vision_smart_model = if c.codex_smart_model.trim().is_empty() {
+                        c.codex_model.clone()
+                    } else {
+                        c.codex_smart_model.clone()
+                    };
                 }
                 // Re-apply the selected model's projector invariant so choosing
                 // "same" cannot route F8 to a managed text-only server.
@@ -128,7 +115,7 @@ pub(crate) fn wire_vision_settings(
                 }
                 c.vision_provider.clone()
             };
-            if saved_provider != provider || direct_same.is_some() {
+            if saved_provider != provider {
                 if let Some(w) = weak.upgrade() {
                     w.set_vision_provider_index(vision_provider_index_from_id(&saved_provider));
                 }
@@ -196,6 +183,16 @@ pub(crate) fn wire_vision_settings(
     }
     {
         let cfg_c = cfg.clone();
+        win.on_vision_smart_model_save(move |v| {
+            let mut c = cfg_c.write();
+            c.vision_smart_model = v.trim().to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] vision_smart_model save failed: {e:#}");
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
         win.on_vision_local_base_url_save(move |v| {
             let mut c = cfg_c.write();
             c.vision_local_base_url = v.trim().to_string();
@@ -225,6 +222,105 @@ pub(crate) fn wire_vision_settings(
         });
     }
     {
+        let cfg_c = cfg.clone();
+        win.on_vision_local_smart_model_save(move |v| {
+            let mut c = cfg_c.write();
+            c.vision_local_smart_model = v.trim().to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] vision_local_smart_model save failed: {e:#}");
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_vision_openai_model_save(move |v| {
+            let mut c = cfg_c.write();
+            c.openai_vision_model = v.trim().to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] openai_vision_model save failed: {e:#}");
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_vision_openai_smart_model_save(move |v| {
+            let mut c = cfg_c.write();
+            c.openai_vision_smart_model = v.trim().to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] openai_vision_smart_model save failed: {e:#}");
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_vision_anthropic_model_save(move |v| {
+            let mut c = cfg_c.write();
+            c.anthropic_vision_model = v.trim().to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] anthropic_vision_model save failed: {e:#}");
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        win.on_vision_anthropic_smart_model_save(move |v| {
+            let mut c = cfg_c.write();
+            c.anthropic_vision_smart_model = v.trim().to_string();
+            if let Err(e) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] anthropic_vision_smart_model save failed: {e:#}");
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        let weak = win.as_weak();
+        win.on_vision_capture_mode_changed(move |index| {
+            let mut c = cfg_c.write();
+            c.vision_capture_mode = if index == 1 { "manual".into() } else { "saved".into() };
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] vision_capture_mode save failed");
+            }
+            if let Some(window) = weak.upgrade() {
+                window.set_vision_capture_region_configured(c.vision_capture_region.is_some());
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        let weak = win.as_weak();
+        win.on_vision_capture_source_changed(move |index| {
+            let mut c = cfg_c.write();
+            c.vision_capture_source = if index == 1 && cfg!(windows) { "window".into() } else { "screen".into() };
+            // A rectangle is relative to its source, so changing source invalidates it.
+            c.vision_capture_region = None;
+            c.vision_capture_window_title.clear();
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] vision_capture_source save failed");
+            }
+            if let Some(window) = weak.upgrade() {
+                window.set_vision_capture_source_index(if c.vision_capture_source == "window" { 1 } else { 0 });
+                window.set_vision_capture_region_configured(false);
+                window.set_vision_capture_window_title(SharedString::from(""));
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        let weak = win.as_weak();
+        win.on_vision_capture_reset(move || {
+            let mut c = cfg_c.write();
+            c.vision_capture_region = None;
+            c.vision_capture_window_title.clear();
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] vision capture reset save failed");
+            }
+            if let Some(window) = weak.upgrade() {
+                window.set_vision_capture_region_configured(false);
+                window.set_vision_capture_window_title(SharedString::from(""));
+            }
+        });
+    }
+    {
         // Vision connection test — resolve the vision endpoint, then send the
         // SYNTHETIC test image (never the user's screen) so this actually
         // exercises the IMAGE path, not just text reachability. Off-thread so the
@@ -233,21 +329,13 @@ pub(crate) fn wire_vision_settings(
         let weak = win.as_weak();
         win.on_vision_test_clicked(move || {
             let Some(w) = weak.upgrade() else { return };
+            w.set_vision_test_result(SharedString::from("testing…"));
             let (ep, ui_is_ru) = {
                 let c = cfg_c.read();
                 (c.vision_endpoint(), c.ui_is_ru())
             };
-            w.set_vision_test_result(SharedString::from(if ui_is_ru {
-                "Проверка…"
-            } else {
-                "Checking…"
-            }));
             let Some(ep) = ep else {
-                w.set_vision_test_result(SharedString::from(if ui_is_ru {
-                    "Анализ скриншотов выключен"
-                } else {
-                    "Screenshot analysis is off"
-                }));
+                w.set_vision_test_result(SharedString::from("[--] vision is off"));
                 return;
             };
             let weak_res = w.as_weak();
@@ -258,29 +346,17 @@ pub(crate) fn wire_vision_settings(
                 {
                     Ok(rt) => {
                         match rt.block_on(overlay_backend::vision::test_connection_endpoint(ep)) {
-                            Ok(_) => {
-                                if ui_is_ru {
-                                    "Подключение работает".to_string()
-                                } else {
-                                    "Connection works".to_string()
-                                }
-                            }
+                            Ok(s) => format!("[ok] {s}"),
                             Err(e) => {
                                 let chain = format!("{e:#}");
-                                if overlay_backend::deep_lock::is_blocked_error(&chain) {
-                                    overlay_backend::deep_lock::blocked_notice(ui_is_ru).to_string()
-                                } else {
-                                    super::status_copy::connection_failed(ui_is_ru, &chain)
-                                }
+                                overlay_backend::deep_lock::blocked_test_result(ui_is_ru, &chain)
+                                    .unwrap_or_else(|| {
+                                        format!("[err] {chain}").chars().take(90).collect()
+                                    })
                             }
                         }
                     }
-                    Err(_) => if ui_is_ru {
-                        "Не удалось запустить проверку"
-                    } else {
-                        "Could not start the check"
-                    }
-                    .to_string(),
+                    Err(e) => format!("[err] runtime: {e}"),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak_res.upgrade() {
@@ -350,27 +426,6 @@ pub(crate) fn wire_vision_settings(
         });
     }
 
-    {
-        let weak = win.as_weak();
-        win.on_diar_engine_selected(move |use_nemotron| {
-            let Some(w) = weak.upgrade() else { return };
-            if w.get_diar_installing() {
-                return;
-            }
-            let engine = overlay_backend::diarize::DiarEngine::from_id(if use_nemotron {
-                "nemotron3"
-            } else {
-                "pyannote"
-            });
-            if let Err(error) = overlay_backend::diarize::save_engine(engine) {
-                log::warn!("diarization preference: {error}");
-                return;
-            }
-            w.set_diar_use_nemotron(engine == overlay_backend::diarize::DiarEngine::Nemotron3);
-            w.set_diar_models_installed(overlay_backend::diarize::engine_ready(engine));
-            w.set_diar_install_status(SharedString::default());
-        });
-    }
     // ===== Speaker-diarization models — download-on-demand install button =====
     // Two SHA-pinned models (~32 MB) on a worker thread, mirroring the OCR/voice
     // installers. Once installed, «Определить говорящих» in the transcript window is
@@ -385,12 +440,6 @@ pub(crate) fn wire_vision_settings(
             if w.get_diar_installing() {
                 return;
             }
-            let engine =
-                overlay_backend::diarize::DiarEngine::from_id(if w.get_diar_use_nemotron() {
-                    "nemotron3"
-                } else {
-                    "pyannote"
-                });
             w.set_diar_installing(true);
             w.set_diar_install_status(slint::SharedString::from("Подготовка…"));
             let weak_done = w.as_weak();
@@ -414,7 +463,7 @@ pub(crate) fn wire_vision_settings(
                     });
                 };
                 let cancel = std::sync::atomic::AtomicBool::new(false);
-                let result = overlay_backend::diarize::install_engine(engine, &cancel, &on);
+                let result = overlay_backend::diar_install::install_models(&cancel, &on);
                 if let Err(e) = &result {
                     diag!("[overlay-host] diarization models install failed: {e:#}");
                 }
@@ -428,7 +477,7 @@ pub(crate) fn wire_vision_settings(
                             "Не удалось установить — проверьте интернет и повторите.",
                         ));
                     } else {
-                        w.set_diar_models_installed(overlay_backend::diarize::engine_ready(engine));
+                        w.set_diar_models_installed(true);
                         // Clear the status so the localized @tr("Speaker models are
                         // installed.") confirmation renders (not the RU progress literal).
                         w.set_diar_install_status(slint::SharedString::default());
@@ -441,26 +490,7 @@ pub(crate) fn wire_vision_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        same_choice_available, same_choice_direct_provider, vision_provider_index_from_id,
-    };
-
-    #[test]
-    fn same_choice_reuses_the_direct_api_profile() {
-        let mut c = overlay_backend::config::Config::defaults();
-        c.ai_provider = "openai".into();
-        assert_eq!(same_choice_direct_provider(&c), Some("openai"));
-        assert!(same_choice_available(&c));
-        c.ai_provider = "anthropic".into();
-        assert_eq!(same_choice_direct_provider(&c), Some("anthropic"));
-        c.ai_provider = "cloud".into();
-        assert_eq!(same_choice_direct_provider(&c), None);
-        assert!(!same_choice_available(&c));
-        c.ai_provider = "local".into();
-        c.ai_local_vision = true;
-        assert_eq!(same_choice_direct_provider(&c), None);
-        assert!(same_choice_available(&c));
-    }
+    use super::vision_provider_index_from_id;
 
     #[test]
     fn vision_provider_ids_match_the_shared_settings_catalog() {

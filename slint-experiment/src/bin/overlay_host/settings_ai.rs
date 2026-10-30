@@ -32,7 +32,9 @@
 //! `on_check_updates_clicked`, `on_install_update_clicked`), and the STT /
 //! Vision blocks (already extracted to their own modules).
 //!
-//! SECURITY: the AI bridge / local tests keep generic messages so no `base_url` /
+//! SECURITY (unchanged by this mechanical move): the AI bridge / local
+//! test-result tiles keep their GENERIC messages (`[ok] …` / `[err] …` capped
+//! at 90 chars for the bridge, `[--] …` for the local test) so no `base_url` /
 //! LAN IP leaks into a screen-shared Settings window. `ai_base_url` saves log
 //! presence (char count) only, never the value.
 //!
@@ -41,8 +43,8 @@
 //! `diag!` macro / `populate_token_status` / the `overlay_backend` config + ai
 //! helpers). That is intentional for the move; imports narrow in a later pass.
 use super::{
-    active_stack_label, populate_token_status, refresh_local_engine_state, refresh_lock_chip,
-    ComponentHandle, ModelRc, OverlayBarWindow, SettingsWindow, SharedString, VecModel,
+    active_stack_label, populate_token_status, refresh_lock_chip, ComponentHandle, ModelRc,
+    OverlayBarWindow, SettingsWindow, SharedString, VecModel,
 };
 use slint::Model;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,6 +104,29 @@ fn catalog_is_authoritative(state: &overlay_backend::codex_subscription::Account
     )
 }
 
+fn reasoning_options(
+    model: Option<&overlay_backend::codex_subscription::CodexModel>,
+    saved: &str,
+    is_ru: bool,
+) -> (Vec<String>, Vec<SharedString>, usize, String) {
+    let mut ids = vec![String::new()];
+    if let Some(model) = model {
+        ids.extend(model.reasoning_efforts.iter().cloned());
+    }
+    let default_effort = model
+        .and_then(|model| model.default_reasoning_effort.as_deref())
+        .unwrap_or(if is_ru { "по настройке модели" } else { "model default" });
+    let mut labels = vec![SharedString::from(if is_ru {
+        format!("По умолчанию ({default_effort})")
+    } else {
+        format!("Default ({default_effort})")
+    })];
+    labels.extend(ids.iter().skip(1).map(|effort| SharedString::from(reasoning_label(effort, is_ru))));
+    let selected = ids.iter().position(|effort| effort == saved).unwrap_or(0);
+    let normalized = ids.get(selected).cloned().unwrap_or_default();
+    (ids, labels, selected, normalized)
+}
+
 fn reasoning_normalization_notice(
     saved: &str,
     normalized: &str,
@@ -144,35 +169,16 @@ fn copy_codex_user_code<E>(
 fn codex_copy_status(result: CodexCopyResult, is_ru: bool) -> &'static str {
     match (result, is_ru) {
         (CodexCopyResult::Empty, _) => "",
-        (CodexCopyResult::Copied, true) => "Код скопирован",
-        (CodexCopyResult::Copied, false) => "Code copied",
-        (CodexCopyResult::Failed, true) => "Не удалось скопировать",
-        (CodexCopyResult::Failed, false) => "Copy failed",
+        (CodexCopyResult::Copied, true) => "[ok] Код скопирован",
+        (CodexCopyResult::Copied, false) => "[ok] Code copied",
+        (CodexCopyResult::Failed, true) => "[err] Не удалось скопировать",
+        (CodexCopyResult::Failed, false) => "[err] Copy failed",
     }
-}
-
-/// Reasoning levels offered for the bridge and the OpenAI profile, in the
-/// order of the Settings list. The empty first entry sends nothing.
-pub(crate) const REASONING_LEVELS: [&str; 6] = ["", "none", "minimal", "low", "medium", "high"];
-
-pub(crate) fn reasoning_level_from_index(index: i32) -> &'static str {
-    usize::try_from(index)
-        .ok()
-        .and_then(|i| REASONING_LEVELS.get(i))
-        .copied()
-        .unwrap_or("")
-}
-
-/// Index of a saved level in `REASONING_LEVELS`; unknown text reads as default.
-pub(crate) fn reasoning_level_index(level: &str) -> i32 {
-    REASONING_LEVELS
-        .iter()
-        .position(|l| *l == level.trim())
-        .map_or(0, |i| i as i32)
 }
 
 pub(crate) fn invalidate_codex_login_ui() -> u64 {
     overlay_backend::codex_subscription::cancel_pending_login();
+    overlay_backend::codex_direct::cancel_pending_login();
     CODEX_SNAPSHOT_UI_GENERATION.fetch_add(1, Ordering::SeqCst);
     CODEX_LOGIN_UI_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
@@ -196,24 +202,116 @@ fn codex_account_label(
     use overlay_backend::codex_subscription::AccountState;
     match state {
         AccountState::NotInstalled if is_ru => {
-            "Codex app-server не найден — установите официальный Codex".into()
+            "[--] Codex app-server не найден — установите официальный Codex".into()
         }
-        AccountState::NotInstalled => "Codex app-server not found — install official Codex".into(),
-        AccountState::SignedOut if is_ru => "выход выполнен".into(),
-        AccountState::SignedOut => "signed out".into(),
-        AccountState::SignInRequired if is_ru => "требуется вход".into(),
-        AccountState::SignInRequired => "sign-in required".into(),
+        AccountState::NotInstalled => {
+            "[--] Codex app-server not found — install official Codex".into()
+        }
+        AccountState::SignedOut if is_ru => "[--] выход выполнен".into(),
+        AccountState::SignedOut => "[--] signed out".into(),
+        AccountState::SignInRequired if is_ru => "[--] требуется вход".into(),
+        AccountState::SignInRequired => "[--] sign-in required".into(),
         AccountState::SignedIn { plan } if is_ru => plan.as_ref().map_or_else(
-            || "вход через ChatGPT выполнен".into(),
-            |plan| format!("вход через ChatGPT выполнен ({plan})"),
+            || "[ok] вход через ChatGPT выполнен".into(),
+            |plan| format!("[ok] вход через ChatGPT выполнен ({plan})"),
         ),
         AccountState::SignedIn { plan } => plan.as_ref().map_or_else(
-            || "signed in with ChatGPT".into(),
-            |plan| format!("signed in with ChatGPT ({plan})"),
+            || "[ok] signed in with ChatGPT".into(),
+            |plan| format!("[ok] signed in with ChatGPT ({plan})"),
         ),
-        AccountState::Error if is_ru => "Не удалось проверить аккаунт Codex".into(),
-        AccountState::Error => "Could not query the Codex account".into(),
+        AccountState::Error if is_ru => "[err] не удалось проверить аккаунт Codex".into(),
+        AccountState::Error => "[err] could not query the Codex account".into(),
     }
+}
+
+fn dispatch_codex_login_event(
+    event: overlay_backend::codex_subscription::LoginEvent,
+    worker_weak: slint::Weak<SettingsWindow>,
+    worker_cfg: overlay_backend::config::SharedConfig,
+    generation: u64,
+    direct_transport: bool,
+) {
+    use overlay_backend::codex_subscription::{AccountState, LoginEvent};
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(window) = worker_weak.upgrade() else {
+            return;
+        };
+        if !codex_ui_is_current(generation) {
+            return;
+        }
+        let is_ru = worker_cfg.read().ui_is_ru();
+        match event {
+            LoginEvent::AwaitingUser {
+                verification_url,
+                user_code,
+            } => {
+                window.set_codex_login_url(SharedString::from(verification_url));
+                window.set_codex_user_code(SharedString::from(user_code));
+                window.set_codex_copy_status(SharedString::default());
+                window.set_codex_auth_status(SharedString::from(if is_ru {
+                    "Откройте страницу входа и введите показанный код"
+                } else {
+                    "Open the sign-in page and enter the shown code"
+                }));
+            }
+            LoginEvent::SignedIn { plan } => {
+                let state = AccountState::SignedIn { plan };
+                window.set_codex_auth_busy(false);
+                window.set_codex_login_url(SharedString::default());
+                window.set_codex_user_code(SharedString::default());
+                window.set_codex_copy_status(SharedString::default());
+                window.set_codex_auth_status(SharedString::from(codex_account_label(
+                    &state, is_ru,
+                )));
+                refresh_codex_account_status(window.as_weak(), worker_cfg);
+            }
+            LoginEvent::SignInRequired => {
+                window.set_codex_auth_busy(false);
+                window.set_codex_login_url(SharedString::default());
+                window.set_codex_user_code(SharedString::default());
+                window.set_codex_copy_status(SharedString::default());
+                window.set_codex_auth_status(SharedString::from(if is_ru {
+                    "[--] вход не завершён — повторите подключение"
+                } else {
+                    "[--] sign-in not completed — connect again"
+                }));
+            }
+            LoginEvent::NotInstalled => {
+                window.set_codex_auth_busy(false);
+                window.set_codex_login_url(SharedString::default());
+                window.set_codex_user_code(SharedString::default());
+                window.set_codex_copy_status(SharedString::default());
+                window.set_codex_auth_status(SharedString::from(if direct_transport {
+                    if is_ru {
+                        "[err] Прямой OAuth ChatGPT недоступен"
+                    } else {
+                        "[err] Direct ChatGPT OAuth is unavailable"
+                    }
+                } else if is_ru {
+                    "[err] Codex CLI не найден. Установите официальный Codex или задайте CODEX_CLI_PATH на native codex.exe"
+                } else {
+                    "[err] Codex CLI not found. Install official Codex or set CODEX_CLI_PATH to the native codex.exe"
+                }));
+            }
+            LoginEvent::Error => {
+                window.set_codex_auth_busy(false);
+                window.set_codex_login_url(SharedString::default());
+                window.set_codex_user_code(SharedString::default());
+                window.set_codex_copy_status(SharedString::default());
+                window.set_codex_auth_status(SharedString::from(if direct_transport {
+                    if is_ru {
+                        "[err] Не удалось выполнить прямой вход ChatGPT OAuth"
+                    } else {
+                        "[err] Direct ChatGPT OAuth failed"
+                    }
+                } else if is_ru {
+                    "[err] Codex найден, но app-server не запустился или несовместим"
+                } else {
+                    "[err] Codex was found, but app-server could not start or is incompatible"
+                }));
+            }
+        }
+    });
 }
 
 pub(crate) fn refresh_codex_account_status(
@@ -228,43 +326,89 @@ pub(crate) fn refresh_codex_account_status(
         let (
             is_ru,
             saved,
+            saved_smart,
             saved_effort,
+            saved_smart_effort,
+            saved_fast,
+            saved_smart_fast,
             saved_vision,
+            saved_vision_smart,
+            saved_vision_effort,
+            saved_vision_smart_effort,
+            saved_vision_fast,
+            saved_vision_smart_fast,
             saved_ai_provider,
             saved_vision_provider,
             baseline_same_available,
+            direct_transport,
         ) = {
             let c = cfg.read();
             (
                 c.ui_is_ru(),
                 c.codex_model.clone(),
+                c.codex_smart_model.clone(),
                 c.codex_reasoning_effort.clone(),
+                c.codex_smart_reasoning_effort.clone(),
+                c.codex_fast_mode,
+                c.codex_smart_fast_mode,
                 c.codex_vision_model.clone(),
+                c.codex_vision_smart_model.clone(),
+                c.codex_vision_reasoning_effort.clone(),
+                c.codex_vision_smart_reasoning_effort.clone(),
+                c.codex_vision_fast_mode,
+                c.codex_vision_smart_fast_mode,
                 c.ai_provider.clone(),
                 c.vision_provider.clone(),
-                super::settings_vision::same_choice_available(&c),
+                c.same_text_model_accepts_images_declared(),
+                c.codex_transport == "direct",
             )
         };
-        let snapshot = overlay_backend::codex_subscription::provider_snapshot();
+
+        let snapshot = if direct_transport {
+            overlay_backend::codex_direct::provider_snapshot()
+        } else {
+            overlay_backend::codex_subscription::provider_snapshot()
+        };
         let authoritative_catalog = catalog_is_authoritative(&snapshot.account);
         let label = codex_account_label(&snapshot.account, is_ru);
-        let ids: Vec<String> = snapshot
-            .models
-            .iter()
-            .map(|model| model.id.clone())
-            .collect();
+        let ids: Vec<String> = snapshot.models.iter().map(|model| model.id.clone()).collect();
         let labels: Vec<SharedString> = snapshot.models.iter().map(codex_model_label).collect();
+
         let selected = preferred_codex_model_index(&snapshot.models, &saved, false);
         let selected_id = selected.and_then(|index| ids.get(index)).cloned();
         let selected_model = selected.and_then(|index| snapshot.models.get(index));
+        let smart_selected = if saved_smart.is_empty() {
+            selected
+        } else {
+            preferred_codex_model_index(&snapshot.models, &saved_smart, false)
+        };
+        let smart_selected_id = smart_selected.and_then(|index| ids.get(index)).cloned();
+        let smart_selected_model = smart_selected.and_then(|index| snapshot.models.get(index));
+
+        let fast_available = selected_model.is_some_and(|model| model.supports_fast);
+        let smart_fast_available = smart_selected_model.is_some_and(|model| model.supports_fast);
+        let normalized_fast = saved_fast && fast_available;
+        let normalized_smart_fast = saved_smart_fast && smart_fast_available;
+        let (reasoning_ids, reasoning_labels, reasoning_selected, normalized_effort) =
+            reasoning_options(selected_model, &saved_effort, is_ru);
+        let (
+            smart_reasoning_ids,
+            smart_reasoning_labels,
+            smart_reasoning_selected,
+            normalized_smart_effort,
+        ) = reasoning_options(smart_selected_model, &saved_smart_effort, is_ru);
+
         let selected_text_accepts_images = selected_model
             .is_some_and(|model| model.input_modalities.iter().any(|value| value == "image"));
+        let smart_text_accepts_images = smart_selected_model
+            .is_some_and(|model| model.input_modalities.iter().any(|value| value == "image"));
         let same_available = if saved_ai_provider == "codex" {
-            selected_text_accepts_images
+            selected_text_accepts_images && smart_text_accepts_images
         } else {
             baseline_same_available
         };
-        let vision_models: Vec<_> = snapshot
+
+        let vision_models: Vec<&overlay_backend::codex_subscription::CodexModel> = snapshot
             .models
             .iter()
             .filter(|model| model.input_modalities.iter().any(|value| value == "image"))
@@ -275,6 +419,37 @@ pub(crate) fn refresh_codex_account_status(
                 vision_models.iter().position(|model| model.id == *id)
             });
         let vision_selected_id = vision_selected.map(|index| vision_models[index].id.clone());
+        let vision_selected_model = vision_selected.and_then(|index| vision_models.get(index).copied());
+        let vision_smart_selected = if saved_vision_smart.is_empty() {
+            vision_selected
+        } else {
+            vision_models.iter().position(|model| model.id.as_str() == saved_vision_smart.as_str())
+        };
+        let vision_smart_selected_id =
+            vision_smart_selected.map(|index| vision_models[index].id.clone());
+        let vision_smart_selected_model =
+            vision_smart_selected.and_then(|index| vision_models.get(index).copied());
+        let vision_fast_available = vision_selected_model.is_some_and(|model| model.supports_fast);
+        let vision_smart_fast_available =
+            vision_smart_selected_model.is_some_and(|model| model.supports_fast);
+        let normalized_vision_fast = saved_vision_fast && vision_fast_available;
+        let normalized_vision_smart_fast = saved_vision_smart_fast && vision_smart_fast_available;
+        let (
+            vision_reasoning_ids,
+            vision_reasoning_labels,
+            vision_reasoning_selected,
+            normalized_vision_effort,
+        ) = reasoning_options(vision_selected_model, &saved_vision_effort, is_ru);
+        let (
+            vision_smart_reasoning_ids,
+            vision_smart_reasoning_labels,
+            vision_smart_reasoning_selected,
+            normalized_vision_smart_effort,
+        ) = reasoning_options(
+            vision_smart_selected_model,
+            &saved_vision_smart_effort,
+            is_ru,
+        );
         let vision_ids: Vec<SharedString> = vision_models
             .iter()
             .map(|model| SharedString::from(model.id.clone()))
@@ -283,139 +458,182 @@ pub(crate) fn refresh_codex_account_status(
             .iter()
             .map(|model| codex_model_label(model))
             .collect();
-        let mut reasoning_ids = vec![String::new()];
-        if let Some(model) = selected_model {
-            reasoning_ids.extend(model.reasoning_efforts.iter().cloned());
-        }
-        let default_effort = selected_model
-            .and_then(|model| model.default_reasoning_effort.as_deref())
-            .unwrap_or(if is_ru {
-                "по настройке модели"
-            } else {
-                "model default"
-            });
-        let mut reasoning_labels = vec![if is_ru {
-            format!("По умолчанию ({default_effort})")
-        } else {
-            format!("Default ({default_effort})")
-        }];
-        reasoning_labels.extend(
-            reasoning_ids
-                .iter()
-                .skip(1)
-                .map(|effort| reasoning_label(effort, is_ru)),
-        );
-        let reasoning_selected = reasoning_ids
-            .iter()
-            .position(|effort| effort == &saved_effort)
-            .unwrap_or(0);
-        let normalized_effort = reasoning_ids
-            .get(reasoning_selected)
-            .cloned()
-            .unwrap_or_default();
+
         let saved_missing = !saved.is_empty() && selected_id.is_none();
+        let smart_saved_missing = !saved_smart.is_empty() && smart_selected_id.is_none();
         let vision_saved_missing = !saved_vision.is_empty() && vision_selected_id.is_none();
-        if let Some(id) = selected_id.clone() {
-            if (saved.is_empty() || normalized_effort != saved_effort)
-                && codex_snapshot_ui_is_current(generation)
-            {
-                let mut c = cfg.write();
-                if codex_snapshot_ui_is_current(generation)
-                    && c.codex_model == saved
-                    && c.codex_reasoning_effort == saved_effort
-                {
-                    c.codex_model = id;
-                    c.codex_reasoning_effort = normalized_effort.clone();
-                    if overlay_backend::config::save(&c).is_err() {
-                        eprintln!("[overlay-host] Codex model save failed");
-                    }
-                }
-            }
-        }
-        if saved_vision.is_empty() {
-            if let Some(id) = vision_selected_id.clone() {
-                if codex_snapshot_ui_is_current(generation) {
-                    let mut c = cfg.write();
-                    if codex_snapshot_ui_is_current(generation) && c.codex_vision_model.is_empty() {
-                        c.codex_vision_model = id;
-                        if overlay_backend::config::save(&c).is_err() {
-                            eprintln!("[overlay-host] Codex vision model save failed");
-                        }
-                    }
-                }
-            }
-        }
+        let vision_smart_saved_missing =
+            !saved_vision_smart.is_empty() && vision_smart_selected_id.is_none();
+
         let mut same_forced_off = false;
-        if authoritative_catalog
-            && saved_ai_provider == "codex"
-            && saved_vision_provider == "same"
-            && codex_snapshot_ui_is_current(generation)
-        {
+        if codex_snapshot_ui_is_current(generation) {
             let mut c = cfg.write();
-            if codex_snapshot_ui_is_current(generation)
+            let mut changed = false;
+            if c.codex_model == saved {
+                if saved.is_empty() {
+                    if let Some(id) = selected_id.as_ref() {
+                        c.codex_model.clone_from(id);
+                        changed = true;
+                    }
+                }
+                if c.codex_reasoning_effort == saved_effort
+                    && c.codex_reasoning_effort != normalized_effort
+                {
+                    c.codex_reasoning_effort.clone_from(&normalized_effort);
+                    changed = true;
+                }
+                if c.codex_fast_mode == saved_fast && c.codex_fast_mode != normalized_fast {
+                    c.codex_fast_mode = normalized_fast;
+                    changed = true;
+                }
+            }
+            if c.codex_smart_model == saved_smart {
+                if saved_smart.is_empty() {
+                    if let Some(id) = smart_selected_id.as_ref() {
+                        c.codex_smart_model.clone_from(id);
+                        changed = true;
+                    }
+                }
+                if c.codex_smart_reasoning_effort == saved_smart_effort
+                    && c.codex_smart_reasoning_effort != normalized_smart_effort
+                {
+                    c.codex_smart_reasoning_effort
+                        .clone_from(&normalized_smart_effort);
+                    changed = true;
+                }
+                if c.codex_smart_fast_mode == saved_smart_fast
+                    && c.codex_smart_fast_mode != normalized_smart_fast
+                {
+                    c.codex_smart_fast_mode = normalized_smart_fast;
+                    changed = true;
+                }
+            }
+            if c.codex_vision_model == saved_vision {
+                if saved_vision.is_empty() {
+                    if let Some(id) = vision_selected_id.as_ref() {
+                        c.codex_vision_model.clone_from(id);
+                        changed = true;
+                    }
+                }
+                if c.codex_vision_reasoning_effort == saved_vision_effort
+                    && c.codex_vision_reasoning_effort != normalized_vision_effort
+                {
+                    c.codex_vision_reasoning_effort
+                        .clone_from(&normalized_vision_effort);
+                    changed = true;
+                }
+                if c.codex_vision_fast_mode == saved_vision_fast
+                    && c.codex_vision_fast_mode != normalized_vision_fast
+                {
+                    c.codex_vision_fast_mode = normalized_vision_fast;
+                    changed = true;
+                }
+            }
+            if c.codex_vision_smart_model == saved_vision_smart {
+                if saved_vision_smart.is_empty() {
+                    if let Some(id) = vision_smart_selected_id.as_ref() {
+                        c.codex_vision_smart_model.clone_from(id);
+                        changed = true;
+                    }
+                }
+                if c.codex_vision_smart_reasoning_effort == saved_vision_smart_effort
+                    && c.codex_vision_smart_reasoning_effort != normalized_vision_smart_effort
+                {
+                    c.codex_vision_smart_reasoning_effort
+                        .clone_from(&normalized_vision_smart_effort);
+                    changed = true;
+                }
+                if c.codex_vision_smart_fast_mode == saved_vision_smart_fast
+                    && c.codex_vision_smart_fast_mode != normalized_vision_smart_fast
+                {
+                    c.codex_vision_smart_fast_mode = normalized_vision_smart_fast;
+                    changed = true;
+                }
+            }
+
+            if authoritative_catalog
+                && saved_ai_provider == "codex"
+                && saved_vision_provider == "same"
                 && c.ai_provider == "codex"
                 && c.vision_provider == "same"
             {
-                if selected_text_accepts_images {
+                if selected_text_accepts_images && smart_text_accepts_images {
                     if let Some(id) = selected_id.as_ref() {
                         if c.codex_vision_model != *id {
                             c.codex_vision_model.clone_from(id);
-                            if overlay_backend::config::save(&c).is_err() {
-                                eprintln!("[overlay-host] Codex same-model vision save failed");
-                            }
+                            changed = true;
+                        }
+                    }
+                    if let Some(id) = smart_selected_id.as_ref() {
+                        if c.codex_vision_smart_model != *id {
+                            c.codex_vision_smart_model.clone_from(id);
+                            changed = true;
                         }
                     }
                 } else {
                     c.vision_provider = "off".into();
                     c.codex_vision_model.clear();
+                    c.codex_vision_smart_model.clear();
                     same_forced_off = true;
-                    if overlay_backend::config::save(&c).is_err() {
-                        eprintln!("[overlay-host] invalid same-model vision repair failed");
-                    }
+                    changed = true;
+                }
+            }
+            if changed && overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] Codex profile normalization save failed");
+            }
+        }
+
+        let mut secondary_status: Vec<String> = Vec::new();
+        for (saved_value, normalized) in [
+            (&saved_effort, &normalized_effort),
+            (&saved_smart_effort, &normalized_smart_effort),
+            (&saved_vision_effort, &normalized_vision_effort),
+            (&saved_vision_smart_effort, &normalized_vision_smart_effort),
+        ] {
+            if let Some(notice) = reasoning_normalization_notice(saved_value, normalized, is_ru) {
+                if !secondary_status.iter().any(|existing| existing.as_str() == notice) {
+                    secondary_status.push(notice.to_string());
                 }
             }
         }
-        let mut secondary_status = Vec::new();
-        if let Some(notice) =
-            reasoning_normalization_notice(&saved_effort, &normalized_effort, is_ru)
-        {
-            secondary_status.push(notice.to_string());
-        }
         if saved_missing {
             secondary_status.push(if is_ru {
-                "Сохранённая модель недоступна; выбор сохранён без замены.".to_string()
+                "Сохранённая обычная модель недоступна; выбор сохранён без замены.".to_string()
             } else {
-                "The saved model is unavailable; the selection was preserved.".to_string()
+                "The saved Normal model is unavailable; the selection was preserved.".to_string()
             });
         }
-        if vision_saved_missing {
+        if smart_saved_missing {
             secondary_status.push(if is_ru {
-                "Сохранённая модель зрения недоступна или не принимает изображения; выбор сохранён без замены."
-                    .to_string()
+                "Сохранённая умная модель недоступна; выбор сохранён без замены.".to_string()
             } else {
-                "The saved vision model is unavailable or cannot accept images; the selection was preserved."
-                    .to_string()
+                "The saved Smart model is unavailable; the selection was preserved.".to_string()
+            });
+        }
+        if vision_saved_missing || vision_smart_saved_missing {
+            secondary_status.push(if is_ru {
+                "Сохранённая Vision-модель недоступна или не принимает изображения; выбор сохранён без замены.".to_string()
+            } else {
+                "A saved Vision model is unavailable or cannot accept images; the selection was preserved.".to_string()
             });
         }
         if let Some(status) = snapshot.rate_limits {
             secondary_status.push(if is_ru {
                 format!(
                     "Лимит аккаунта: {}",
-                    status
-                        .replace("% used", "% использовано")
-                        .replace(" min", " мин")
+                    status.replace("% used", "% использовано").replace(" min", " мин")
                 )
             } else {
                 format!("Account limit: {status}")
             });
         }
+
         let model_ids: Vec<SharedString> = ids.into_iter().map(SharedString::from).collect();
-        let reasoning_ids: Vec<SharedString> =
-            reasoning_ids.into_iter().map(SharedString::from).collect();
-        let reasoning_labels: Vec<SharedString> = reasoning_labels
-            .into_iter()
-            .map(SharedString::from)
-            .collect();
+        let to_shared = |items: Vec<String>| items.into_iter().map(SharedString::from).collect::<Vec<_>>();
+        let reasoning_ids = to_shared(reasoning_ids);
+        let smart_reasoning_ids = to_shared(smart_reasoning_ids);
+        let vision_reasoning_ids = to_shared(vision_reasoning_ids);
+        let vision_smart_reasoning_ids = to_shared(vision_smart_reasoning_ids);
         let _ = slint::invoke_from_event_loop(move || {
             if codex_snapshot_ui_is_current(generation) {
                 if let Some(window) = weak.upgrade() {
@@ -425,16 +643,31 @@ pub(crate) fn refresh_codex_account_status(
                     window.set_codex_model_ids(ModelRc::new(VecModel::from(model_ids)));
                     window.set_codex_model_labels(ModelRc::new(VecModel::from(labels)));
                     window.set_codex_model_index(selected.map_or(-1, |index| index as i32));
-                    window.set_codex_vision_model_ids(ModelRc::new(VecModel::from(vision_ids)));
-                    window
-                        .set_codex_vision_model_labels(ModelRc::new(VecModel::from(vision_labels)));
-                    window.set_codex_vision_model_index(
-                        vision_selected.map_or(-1, |index| index as i32),
-                    );
+                    window.set_codex_smart_model_index(smart_selected.map_or(-1, |index| index as i32));
                     window.set_codex_reasoning_ids(ModelRc::new(VecModel::from(reasoning_ids)));
-                    window
-                        .set_codex_reasoning_labels(ModelRc::new(VecModel::from(reasoning_labels)));
+                    window.set_codex_reasoning_labels(ModelRc::new(VecModel::from(reasoning_labels)));
                     window.set_codex_reasoning_index(reasoning_selected as i32);
+                    window.set_codex_fast_available(fast_available);
+                    window.set_codex_fast_mode(normalized_fast);
+                    window.set_codex_smart_reasoning_ids(ModelRc::new(VecModel::from(smart_reasoning_ids)));
+                    window.set_codex_smart_reasoning_labels(ModelRc::new(VecModel::from(smart_reasoning_labels)));
+                    window.set_codex_smart_reasoning_index(smart_reasoning_selected as i32);
+                    window.set_codex_smart_fast_available(smart_fast_available);
+                    window.set_codex_smart_fast_mode(normalized_smart_fast);
+                    window.set_codex_vision_model_ids(ModelRc::new(VecModel::from(vision_ids)));
+                    window.set_codex_vision_model_labels(ModelRc::new(VecModel::from(vision_labels)));
+                    window.set_codex_vision_model_index(vision_selected.map_or(-1, |index| index as i32));
+                    window.set_codex_vision_smart_model_index(vision_smart_selected.map_or(-1, |index| index as i32));
+                    window.set_codex_vision_reasoning_ids(ModelRc::new(VecModel::from(vision_reasoning_ids)));
+                    window.set_codex_vision_reasoning_labels(ModelRc::new(VecModel::from(vision_reasoning_labels)));
+                    window.set_codex_vision_reasoning_index(vision_reasoning_selected as i32);
+                    window.set_codex_vision_fast_available(vision_fast_available);
+                    window.set_codex_vision_fast_mode(normalized_vision_fast);
+                    window.set_codex_vision_smart_reasoning_ids(ModelRc::new(VecModel::from(vision_smart_reasoning_ids)));
+                    window.set_codex_vision_smart_reasoning_labels(ModelRc::new(VecModel::from(vision_smart_reasoning_labels)));
+                    window.set_codex_vision_smart_reasoning_index(vision_smart_reasoning_selected as i32);
+                    window.set_codex_vision_smart_fast_available(vision_smart_fast_available);
+                    window.set_codex_vision_smart_fast_mode(normalized_vision_smart_fast);
                     window.set_vision_same_available(same_available);
                     if same_forced_off {
                         window.set_vision_provider_index(0);
@@ -466,18 +699,20 @@ pub(crate) fn fetch_models(
     target: ModelTarget,
 ) {
     std::thread::spawn(move || {
-        let (base_url, bearer, saved) = {
+        let (base_url, bearer, saved, smart_saved) = {
             let c = cfg.read();
             match target {
                 ModelTarget::Cloud => (
                     c.ai_base_url.clone(),
                     c.ai_bearer.clone(),
                     c.ai_model.clone(),
+                    c.prep_model.clone(),
                 ),
                 ModelTarget::Local => (
                     c.ai_local_base_url.clone(),
                     c.ai_local_bearer.clone(),
                     c.ai_local_model.clone(),
+                    String::new(),
                 ),
             }
         };
@@ -501,13 +736,21 @@ pub(crate) fn fetch_models(
             if !saved.is_empty() && !list.iter().any(|m| m == &saved) {
                 list.insert(0, saved.clone());
             }
+            if !smart_saved.is_empty() && !list.iter().any(|m| m == &smart_saved) {
+                list.push(smart_saved.clone());
+            }
             let idx = list.iter().position(|m| m == &saved).unwrap_or(0) as i32;
+            let smart_idx = list
+                .iter()
+                .position(|m| m == &smart_saved)
+                .map_or(-1, |index| index as i32);
             let shared: Vec<SharedString> = list.into_iter().map(SharedString::from).collect();
             let model = ModelRc::new(VecModel::from(shared));
             match target {
                 ModelTarget::Cloud => {
                     w.set_ai_models(model);
                     w.set_ai_model_index(idx);
+                    w.set_ai_smart_model_index(smart_idx);
                 }
                 ModelTarget::Local => {
                     w.set_ai_local_models(model);
@@ -592,9 +835,9 @@ pub(crate) fn wire_ai_settings(
                 if let Some(w) = weak_for_refresh.upgrade() {
                     let is_ru = cfg_c.read().ui_language != "en";
                     w.set_openai_key_status(if is_ru {
-                        "Не удалось сохранить: защищённое хранилище Windows недоступно".into()
+                        "[ошибка] защищённое хранилище недоступно".into()
                     } else {
-                        "Could not save: Windows secure storage is unavailable".into()
+                        "[err] secure storage unavailable".into()
                     });
                 }
                 return;
@@ -616,9 +859,9 @@ pub(crate) fn wire_ai_settings(
                 if let Some(w) = weak_for_refresh.upgrade() {
                     let is_ru = cfg_c.read().ui_language != "en";
                     w.set_anthropic_key_status(if is_ru {
-                        "Не удалось сохранить: защищённое хранилище Windows недоступно".into()
+                        "[ошибка] защищённое хранилище недоступно".into()
                     } else {
-                        "Could not save: Windows secure storage is unavailable".into()
+                        "[err] secure storage unavailable".into()
                     });
                 }
                 return;
@@ -659,9 +902,6 @@ pub(crate) fn wire_ai_settings(
             {
                 let mut c = cfg_c.write();
                 c.ai_base_url = trimmed.clone();
-                // Requests use the new address even when the save fails, so
-                // the reasoning table follows it either way.
-                overlay_backend::ai::set_reasoning_efforts(c.reasoning_efforts());
                 if let Err(e) = overlay_backend::config::save(&c) {
                     eprintln!("[overlay-host] ai_base_url save failed: {e:#}");
                     return;
@@ -682,42 +922,39 @@ pub(crate) fn wire_ai_settings(
             if let Err(error) = overlay_backend::config::save(&c) {
                 eprintln!("[overlay-host] OpenAI URL save failed: {error:#}");
             }
-            overlay_backend::ai::set_reasoning_efforts(c.reasoning_efforts());
-        });
-    }
-    // Reasoning level of the bridge and the OpenAI profile; index into
-    // `REASONING_LEVELS` (0 = the model's own default, nothing sent).
-    {
-        let cfg_c = cfg.clone();
-        win.on_ai_reasoning_changed(move |index| {
-            let mut c = cfg_c.write();
-            c.ai_reasoning_effort = reasoning_level_from_index(index).to_string();
-            if let Err(error) = overlay_backend::config::save(&c) {
-                eprintln!("[overlay-host] bridge reasoning save failed: {error:#}");
-            }
-            overlay_backend::ai::set_reasoning_efforts(c.reasoning_efforts());
-            diag!("ai_reasoning_effort -> {:?}", c.ai_reasoning_effort);
         });
     }
     {
         let cfg_c = cfg.clone();
-        win.on_openai_reasoning_changed(move |index| {
-            let mut c = cfg_c.write();
-            c.openai_reasoning_effort = reasoning_level_from_index(index).to_string();
-            if let Err(error) = overlay_backend::config::save(&c) {
-                eprintln!("[overlay-host] OpenAI reasoning save failed: {error:#}");
-            }
-            overlay_backend::ai::set_reasoning_efforts(c.reasoning_efforts());
-            diag!("openai_reasoning_effort -> {:?}", c.openai_reasoning_effort);
-        });
-    }
-    {
-        let cfg_c = cfg.clone();
+        let overlay = overlay_weak.clone();
         win.on_openai_model_save(move |value| {
             let mut c = cfg_c.write();
             c.openai_model = value.trim().to_string();
+            let label = active_stack_label(&c);
             if let Err(error) = overlay_backend::config::save(&c) {
                 eprintln!("[overlay-host] OpenAI model save failed: {error:#}");
+                return;
+            }
+            drop(c);
+            if let Some(bar) = overlay.upgrade() {
+                bar.set_active_stack(SharedString::from(label));
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        let overlay = overlay_weak.clone();
+        win.on_openai_smart_model_save(move |value| {
+            let mut c = cfg_c.write();
+            c.openai_smart_model = value.trim().to_string();
+            let label = active_stack_label(&c);
+            if let Err(error) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] OpenAI smart model save failed: {error:#}");
+                return;
+            }
+            drop(c);
+            if let Some(bar) = overlay.upgrade() {
+                bar.set_active_stack(SharedString::from(label));
             }
         });
     }
@@ -733,30 +970,83 @@ pub(crate) fn wire_ai_settings(
     }
     {
         let cfg_c = cfg.clone();
+        let overlay = overlay_weak.clone();
         win.on_anthropic_model_save(move |value| {
             let mut c = cfg_c.write();
             c.anthropic_model = value.trim().to_string();
+            let label = active_stack_label(&c);
             if let Err(error) = overlay_backend::config::save(&c) {
                 eprintln!("[overlay-host] Anthropic model save failed: {error:#}");
+                return;
+            }
+            drop(c);
+            if let Some(bar) = overlay.upgrade() {
+                bar.set_active_stack(SharedString::from(label));
             }
         });
     }
     {
         let cfg_c = cfg.clone();
+        let overlay = overlay_weak.clone();
+        win.on_anthropic_smart_model_save(move |value| {
+            let mut c = cfg_c.write();
+            c.anthropic_smart_model = value.trim().to_string();
+            let label = active_stack_label(&c);
+            if let Err(error) = overlay_backend::config::save(&c) {
+                eprintln!("[overlay-host] Anthropic smart model save failed: {error:#}");
+                return;
+            }
+            drop(c);
+            if let Some(bar) = overlay.upgrade() {
+                bar.set_active_stack(SharedString::from(label));
+            }
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        let overlay = overlay_weak.clone();
         win.on_ai_model_selected(move |new_value| {
             let trimmed = new_value.trim().to_string();
             if trimmed.is_empty() {
                 return;
             }
-            {
+            let active_stack = {
                 let mut c = cfg_c.write();
                 c.ai_model = trimmed.clone();
+                let active_stack = active_stack_label(&c);
                 if let Err(e) = overlay_backend::config::save(&c) {
                     eprintln!("[overlay-host] ai_model save failed: {e:#}");
                     return;
                 }
+                active_stack
+            };
+            if let Some(bar) = overlay.upgrade() {
+                bar.set_active_stack(SharedString::from(active_stack));
             }
             eprintln!("[overlay-host] ai_model selected: {trimmed}");
+        });
+    }
+    {
+        let cfg_c = cfg.clone();
+        let overlay = overlay_weak.clone();
+        win.on_ai_smart_model_selected(move |new_value| {
+            let trimmed = new_value.trim().to_string();
+            if trimmed.is_empty() {
+                return;
+            }
+            let active_stack = {
+                let mut c = cfg_c.write();
+                c.prep_model = trimmed;
+                let active_stack = active_stack_label(&c);
+                if let Err(e) = overlay_backend::config::save(&c) {
+                    eprintln!("[overlay-host] prep_model save failed: {e:#}");
+                    return;
+                }
+                active_stack
+            };
+            if let Some(bar) = overlay.upgrade() {
+                bar.set_active_stack(SharedString::from(active_stack));
+            }
         });
     }
     {
@@ -808,7 +1098,10 @@ pub(crate) fn wire_ai_settings(
                     current.vision_provider == "mlx",
                 )
             };
-            if leaving_mlx && !vision_uses_mlx && !overlay_backend::mlx_runtime::stop_if_idle() {
+            if leaving_mlx
+                && !vision_uses_mlx
+                && !overlay_backend::mlx_runtime::stop_if_idle()
+            {
                 if let Some(window) = weak.upgrade() {
                     window.set_ai_provider_index(4);
                 }
@@ -829,20 +1122,9 @@ pub(crate) fn wire_ai_settings(
             if c.vision_provider == "same" && !c.same_text_model_accepts_images_declared() {
                 c.vision_provider = "off".into();
             }
-            // Screenshots never set up (the default bridge with no key) follow
-            // the direct API just chosen for answers instead of failing on F8.
-            if c.vision_provider == "cloud"
-                && c.vision_base_url.trim().is_empty()
-                && c.vision_bearer.trim().is_empty()
-                && c.ai_bearer.trim().is_empty()
-            {
-                if let Some(direct) = super::settings_vision::same_choice_direct_provider(&c) {
-                    c.vision_provider = direct.to_string();
-                }
-            }
             let vision_state = (
                 c.vision_provider.clone(),
-                super::settings_vision::same_choice_available(&c),
+                c.same_text_model_accepts_images_declared(),
             );
             let local_state = (provider == "local").then(|| {
                 let root = overlay_backend::local_ai::default_root();
@@ -862,9 +1144,11 @@ pub(crate) fn wire_ai_settings(
             let codex_needed =
                 !cfg!(target_os = "macos") && (provider == "codex" || c.vision_provider == "codex");
             overlay_backend::ai::set_local_no_think(provider == "local" && !c.ai_local_thinking);
+            let active_stack = active_stack_label(&c);
             drop(c);
             if let Some(o) = overlay.upgrade() {
                 refresh_lock_chip(&o, &cfg_c);
+                o.set_active_stack(SharedString::from(active_stack));
             }
             if let Some(window) = weak.upgrade() {
                 window.set_vision_provider_index(
@@ -924,9 +1208,31 @@ pub(crate) fn wire_ai_settings(
         });
     }
 
-    // RC14 — ChatGPT subscription sign-in is delegated to the official Codex
-    // app-server. Suflyor receives only account state and device-code display
-    // fields; it never receives or stores OAuth tokens.
+    // Codex account sign-in. App Server remains the default; Direct OAuth is
+    // an additive transport that stores its own protected access/refresh tokens.
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
+        win.on_codex_transport_changed(move |index| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let direct = index == 1;
+            invalidate_codex_login_ui();
+            {
+                let mut c = cfg_c.write();
+                c.codex_transport = if direct { "direct".into() } else { "app_server".into() };
+                if overlay_backend::config::save(&c).is_err() {
+                    eprintln!("[overlay-host] Codex transport save failed");
+                }
+            }
+            window.set_codex_transport_index(if direct { 1 } else { 0 });
+            window.set_codex_login_url(SharedString::default());
+            window.set_codex_user_code(SharedString::default());
+            window.set_codex_copy_status(SharedString::default());
+            refresh_codex_account_status(window.as_weak(), cfg_c.clone());
+        });
+    }
     {
         let weak = win.as_weak();
         let cfg_c = cfg.clone();
@@ -934,14 +1240,22 @@ pub(crate) fn wire_ai_settings(
             let Some(window) = weak.upgrade() else {
                 return;
             };
-            let is_ru = cfg_c.read().ui_is_ru();
+            let (is_ru, direct_transport) = {
+                let c = cfg_c.read();
+                (c.ui_is_ru(), c.codex_transport == "direct")
+            };
             let generation = invalidate_codex_login_ui();
-            let attempt = overlay_backend::codex_subscription::begin_device_login();
             window.set_codex_auth_busy(true);
             window.set_codex_login_url(SharedString::default());
             window.set_codex_user_code(SharedString::default());
             window.set_codex_copy_status(SharedString::default());
-            window.set_codex_auth_status(SharedString::from(if is_ru {
+            window.set_codex_auth_status(SharedString::from(if direct_transport {
+                if is_ru {
+                    "Запуск прямого входа ChatGPT OAuth..."
+                } else {
+                    "Starting direct ChatGPT OAuth..."
+                }
+            } else if is_ru {
                 "Запуск официального входа Codex..."
             } else {
                 "Starting official Codex sign-in..."
@@ -949,71 +1263,29 @@ pub(crate) fn wire_ai_settings(
             let worker_weak = window.as_weak();
             let worker_cfg = cfg_c.clone();
             std::thread::spawn(move || {
-                overlay_backend::codex_subscription::device_login(attempt, move |event| {
-                    use overlay_backend::codex_subscription::LoginEvent;
-                    let event_weak = worker_weak.clone();
-                    let event_cfg = worker_cfg.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        let Some(window) = event_weak.upgrade() else {
-                            return;
-                        };
-                        if !codex_ui_is_current(generation) {
-                            return;
-                        }
-                        let is_ru = event_cfg.read().ui_is_ru();
-                        match event {
-                            LoginEvent::AwaitingUser {
-                                verification_url,
-                                user_code,
-                            } => {
-                                window.set_codex_login_url(SharedString::from(verification_url));
-                                window.set_codex_user_code(SharedString::from(user_code));
-                                window.set_codex_copy_status(SharedString::default());
-                                window.set_codex_auth_status(SharedString::from(if is_ru {
-                                    "Откройте страницу входа и введите показанный код"
-                                } else {
-                                    "Open the sign-in page and enter the shown code"
-                                }));
-                            }
-                            LoginEvent::SignedIn { plan } => {
-                                let state =
-                                    overlay_backend::codex_subscription::AccountState::SignedIn {
-                                        plan,
-                                    };
-                                window.set_codex_auth_busy(false);
-                                window.set_codex_login_url(SharedString::default());
-                                window.set_codex_user_code(SharedString::default());
-                                window.set_codex_copy_status(SharedString::default());
-                                window.set_codex_auth_status(SharedString::from(
-                                    codex_account_label(&state, is_ru),
-                                ));
-                                refresh_codex_account_status(window.as_weak(), event_cfg);
-                            }
-                            LoginEvent::SignInRequired => {
-                                window.set_codex_auth_busy(false);
-                                window.set_codex_login_url(SharedString::default());
-                                window.set_codex_user_code(SharedString::default());
-                                window.set_codex_copy_status(SharedString::default());
-                                window.set_codex_auth_status(SharedString::from(if is_ru {
-                                    "вход не завершён — повторите подключение"
-                                } else {
-                                    "sign-in not completed — connect again"
-                                }));
-                            }
-                            LoginEvent::Error => {
-                                window.set_codex_auth_busy(false);
-                                window.set_codex_login_url(SharedString::default());
-                                window.set_codex_user_code(SharedString::default());
-                                window.set_codex_copy_status(SharedString::default());
-                                window.set_codex_auth_status(SharedString::from(if is_ru {
-                                    "Вход в Codex недоступен"
-                                } else {
-                                    "Codex sign-in unavailable"
-                                }));
-                            }
-                        }
+                if direct_transport {
+                    let attempt = overlay_backend::codex_direct::begin_device_login();
+                    overlay_backend::codex_direct::device_login(attempt, move |event| {
+                        dispatch_codex_login_event(
+                            event,
+                            worker_weak.clone(),
+                            worker_cfg.clone(),
+                            generation,
+                            true,
+                        );
                     });
-                });
+                } else {
+                    let attempt = overlay_backend::codex_subscription::begin_device_login();
+                    overlay_backend::codex_subscription::device_login(attempt, move |event| {
+                        dispatch_codex_login_event(
+                            event,
+                            worker_weak.clone(),
+                            worker_cfg.clone(),
+                            generation,
+                            false,
+                        );
+                    });
+                }
             });
         });
     }
@@ -1072,6 +1344,60 @@ pub(crate) fn wire_ai_settings(
     {
         let weak = win.as_weak();
         let cfg_c = cfg.clone();
+        let overlay = overlay_weak.clone();
+        win.on_codex_smart_model_selected(move |index| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if index < 0 {
+                return;
+            }
+            let Some(model) = window.get_codex_model_ids().row_data(index as usize) else {
+                return;
+            };
+            let model = model.to_string();
+            let vision_ids = window.get_codex_vision_model_ids();
+            let accepts_images = (0..vision_ids.row_count()).any(|row| {
+                vision_ids
+                    .row_data(row)
+                    .is_some_and(|candidate| candidate.as_str() == model.as_str())
+            });
+            invalidate_codex_snapshot_ui();
+            let mut c = cfg_c.write();
+            c.codex_smart_model.clone_from(&model);
+            c.codex_smart_reasoning_effort.clear();
+            let same_forced_off = if c.vision_provider == "same" && c.ai_provider == "codex" {
+                if accepts_images {
+                    c.codex_vision_smart_model.clone_from(&model);
+                    false
+                } else {
+                    c.vision_provider = "off".into();
+                    c.codex_vision_model.clear();
+                    c.codex_vision_smart_model.clear();
+                    true
+                }
+            } else {
+                false
+            };
+            let active_stack = active_stack_label(&c);
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] Codex smart model save failed");
+                return;
+            }
+            drop(c);
+            if same_forced_off {
+                window.set_vision_provider_index(0);
+                window.set_vision_same_available(false);
+            }
+            if let Some(bar) = overlay.upgrade() {
+                bar.set_active_stack(SharedString::from(active_stack));
+            }
+            refresh_codex_account_status(window.as_weak(), cfg_c.clone());
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
         win.on_codex_reasoning_selected(move |index| {
             let Some(window) = weak.upgrade() else {
                 return;
@@ -1092,6 +1418,65 @@ pub(crate) fn wire_ai_settings(
     {
         let weak = win.as_weak();
         let cfg_c = cfg.clone();
+        win.on_codex_smart_reasoning_selected(move |index| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if index < 0 {
+                return;
+            }
+            let Some(effort) = window
+                .get_codex_smart_reasoning_ids()
+                .row_data(index as usize)
+            else {
+                return;
+            };
+            let mut c = cfg_c.write();
+            c.codex_smart_reasoning_effort = effort.to_string();
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] Codex smart reasoning save failed");
+            }
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
+        win.on_codex_fast_mode_changed(move |on| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if on && !window.get_codex_fast_available() {
+                window.set_codex_fast_mode(false);
+                return;
+            }
+            let mut c = cfg_c.write();
+            c.codex_fast_mode = on;
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] Codex fast-mode save failed");
+            }
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
+        win.on_codex_smart_fast_mode_changed(move |on| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if on && !window.get_codex_smart_fast_available() {
+                window.set_codex_smart_fast_mode(false);
+                return;
+            }
+            let mut c = cfg_c.write();
+            c.codex_smart_fast_mode = on;
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] Codex smart fast-mode save failed");
+            }
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
         win.on_codex_vision_model_selected(move |index| {
             let Some(window) = weak.upgrade() else {
                 return;
@@ -1102,10 +1487,122 @@ pub(crate) fn wire_ai_settings(
             let Some(model) = window.get_codex_vision_model_ids().row_data(index as usize) else {
                 return;
             };
+            {
+                let mut c = cfg_c.write();
+                c.codex_vision_model = model.to_string();
+                c.codex_vision_reasoning_effort.clear();
+                if overlay_backend::config::save(&c).is_err() {
+                    eprintln!("[overlay-host] Codex vision model save failed");
+                    return;
+                }
+            }
+            refresh_codex_account_status(window.as_weak(), cfg_c.clone());
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
+        win.on_codex_vision_smart_model_selected(move |index| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if index < 0 {
+                return;
+            }
+            let Some(model) = window.get_codex_vision_model_ids().row_data(index as usize) else {
+                return;
+            };
+            {
+                let mut c = cfg_c.write();
+                c.codex_vision_smart_model = model.to_string();
+                c.codex_vision_smart_reasoning_effort.clear();
+                if overlay_backend::config::save(&c).is_err() {
+                    eprintln!("[overlay-host] Codex smart vision model save failed");
+                    return;
+                }
+            }
+            refresh_codex_account_status(window.as_weak(), cfg_c.clone());
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
+        win.on_codex_vision_reasoning_selected(move |index| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if index < 0 {
+                return;
+            }
+            let Some(effort) = window
+                .get_codex_vision_reasoning_ids()
+                .row_data(index as usize)
+            else {
+                return;
+            };
             let mut c = cfg_c.write();
-            c.codex_vision_model = model.to_string();
+            c.codex_vision_reasoning_effort = effort.to_string();
             if overlay_backend::config::save(&c).is_err() {
-                eprintln!("[overlay-host] Codex vision model save failed");
+                eprintln!("[overlay-host] Codex vision reasoning save failed");
+            }
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
+        win.on_codex_vision_smart_reasoning_selected(move |index| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if index < 0 {
+                return;
+            }
+            let Some(effort) = window
+                .get_codex_vision_smart_reasoning_ids()
+                .row_data(index as usize)
+            else {
+                return;
+            };
+            let mut c = cfg_c.write();
+            c.codex_vision_smart_reasoning_effort = effort.to_string();
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] Codex smart vision reasoning save failed");
+            }
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
+        win.on_codex_vision_fast_mode_changed(move |on| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if on && !window.get_codex_vision_fast_available() {
+                window.set_codex_vision_fast_mode(false);
+                return;
+            }
+            let mut c = cfg_c.write();
+            c.codex_vision_fast_mode = on;
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] Codex vision fast-mode save failed");
+            }
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let cfg_c = cfg.clone();
+        win.on_codex_vision_smart_fast_mode_changed(move |on| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if on && !window.get_codex_vision_smart_fast_available() {
+                window.set_codex_vision_smart_fast_mode(false);
+                return;
+            }
+            let mut c = cfg_c.write();
+            c.codex_vision_smart_fast_mode = on;
+            if overlay_backend::config::save(&c).is_err() {
+                eprintln!("[overlay-host] Codex smart vision fast-mode save failed");
             }
         });
     }
@@ -1123,7 +1620,7 @@ pub(crate) fn wire_ai_settings(
             let Some(window) = weak.upgrade() else {
                 return;
             };
-            let is_ru = {
+            let (is_ru, direct_transport) = {
                 let mut c = cfg_c.write();
                 if c.ai_provider == "codex" && c.vision_provider == "same" {
                     c.vision_provider = "off".into();
@@ -1132,7 +1629,7 @@ pub(crate) fn wire_ai_settings(
                         eprintln!("[overlay-host] Codex disconnect vision repair failed");
                     }
                 }
-                c.ui_is_ru()
+                (c.ui_is_ru(), c.codex_transport == "direct")
             };
             window.set_vision_same_available(false);
             let generation = invalidate_codex_login_ui();
@@ -1143,7 +1640,11 @@ pub(crate) fn wire_ai_settings(
             window.set_codex_copy_status(SharedString::default());
             let worker_weak = window.as_weak();
             std::thread::spawn(move || {
-                let state = overlay_backend::codex_subscription::disconnect();
+                let state = if direct_transport {
+                    overlay_backend::codex_direct::disconnect()
+                } else {
+                    overlay_backend::codex_subscription::disconnect()
+                };
                 let label = codex_account_label(&state, is_ru);
                 let _ =
                     slint::invoke_from_event_loop(move || {
@@ -1160,6 +1661,11 @@ pub(crate) fn wire_ai_settings(
                                 >::new(
                                 ))));
                                 window.set_codex_model_index(-1);
+                                window.set_codex_smart_model_index(-1);
+                                window.set_codex_fast_available(false);
+                                window.set_codex_smart_fast_available(false);
+                                window.set_codex_vision_fast_available(false);
+                                window.set_codex_vision_smart_fast_available(false);
                                 window.set_codex_reasoning_ids(ModelRc::new(VecModel::from(
                                     Vec::<SharedString>::new(),
                                 )));
@@ -1167,6 +1673,13 @@ pub(crate) fn wire_ai_settings(
                                     Vec::<SharedString>::new(),
                                 )));
                                 window.set_codex_reasoning_index(-1);
+                                window.set_codex_smart_reasoning_ids(ModelRc::new(VecModel::from(
+                                    Vec::<SharedString>::new(),
+                                )));
+                                window.set_codex_smart_reasoning_labels(ModelRc::new(VecModel::from(
+                                    Vec::<SharedString>::new(),
+                                )));
+                                window.set_codex_smart_reasoning_index(-1);
                                 window.set_codex_vision_model_ids(ModelRc::new(VecModel::from(
                                     Vec::<SharedString>::new(),
                                 )));
@@ -1174,6 +1687,21 @@ pub(crate) fn wire_ai_settings(
                                     Vec::<SharedString>::new(),
                                 )));
                                 window.set_codex_vision_model_index(-1);
+                                window.set_codex_vision_smart_model_index(-1);
+                                window.set_codex_vision_reasoning_ids(ModelRc::new(VecModel::from(
+                                    Vec::<SharedString>::new(),
+                                )));
+                                window.set_codex_vision_reasoning_labels(ModelRc::new(VecModel::from(
+                                    Vec::<SharedString>::new(),
+                                )));
+                                window.set_codex_vision_reasoning_index(-1);
+                                window.set_codex_vision_smart_reasoning_ids(ModelRc::new(VecModel::from(
+                                    Vec::<SharedString>::new(),
+                                )));
+                                window.set_codex_vision_smart_reasoning_labels(ModelRc::new(VecModel::from(
+                                    Vec::<SharedString>::new(),
+                                )));
+                                window.set_codex_vision_smart_reasoning_index(-1);
                                 window.set_codex_rate_status(SharedString::default());
                             }
                         }
@@ -1182,12 +1710,11 @@ pub(crate) fn wire_ai_settings(
         });
     }
     win.on_codex_open_signin_clicked(move |url| {
-        if !overlay_backend::codex_subscription::allowed_signin_url(url.as_str()) {
+        if !overlay_backend::codex_subscription::allowed_signin_url(url.as_str())
+            && !overlay_backend::codex_direct::allowed_signin_url(url.as_str())
+        {
             return;
         }
-        #[cfg(target_os = "linux")]
-        let _ = slint_replay::native::desktop::open(std::ffi::OsStr::new(url.as_str()));
-        #[cfg(not(target_os = "linux"))]
         if let Err(error) = std::process::Command::new("explorer.exe")
             .arg(url.as_str())
             .spawn()
@@ -1225,13 +1752,6 @@ pub(crate) fn wire_ai_settings(
         win.on_ai_local_base_url_save(move |v| {
             let base_url = v.trim().to_string();
             let root = overlay_backend::local_ai::default_root();
-            // Strata pins tens of GB of RAM; leaving it for another server stops it.
-            if !overlay_backend::local_ai::is_managed_strata_endpoint(&base_url)
-                && overlay_backend::local_ai::strata_running()
-            {
-                overlay_backend::local_ai::abort_strata_start();
-                std::thread::spawn(overlay_backend::local_ai::stop_strata);
-            }
             let (
                 managed,
                 quality,
@@ -1281,7 +1801,6 @@ pub(crate) fn wire_ai_settings(
                     &vision_provider,
                 ));
                 refresh_local_model_resource_warning(&w, root, saved_base_url, model);
-                refresh_local_engine_state(&w, &cfg_c.read());
             }
             // #E10.1 — re-query models against the new URL.
             fetch_models(weak.clone(), cfg_c.clone(), ModelTarget::Local);
@@ -1300,22 +1819,26 @@ pub(crate) fn wire_ai_settings(
     {
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
+        let overlay = overlay_weak.clone();
         win.on_ai_local_model_selected(move |model| {
             let m = model.trim().to_string();
             if m.is_empty() {
                 return;
             }
-            let base_url = {
+            let (base_url, active_stack) = {
                 let mut c = cfg_c.write();
                 c.ai_local_model = m.clone();
+                let active_stack = active_stack_label(&c);
                 if let Err(e) = overlay_backend::config::save(&c) {
                     eprintln!("[overlay-host] ai_local_model save failed: {e:#}");
                     return;
                 }
-                c.ai_local_base_url.clone()
+                (c.ai_local_base_url.clone(), active_stack)
             };
+            if let Some(bar) = overlay.upgrade() {
+                bar.set_active_stack(SharedString::from(active_stack));
+            }
             if let Some(w) = weak.upgrade() {
-                refresh_local_engine_state(&w, &cfg_c.read());
                 refresh_local_model_resource_warning(
                     &w,
                     overlay_backend::local_ai::default_root(),
@@ -1368,36 +1891,12 @@ pub(crate) fn wire_ai_settings(
     }
     {
         let cfg_c = cfg.clone();
-        win.on_ai_agent_tools_changed(move |on| {
-            let mut c = cfg_c.write();
-            c.ai_agent_tools = on;
-            if let Err(e) = overlay_backend::config::save(&c) {
-                eprintln!("[overlay-host] ai_agent_tools save failed: {e:#}");
-            }
-            overlay_backend::ai::set_agent_tools(on, c.ai_web_search);
-        });
-    }
-    {
-        let cfg_c = cfg.clone();
-        win.on_ai_web_search_changed(move |on| {
-            let mut c = cfg_c.write();
-            c.ai_web_search = on;
-            if let Err(e) = overlay_backend::config::save(&c) {
-                eprintln!("[overlay-host] ai_web_search save failed: {e:#}");
-            }
-            overlay_backend::ai::set_agent_tools(c.ai_agent_tools, on);
-        });
-    }
-    {
-        let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_ai_local_test_clicked(move || {
             let Some(w) = weak.upgrade() else {
                 return;
             };
-            #[cfg(windows)]
-            let generation = super::settings_local_ai::begin_now_check(&w);
-            w.set_ai_local_test_result(SharedString::from(if cfg_c.read().ui_is_ru() { "Проверка…" } else { "Checking…" }));
+            w.set_ai_local_test_result(SharedString::from("Проверка…"));
             let (base_url, bearer, model, ui_is_ru) = {
                 let c = cfg_c.read();
                 (
@@ -1409,7 +1908,6 @@ pub(crate) fn wire_ai_settings(
             };
             let weak_res = w.as_weak();
             std::thread::spawn(move || {
-                let mut working = false;
                 let msg = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -1418,17 +1916,17 @@ pub(crate) fn wire_ai_settings(
                         match rt.block_on(overlay_backend::ai::test_connection(
                             base_url, bearer, model,
                         )) {
-                            Ok(_) => {
-                                working = true;
-                                if ui_is_ru { "Подключение работает" } else { "Connection works" }.to_string()
-                            }
+                            Ok(s) => format!("[ok] {s}"),
                             // A deep-locked managed server: the specific
                             // localized notice instead of a misleading "server
                             // not answering".
                             Err(e)
                                 if overlay_backend::deep_lock::is_blocked_error(&e.to_string()) =>
                             {
-                                overlay_backend::deep_lock::blocked_notice(ui_is_ru).to_string()
+                                format!(
+                                    "[--] {}",
+                                    overlay_backend::deep_lock::blocked_notice(ui_is_ru)
+                                )
                             }
                             // UI-audit 2026-06-13: do NOT echo the raw error body
                             // into the panel. A starting llama-server returns the
@@ -1441,22 +1939,19 @@ pub(crate) fn wire_ai_settings(
                             Err(e) => {
                                 let es = e.to_string().to_lowercase();
                                 if es.contains("503") || es.contains("loading") {
-                                    if ui_is_ru { "Сервер запускает модель — подождите ~10 с и повторите." } else { "The server is loading the model — wait about 10 seconds and try again." }.to_string()
+                                    "Сервер запускает модель — подождите ~10 с и повторите."
+                                        .to_string()
                                 } else {
-                                    if ui_is_ru { "Локальный сервер не отвечает — проверьте, что он запущен." } else { "The local server is not answering — check that it is running." }.to_string()
+                                    "[--] Локальный сервер не отвечает — проверьте, что он запущен."
+                                        .to_string()
                                 }
                             }
                         }
                     }
-                    Err(_) => if ui_is_ru { "Не удалось проверить подключение." } else { "Could not check the connection." }.to_string(),
+                    Err(e) => format!("[--] runtime: {e}"),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
-                    #[cfg(windows)]
-                    if !super::settings_local_ai::now_check_is_current(generation) {
-                        return;
-                    }
                     if let Some(w) = weak_res.upgrade() {
-                        w.set_now_state(if working { 1 } else { 3 });
                         w.set_ai_local_test_result(SharedString::from(msg));
                     }
                 });
@@ -1467,18 +1962,13 @@ pub(crate) fn wire_ai_settings(
     // Phase E6 v27 — AI bridge connection test. Off-thread (local
     // current-thread tokio runtime) so the blocking HTTP round-trip
     // doesn't freeze the UI; result posted back via invoke_from_
-    // event_loop with plain localized success copy.
+    // event_loop. ASCII status prefixes (no ✓/✗ missing-glyphs).
     {
         let cfg_c = cfg.clone();
         let weak = win.as_weak();
         win.on_ai_bridge_test_clicked(move || {
-            let ru = cfg_c.read().ui_is_ru();
             let Some(w) = weak.upgrade() else { return };
-            w.set_ai_bridge_test_result(SharedString::from(if ru {
-                "Проверка…"
-            } else {
-                "Checking…"
-            }));
+            w.set_ai_bridge_test_result(SharedString::from("testing…"));
             let endpoint = cfg_c.read().ai_endpoint(false);
             let weak_res = w.as_weak();
             std::thread::spawn(move || {
@@ -1488,16 +1978,11 @@ pub(crate) fn wire_ai_settings(
                 {
                     Ok(rt) => {
                         match rt.block_on(overlay_backend::ai::test_connection_endpoint(endpoint)) {
-                            Ok(_) => if ru {
-                                "Подключение работает"
-                            } else {
-                                "Connection works"
-                            }
-                            .to_string(),
-                            Err(e) => super::status_copy::connection_failed(ru, &format!("{e:#}")),
+                            Ok(s) => format!("[ok] {s}"),
+                            Err(e) => format!("[err] {e:#}").chars().take(90).collect(),
                         }
                     }
-                    Err(e) => super::status_copy::check_not_started(ru, &e),
+                    Err(e) => format!("[err] runtime: {e}"),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak_res.upgrade() {
@@ -1514,17 +1999,6 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
     use super::*;
-
-    #[test]
-    fn reasoning_levels_round_trip_and_unknown_reads_default() {
-        for (index, level) in REASONING_LEVELS.iter().enumerate() {
-            assert_eq!(reasoning_level_from_index(index as i32), *level);
-            assert_eq!(reasoning_level_index(level), index as i32);
-        }
-        assert_eq!(reasoning_level_from_index(-1), "");
-        assert_eq!(reasoning_level_from_index(99), "");
-        assert_eq!(reasoning_level_index("extreme"), 0);
-    }
     use std::cell::RefCell;
 
     fn model(
@@ -1543,6 +2017,7 @@ mod tests {
             } else {
                 vec!["text".to_string()]
             },
+            supports_fast: false,
         }
     }
 
@@ -1644,19 +2119,19 @@ mod tests {
     fn codex_copy_feedback_is_short_generic_and_localized() {
         assert_eq!(
             codex_copy_status(CodexCopyResult::Copied, false),
-            "Code copied"
+            "[ok] Code copied"
         );
         assert_eq!(
             codex_copy_status(CodexCopyResult::Copied, true),
-            "Код скопирован"
+            "[ok] Код скопирован"
         );
         assert_eq!(
             codex_copy_status(CodexCopyResult::Failed, false),
-            "Copy failed"
+            "[err] Copy failed"
         );
         assert_eq!(
             codex_copy_status(CodexCopyResult::Failed, true),
-            "Не удалось скопировать"
+            "[err] Не удалось скопировать"
         );
     }
 }

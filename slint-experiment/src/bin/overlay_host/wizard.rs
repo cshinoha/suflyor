@@ -33,7 +33,7 @@ use super::{
 };
 
 /// Refill the step-7 summary rows. Renders ONLY secret-free values: the live
-/// check detail a step already painted (plain words, secret-free, same as the
+/// check detail a step already painted ([ok]/[err], secret-free, same as the
 /// Diagnostics tab) or a status WORD from `readiness().configured`. NEVER the
 /// `ReadinessItem.detail` — for cloud AI it embeds the bridge LAN IP
 /// (`ai_base_url`), which must not reach this screen-shareable summary panel
@@ -41,16 +41,11 @@ use super::{
 /// so a fully-skipped run still shows a populated summary.
 pub(crate) fn refill_wizard_summary(w: &WizardWindow, cfg: &overlay_backend::config::SharedConfig) {
     let r = cfg.read().readiness();
-    let ru = cfg.read().ui_is_ru();
     let pick = |live: SharedString, configured: bool| -> SharedString {
         if !live.is_empty() {
             live
         } else if configured {
-            SharedString::from(if ru {
-                "настроено"
-            } else {
-                "configured"
-            })
+            SharedString::from("configured")
         } else {
             SharedString::from("—")
         }
@@ -173,28 +168,20 @@ pub(crate) fn wire_wizard_steps(
                 {
                     Ok(rt) => {
                         match rt.block_on(overlay_backend::ai::test_connection_endpoint(endpoint)) {
-                            Ok(_) => (
-                                0,
-                                if ui_is_ru {
-                                    "Подключение работает"
-                                } else {
-                                    "Connection works"
-                                }
-                                .to_string(),
-                            ),
+                            Ok(s) => (0, format!("[ok] {s}")),
                             Err(e) => {
                                 let chain = format!("{e:#}");
                                 let msg = overlay_backend::deep_lock::blocked_test_result(
                                     ui_is_ru, &chain,
                                 )
                                 .unwrap_or_else(|| {
-                                    super::status_copy::connection_failed(ui_is_ru, &chain)
+                                    format!("[err] {chain}").chars().take(80).collect()
                                 });
                                 (4, msg)
                             }
                         }
                     }
-                    Err(e) => (4, super::status_copy::check_not_started(ui_is_ru, &e)),
+                    Err(e) => (4, format!("[err] runtime: {e}")),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = wr.upgrade() {
@@ -215,7 +202,6 @@ pub(crate) fn wire_wizard_steps(
             w.set_stt_level(-1);
             w.set_stt_detail(SharedString::from(""));
             let backend = cfg_c.read().stt_backend();
-            let ui_is_ru = cfg_c.read().ui_is_ru();
             let wr = w.as_weak();
             std::thread::spawn(move || {
                 let (lvl, msg): (i32, String) = match tokio::runtime::Builder::new_current_thread()
@@ -224,22 +210,11 @@ pub(crate) fn wire_wizard_steps(
                 {
                     Ok(rt) => {
                         match rt.block_on(overlay_backend::stt::test_connection_backend(&backend)) {
-                            Ok(_) => (
-                                0,
-                                if ui_is_ru {
-                                    "Подключение работает"
-                                } else {
-                                    "Connection works"
-                                }
-                                .to_string(),
-                            ),
-                            Err(e) => (
-                                4,
-                                super::status_copy::connection_failed(ui_is_ru, &format!("{e:#}")),
-                            ),
+                            Ok(s) => (0, format!("[ok] {s}")),
+                            Err(e) => (4, format!("[err] {e:#}").chars().take(80).collect()),
                         }
                     }
-                    Err(e) => (4, super::status_copy::check_not_started(ui_is_ru, &e)),
+                    Err(e) => (4, format!("[err] runtime: {e}")),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = wr.upgrade() {
@@ -260,12 +235,7 @@ pub(crate) fn wire_wizard_steps(
         win.on_mic_test_clicked(move || {
             let Some(w) = weak.upgrade() else { return };
             w.set_mic_level(-1);
-            let ui_is_ru = cfg_c.read().ui_is_ru();
-            w.set_mic_detail(SharedString::from(if ui_is_ru {
-                "Запись 3 секунды…"
-            } else {
-                "Recording 3 seconds…"
-            }));
+            w.set_mic_detail(SharedString::from("recording 3s…"));
             let dev = cfg_c.read().mic_device.clone();
             let wr = w.as_weak();
             std::thread::spawn(move || {
@@ -273,58 +243,22 @@ pub(crate) fn wire_wizard_steps(
                 let (lvl, msg): (i32, String) = if mic_guard.is_none() {
                     (
                         4,
-                        if ui_is_ru {
-                            "Микрофон занят — завершите голосовой ввод и повторите"
-                        } else {
-                            "Microphone busy — finish voice input and retry"
-                        }
-                        .to_string(),
+                        "[!] mic busy — close PTT / dictation and retry".to_string(),
                     )
                 } else {
                     let r = overlay_backend::audio::record_mic_blocking(3000, dev);
                     drop(mic_guard); // release before processing (RAII: also on panic)
                     match r {
-                        Ok(s) if s.is_empty() => (
-                            4,
-                            if ui_is_ru {
-                                "Звук не записан"
-                            } else {
-                                "No audio captured"
-                            }
-                            .to_string(),
-                        ),
+                        Ok(s) if s.is_empty() => (4, "[!] no audio captured".to_string()),
                         Ok(s) => {
                             let d = overlay_backend::audio::rms_dbfs(&s);
                             if d >= -45.0 {
-                                (
-                                    0,
-                                    if ui_is_ru {
-                                        format!("Голос слышен ({d:.0} dBFS)")
-                                    } else {
-                                        format!("Heard you ({d:.0} dBFS)")
-                                    },
-                                )
+                                (0, format!("[ok] heard you ({d:.0} dBFS)"))
                             } else {
-                                (
-                                    0,
-                                    if ui_is_ru {
-                                        format!("Запись работает · тихо ({d:.0} dBFS)")
-                                    } else {
-                                        format!("Capture works · quiet ({d:.0} dBFS)")
-                                    },
-                                )
+                                (0, format!("[ok] capture works · quiet ({d:.0} dBFS)"))
                             }
                         }
-                        Err(e) => {
-                            log::warn!("wizard: mic check failed: {e}");
-                            (
-                                4,
-                                super::diagnostics::mic_open_failed(
-                                    ui_is_ru,
-                                    ("Record test", "Записать тест"),
-                                ),
-                            )
-                        }
+                        Err(e) => (4, format!("[err] {e}").chars().take(80).collect()),
                     }
                 };
                 let _ = slint::invoke_from_event_loop(move || {
@@ -346,7 +280,6 @@ pub(crate) fn wire_wizard_steps(
             let Some(w) = weak.upgrade() else { return };
             w.set_sys_level(-1);
             w.set_sys_detail(SharedString::from(""));
-            let ui_is_ru = cfg_c.read().ui_is_ru();
             let dev = cfg_c.read().system_audio_device.clone();
             let wr = w.as_weak();
             std::thread::spawn(move || {
@@ -357,20 +290,17 @@ pub(crate) fn wire_wizard_steps(
                             if d > -60.0 {
                                 (
                                     0,
-                                    if ui_is_ru { format!("Проверочный звук записан ({d:.0} dBFS)") } else { format!("Test tone captured ({d:.0} dBFS)") },
+                                    format!("[ok] loopback heard the test tone ({d:.0} dBFS)"),
                                 )
                             } else {
                                 (
                                     4,
-                                    if ui_is_ru { "Проверочный звук не записан — проверьте выбранное устройство вывода" } else { "Test tone not captured — check the selected output device" }
+                                    "[!] test tone not captured — output device ≠ loopback source?"
                                         .to_string(),
                                 )
                             }
                         }
-                        Err(e) => {
-                            log::warn!("wizard: system audio check failed: {e}");
-                            (4, if ui_is_ru { "Не удалось открыть устройство вывода" } else { "Could not open the output device" }.to_string())
-                        }
+                        Err(e) => (4, format!("[err] {e}").chars().take(80).collect()),
                     };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = wr.upgrade() {

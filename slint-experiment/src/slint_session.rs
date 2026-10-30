@@ -40,194 +40,6 @@ use std::time::{Duration, Instant};
 const SESSION_SYSTEM_COLLECTOR_MAX_SAMPLES: usize = audio::TARGET_SAMPLE_RATE as usize * 30;
 const AUTO_TILE_MAX_TOKENS: u32 = 4096;
 const AUTO_TILE_MAX_TOKENS_MLX: u32 = 384;
-/// Shared bound for short live answers and their terms line.
-const AUTO_TILE_MAX_TOKENS_FAST: u32 = ai::FAST_ANSWER_MAX_TOKENS;
-
-/// Whether auto tiles use the fast-answer prompt. The managed MLX server
-/// keeps its own compact prompt.
-fn auto_tile_fast(c: &overlay_backend::config::Config) -> bool {
-    c.ai_fast_answers && c.ai_provider != "mlx"
-}
-
-/// Bumped by each session start; a keep-loaded loop ends when it changes.
-static PRIME_SESSION: AtomicU64 = AtomicU64::new(0);
-
-/// Session start: read the fast-answer system prompt into the local server's
-/// cache before the first question, and keep it there during the session.
-fn prime_live_prompt(cfg: &SharedConfig) {
-    let (endpoint, system) = {
-        let c = cfg.read();
-        if !auto_tile_fast(&c) || c.ai_provider != "local" || c.deep_lock {
-            return;
-        }
-        let ep = c.ai_endpoint(false);
-        let endpoint = ai::AiEndpoint {
-            protocol: ep.protocol,
-            base_url: ep.base_url,
-            bearer: ep.bearer,
-            model: ep.model,
-            reasoning_effort: ep.reasoning_effort,
-            is_local: true,
-        };
-        let (system, _) = backend_runtime::build_fast_auto_tile_prompts(
-            &backend_runtime::Trigger::Question(String::new()),
-            &[],
-            "",
-            &c.response_language,
-            c.live_coaching_tiles_enabled,
-        );
-        (endpoint, system)
-    };
-    let base_url = endpoint.base_url.clone();
-    ai::local_server::set_hot_prompt(endpoint, system, backend_runtime::FAST_USER_HEAD);
-    let session_gen = PRIME_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
-    tokio::spawn(async move {
-        ai::local_server::detect_kind(&base_url).await;
-        ai::local_server::prime_hot_prompt().await;
-        // Keep an idle server from unloading the model between questions.
-        loop {
-            ai::local_server::keep_model_loaded().await;
-            tokio::time::sleep(Duration::from_secs(240)).await;
-            if PRIME_SESSION.load(Ordering::SeqCst) != session_gen
-                || !ai::local_server::hot_prompt_active()
-            {
-                break;
-            }
-        }
-    });
-}
-/// The answer so far for a streaming auto tile: `{label, text}`.
-pub const AUTO_TILE_STREAM_CHANNEL: &str = "auto-tile:stream";
-/// The complete answer for a streaming auto tile: `{label, question, answer,
-/// highlights, stealth}`.
-pub const AUTO_TILE_FILL_CHANNEL: &str = "auto-tile:fill";
-/// Close a streaming auto tile that got no answer: `{label}`.
-pub const AUTO_TILE_DROP_CHANNEL: &str = "auto-tile:drop";
-/// `TileSpec::source` of the tile that waits for its streamed answer.
-pub const AUTO_TILE_STREAM_SOURCE: &str = "auto_tile_stream";
-/// How often a streaming auto tile is redrawn.
-const AUTO_TILE_STREAM_PUSH: Duration = Duration::from_millis(100);
-/// Attempts for an auto-tile answer, as the one-shot call it replaced made.
-const AUTO_TILE_AI_ATTEMPTS: u32 = 3;
-
-/// What an auto tile asks: the messages, the token limit, and whether a local
-/// model must answer without reasoning (fast answers).
-struct AutoTileAsk {
-    messages: Vec<ai::ChatMessage>,
-    max_tokens: u32,
-    no_think: bool,
-}
-
-/// Stream an auto-tile answer, pushing the text so far into the tile `label`.
-/// Returns the answer and the provider's finish reason. A failure before any
-/// text arrived is retried after 1 s and 2 s, like the one-shot call this
-/// replaced; a stopped or restarted session ends the stream early.
-async fn stream_auto_tile_answer(
-    endpoint: &ai::AiEndpoint,
-    ask: &AutoTileAsk,
-    events: &Arc<dyn RuntimeEvents>,
-    label: Option<&str>,
-    rt: &SharedSlintRuntime,
-    session_gen: u64,
-) -> Result<(String, String)> {
-    let mut attempt = 1;
-    loop {
-        if lock(rt).session_gen != session_gen
-            || label.is_some_and(|label| !events.tile_request_open(label))
-        {
-            return Ok((String::new(), "cancelled".into()));
-        }
-        let mut rx = if ai::tools::web_enabled() {
-            ai::stream_live_chat_endpoint(
-                endpoint.clone(),
-                ask.messages.clone(),
-                ask.max_tokens,
-                ask.no_think,
-            )
-        } else {
-            ai::stream_chat_endpoint_plain(
-                endpoint.clone(),
-                ask.messages.clone(),
-                ask.max_tokens,
-                ask.no_think,
-            )
-        };
-        let mut answer = String::new();
-        let mut last_push: Option<Instant> = None;
-        let outcome = loop {
-            if label.is_some_and(|label| !events.tile_request_open(label)) {
-                return Ok((String::new(), "cancelled".into()));
-            }
-            // Wake up now and then so a stopped session closes the tile even
-            // while the request still waits for its first token.
-            let next = match tokio::time::timeout(AUTO_TILE_STREAM_PUSH * 5, rx.recv()).await {
-                Ok(next) => next,
-                Err(_) if lock(rt).session_gen != session_gen => {
-                    break Ok("cancelled".to_string());
-                }
-                Err(_) => continue,
-            };
-            match next {
-                Some(ai::AiEvent::Delta { text }) => {
-                    answer.push_str(&text);
-                    if lock(rt).session_gen != session_gen {
-                        break Ok("cancelled".to_string());
-                    }
-                    let due = match last_push {
-                        None => true,
-                        Some(at) => at.elapsed() >= AUTO_TILE_STREAM_PUSH,
-                    };
-                    if let (Some(label), true) = (label, due) {
-                        events.emit(
-                            AUTO_TILE_STREAM_CHANNEL,
-                            serde_json::json!({ "label": label, "text": answer }),
-                        );
-                        last_push = Some(Instant::now());
-                    }
-                }
-                Some(ai::AiEvent::Tool { name, detail }) => {
-                    if let Some(label) = label {
-                        events.emit(
-                            AUTO_TILE_STREAM_CHANNEL,
-                            serde_json::json!({ "label": label, "text": answer, "tool": name, "detail": detail }),
-                        );
-                    }
-                }
-                // A newer question replaced this one before it started.
-                Some(ai::AiEvent::Done { reason }) if reason == ai::SUPERSEDED_REASON => {
-                    return Ok((String::new(), "cancelled".into()));
-                }
-                // A connection closed before any text is a failure to retry,
-                // as a truncated one-shot reply was.
-                Some(ai::AiEvent::Done { reason }) if reason == "eof" && answer.is_empty() => {
-                    break Err("AI stream closed without an answer".to_string());
-                }
-                Some(ai::AiEvent::Done { reason }) => break Ok(reason),
-                Some(ai::AiEvent::Error { message }) => break Err(message),
-                Some(_) => {}
-                None => break Err("AI stream ended without an answer".to_string()),
-            }
-        };
-        match outcome {
-            Ok(reason) => return Ok((answer, reason)),
-            Err(message) => {
-                let retry = answer.is_empty()
-                    && attempt < AUTO_TILE_AI_ATTEMPTS
-                    && !ai::is_permanent_ai_error(&message)
-                    && lock(rt).session_gen == session_gen
-                    && label.is_none_or(|label| events.tile_request_open(label));
-                if !retry {
-                    return Err(anyhow::anyhow!(message));
-                }
-                log_warn(&format!(
-                    "auto-tile AI attempt {attempt}/{AUTO_TILE_AI_ATTEMPTS} failed — retrying"
-                ));
-                tokio::time::sleep(Duration::from_millis(1000 << (attempt - 1))).await;
-                attempt += 1;
-            }
-        }
-    }
-}
 
 #[must_use]
 fn auto_tile_max_tokens(is_mlx: bool) -> u32 {
@@ -458,35 +270,16 @@ pub fn start_session_with_recovery(
     start_session_inner(events, cfg, rt, Some(recovered_from))
 }
 
-fn prepare_session_start(rt: &SharedSlintRuntime) -> Result<SystemAudioSessionStartGuard> {
-    // A restart must release its previous capture before claiming ownership.
+fn start_session_inner(
+    events: Arc<dyn RuntimeEvents>,
+    cfg: SharedConfig,
+    rt: SharedSlintRuntime,
+    recovered_from: Option<String>,
+) -> Result<()> {
+    // ===== 1. Stop any prior session + reset state =====
     let prior_capture = {
-        let mut s = lock(rt);
-        let capture = s.capture.take();
-        if capture.is_some() {
-            s.system_audio_collector = None;
-            if let Some(h) = s.transcript_task.take() {
-                h.abort();
-            }
-            if let Some(h) = s.ai_task.take() {
-                h.abort();
-            }
-            if let Some(h) = s.health_task.take() {
-                h.abort();
-            }
-        }
-        capture
-    };
-    if prior_capture.is_some() {
-        drop(prior_capture);
-        release_system_audio_session();
-        stt::reset_gigaam_cache();
-    }
-    let system_audio_owner = SystemAudioSessionStartGuard::acquire()?;
-
-    // A rejected start leaves the stopped session's Summary source intact.
-    {
-        let mut s = lock(rt);
+        let mut s = lock(&rt);
+        let prior_cap = s.capture.take(); // Drop signals capture thread to stop.
         s.system_audio_collector = None;
         s.transcript.clear();
         // v0.12.0 — the Summary accumulator resets at session START (not
@@ -505,8 +298,6 @@ fn prepare_session_start(rt: &SharedSlintRuntime) -> Result<SystemAudioSessionSt
         s.session_name_at_len = 0;
         s.last_transcript_ms = 0;
         s.session_cost_microcents = 0;
-        // Cancel independent manual asks before replacing their session context.
-        s.cancel_session_requests();
         // New session generation — invalidates any in-flight auto-tile task
         // from a prior session (it bails post-AI-call on the gen mismatch).
         s.session_gen = s.session_gen.wrapping_add(1);
@@ -548,48 +339,40 @@ fn prepare_session_start(rt: &SharedSlintRuntime) -> Result<SystemAudioSessionSt
             // event; we replicate that pattern in stop_session, not here.)
             drop(j);
         }
-    }
-    Ok(system_audio_owner)
-}
+        prior_cap
+    };
 
-fn start_session_inner(
-    events: Arc<dyn RuntimeEvents>,
-    cfg: SharedConfig,
-    rt: SharedSlintRuntime,
-    recovered_from: Option<String>,
-) -> Result<()> {
-    // ===== 1. Stop any prior session + reset state =====
-    let mut system_audio_owner = prepare_session_start(&rt)?;
+    if prior_capture.is_some() {
+        drop(prior_capture);
+        release_system_audio_session();
+        stt::reset_gigaam_cache();
+    }
+
+    let mut system_audio_owner = SystemAudioSessionStartGuard::acquire()?;
 
     // Tell the UI cost is back to zero (chips depending on session_usd
     // get a chance to reset). Pre-port React side did the same.
     events.emit("cost:update", serde_json::json!({ "session_usd": 0.0_f64 }));
 
     // ===== 2. Read cfg fields needed for capture + STT =====
-    let (mic_dev, sys_dev, stt_backend, stt_is_local, groq_key, language, whisper_prompt) = {
+    let (mic_dev, sys_dev, stt_backend, missing_key, language, whisper_prompt, local_whisper_prompt) = {
         let c = cfg.read();
         (
             c.mic_device.clone(),
             c.system_audio_device.clone(),
             c.stt_backend(),
-            c.stt_is_local(),
-            c.groq_api_key.clone(),
+            c.stt_missing_cloud_key(),
             c.stt_language.clone(),
-            stt::build_whisper_prompt(&c.trigger_keywords, &c.meeting_context),
+            c.stt_prompt_for("cloud"),
+            c.stt_prompt_for("whisper"),
         )
     };
-    // QA builds may replay transcript lines instead; then no STT is checked.
-    let qa_rx = qa_transcript_source();
     // Only the cloud (Groq) backend needs a key — local GigaAM/Whisper don't.
-    if qa_rx.is_none() && !stt_is_local && groq_key.trim().is_empty() {
-        anyhow::bail!("Groq API key not set in settings (cfg.groq_api_key empty)");
-    }
+    if missing_key { anyhow::bail!("Selected STT provider API key is not set"); }
     // Local GigaAM: validate the model dir loads up front so we fail fast with a
     // clear message instead of silently producing no transcripts once capture
     // starts (mirrors the cloud-key bail above). One-shot blocking load (~0.5s).
-    if let (None, overlay_backend::config::SttBackendCfg::Gigaam { model_dir }) =
-        (&qa_rx, &stt_backend)
-    {
+    if let overlay_backend::config::SttBackendCfg::Gigaam { model_dir } = &stt_backend {
         if let Err(e) = stt::validate_gigaam_dir(model_dir) {
             anyhow::bail!("GigaAM model dir invalid: {e}");
         }
@@ -611,8 +394,17 @@ fn start_session_inner(
         overlay_backend::config::SttBackendCfg::Whisper {
             base_url, model, ..
         } => format!("local-whisper (url={base_url} model={model})"),
+        overlay_backend::config::SttBackendCfg::Speechmatics { model, .. } =>
+            format!("speechmatics (model={model})"),
+        overlay_backend::config::SttBackendCfg::Elevenlabs { model, .. } =>
+            format!("elevenlabs (model={model})"),
+        overlay_backend::config::SttBackendCfg::Deepgram { model, .. } =>
+            format!("deepgram (model={model})"),
         overlay_backend::config::SttBackendCfg::Gigaam { model_dir } => {
             format!("local-gigaam (dir={model_dir})")
+        }
+        overlay_backend::config::SttBackendCfg::FallbackChain { backends } => {
+            format!("ordered: {}", backends.iter().map(|b| b.label()).collect::<Vec<_>>().join(" -> "))
         }
     };
     log_info(&format!(
@@ -674,70 +466,64 @@ fn start_session_inner(
         .unwrap_or_else(|| format!("session_{}", now_unix_ms()));
     lock(&rt).current_session_id = Some(session_id.clone());
 
+    // ===== 4. Spawn audio capture =====
+    let (audio_rx, capture_handle) = audio::start_capture(mic_dev, sys_dev)
+        .context("audio::start_capture failed (check mic / system audio devices in Settings)")?;
     let health = lock(&rt).health.clone();
-    let stt_rx = if let Some(rx) = qa_rx {
-        log_info("QA transcript replaces audio capture and STT");
-        rx
-    } else {
-        // ===== 4. Spawn audio capture =====
-        let (audio_rx, capture_handle) = audio::start_capture(mic_dev, sys_dev).context(
-            "audio::start_capture failed (check mic / system audio devices in Settings)",
-        )?;
 
-        // ===== 4b. Pause gate + optional raw-audio recorder (v0.13.0) =====
-        // Every chunk now crosses the same pause-aware forwarder before STT,
-        // regardless of whether recording is enabled. The recorder feed is
-        // non-blocking (drops on overflow), and forwarding to STT keeps the same
-        // bounded(128) back-pressure.
-        // One atomic snapshot — the enabled flag + both retention bounds are read
-        // under a SINGLE lock so a concurrent Settings save can't split the
-        // decision across two config states (review v0.15.0).
-        let (record_enabled, keep_sessions, keep_days, max_total_mb) = {
-            let c = cfg.read();
-            (
-                c.record_audio_enabled,
-                c.record_retention_sessions as usize,
-                c.record_retention_days,
-                c.record_max_total_mb,
-            )
-        };
-        let recorder = if record_enabled {
-            // Reuse the session id derived above (the conspect + the recordings dir
-            // share one key, so a re-Summary from the archive lines up with both).
-            match overlay_backend::recorder::SessionRecorder::start(
-                &session_id,
-                keep_sessions,
-                keep_days,
-                max_total_mb,
-            ) {
-                Ok(recorder) => {
-                    log_info(&format!("audio recording → {}", recorder.dir().display()));
-                    Some(recorder)
-                }
-                Err(e) => {
-                    // Recording is best-effort: a failure must NOT abort the session.
-                    log_info(&format!(
-                        "audio recording unavailable (continuing without it): {e:#}"
-                    ));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let stt_audio_rx = forward_audio_chunks(audio_rx, rt.clone(), recorder);
-
-        // ===== 5. Spawn STT pipeline =====
-        let stt_rx = stt::spawn(
-            stt_audio_rx,
-            stt_backend,
-            language,
-            whisper_prompt,
-            health.clone(),
-        );
-        lock(&rt).capture = Some(capture_handle);
-        stt_rx
+    // ===== 4b. Pause gate + optional raw-audio recorder (v0.13.0) =====
+    // Every chunk now crosses the same pause-aware forwarder before STT,
+    // regardless of whether recording is enabled. The recorder feed is
+    // non-blocking (drops on overflow), and forwarding to STT keeps the same
+    // bounded(128) back-pressure.
+    // One atomic snapshot — the enabled flag + both retention bounds are read
+    // under a SINGLE lock so a concurrent Settings save can't split the
+    // decision across two config states (review v0.15.0).
+    let (record_enabled, keep_sessions, keep_days, max_total_mb) = {
+        let c = cfg.read();
+        (
+            c.record_audio_enabled,
+            c.record_retention_sessions as usize,
+            c.record_retention_days,
+            c.record_max_total_mb,
+        )
     };
+    let recorder = if record_enabled {
+        // Reuse the session id derived above (the conspect + the recordings dir
+        // share one key, so a re-Summary from the archive lines up with both).
+        match overlay_backend::recorder::SessionRecorder::start(
+            &session_id,
+            keep_sessions,
+            keep_days,
+            max_total_mb,
+        ) {
+            Ok(recorder) => {
+                log_info(&format!("audio recording → {}", recorder.dir().display()));
+                Some(recorder)
+            }
+            Err(e) => {
+                // Recording is best-effort: a failure must NOT abort the session.
+                log_info(&format!(
+                    "audio recording unavailable (continuing without it): {e:#}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let stt_audio_rx = forward_audio_chunks(audio_rx, rt.clone(), recorder);
+
+    // ===== 5. Spawn STT pipeline =====
+    let stt_rx = stt::spawn(
+        stt_audio_rx,
+        stt_backend,
+        language,
+        whisper_prompt,
+        local_whisper_prompt,
+        health.clone(),
+    );
+    lock(&rt).capture = Some(capture_handle);
     system_audio_owner.disarm();
 
     // ===== 6. Spawn health emitter (2s ticker) =====
@@ -808,8 +594,6 @@ fn start_session_inner(
     ));
     lock(&rt).transcript_task = Some(forwarder);
 
-    prime_live_prompt(&cfg);
-
     // ===== 8. Signal session start =====
     events.emit(
         "session:started",
@@ -817,57 +601,6 @@ fn start_session_inner(
     );
 
     Ok(())
-}
-
-/// QA builds only: replay transcript lines from the file named by
-/// `SUFLYOR_QA_TRANSCRIPT` instead of capturing audio, so the live-answer path
-/// can be checked on a machine without audio devices. Each line is
-/// `<delay ms>\t<mic|sys>\t<text>`.
-#[cfg(feature = "ui-mcp")]
-fn qa_transcript_source() -> Option<tokio::sync::mpsc::Receiver<stt::TranscriptEvent>> {
-    let path = std::env::var_os("SUFLYOR_QA_TRANSCRIPT")?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let lines: Vec<(u64, AudioSource, String)> = text
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
-            let delay = parts.next()?.trim().parse().ok()?;
-            let source = if parts.next()?.trim() == "mic" {
-                AudioSource::Mic
-            } else {
-                AudioSource::System
-            };
-            Some((delay, source, parts.next()?.to_string()))
-        })
-        .collect();
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    tokio::spawn(async move {
-        let started = Instant::now();
-        for (delay, source, text) in lines {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            log_info(&format!(
-                "QA transcript line sent at unix_ms={} ({} chars)",
-                now_unix_ms(),
-                text.chars().count()
-            ));
-            let event = stt::TranscriptEvent {
-                source,
-                text,
-                timestamp_ms: started.elapsed().as_millis() as u64,
-            };
-            if tx.send(event).await.is_err() {
-                return;
-            }
-        }
-        // Keep the session running after the last line.
-        tx.closed().await;
-    });
-    Some(rx)
-}
-
-#[cfg(not(feature = "ui-mcp"))]
-fn qa_transcript_source() -> Option<tokio::sync::mpsc::Receiver<stt::TranscriptEvent>> {
-    None
 }
 
 fn forward_audio_chunks(
@@ -1078,32 +811,6 @@ pub fn trigger_highlights(trigger: &backend_runtime::Trigger) -> Vec<String> {
     }
 }
 
-/// Longest question an auto tile shows; a longer line keeps its end, where
-/// the question usually is.
-const SHOWN_QUESTION_MAX_CHARS: usize = 240;
-
-/// What an auto tile shows as its question: the whole recognised line for a
-/// question (the detected clause alone can lose what "it" refers to), the
-/// keyword for a keyword.
-fn shown_question(trigger: &backend_runtime::Trigger, line: &str) -> String {
-    match trigger {
-        backend_runtime::Trigger::Question(_) => {
-            let line = overlay_backend::text::collapse_ws(line);
-            let chars = line.chars().count();
-            if chars <= SHOWN_QUESTION_MAX_CHARS {
-                line
-            } else {
-                let tail: String = line
-                    .chars()
-                    .skip(chars - SHOWN_QUESTION_MAX_CHARS)
-                    .collect();
-                format!("…{tail}")
-            }
-        }
-        backend_runtime::Trigger::Keyword(kw, _) => kw.clone(),
-    }
-}
-
 /// Auto-tile rate limit — drop spawn if more than this many tiles
 /// fired in the rolling 60s window. Matches src-tauri's MAX_TILES_
 /// PER_MIN value to keep cost behavior identical across binaries.
@@ -1144,12 +851,12 @@ fn mic_down_notice(ui_is_ru: bool) -> (&'static str, &'static str) {
     if ui_is_ru {
         (
             "Микрофон не слышен",
-            "Микрофон не передаёт звук: ваша речь не расшифровывается.\n\nПроверьте Настройки → Аудио → Устройство микрофона и убедитесь, что микрофон не отключён и не занят другим приложением.",
+            "Микрофон не передаёт звук: ваша речь не расшифровывается.\n\nПроверьте устройство ввода (Настройки -> STT) и убедитесь, что микрофон не отключён и не занят другим приложением.",
         )
     } else {
         (
             "Microphone unavailable",
-            "The microphone is not providing audio, so your speech cannot be transcribed.\n\nCheck Settings → Audio → Microphone device and make sure the microphone is enabled and not used by another app.",
+            "The microphone is not providing audio, so your speech cannot be transcribed.\n\nCheck the input device in Settings -> STT and make sure the microphone is enabled and not used by another app.",
         )
     }
 }
@@ -1191,6 +898,7 @@ async fn maybe_spawn_auto_tile(
         bearer,
         model,
         reasoning_effort,
+        service_tier,
         response_language,
         meeting_context,
         cap_usd,
@@ -1198,7 +906,6 @@ async fn maybe_spawn_auto_tile(
         stealth,
         is_local,
         is_mlx,
-        fast,
     ) = {
         let c = cfg.read();
         let ep = c.ai_endpoint(false);
@@ -1213,6 +920,7 @@ async fn maybe_spawn_auto_tile(
             ep.bearer,
             ep.model,
             ep.reasoning_effort,
+            ep.service_tier,
             c.response_language.clone(),
             c.meeting_context.clone(),
             c.max_session_cost_usd,
@@ -1220,7 +928,6 @@ async fn maybe_spawn_auto_tile(
             c.stealth_enabled,
             is_unmetered,
             is_mlx,
-            auto_tile_fast(&c),
         )
     };
     // A bearer is required only for the CLOUD bridge; local servers
@@ -1324,8 +1031,11 @@ async fn maybe_spawn_auto_tile(
     // outlive transcript grounding, approved memory, coaching, or provider profile.
     let recent_transcript: Vec<String> = {
         let s = lock(&rt);
-        backend_runtime::select_conversation_lines(&s.transcript, 8)
-            .into_iter()
+        s.transcript
+            .iter()
+            .rev()
+            .take(5)
+            .rev()
             .map(|line| {
                 let source = match line.source {
                     AudioSource::System => "СОБЕСЕДНИК",
@@ -1349,13 +1059,10 @@ async fn maybe_spawn_auto_tile(
     trigger_keywords.hash(&mut keyword_hasher);
     let kw_hash = keyword_hasher.finish();
     let cache_key: String = format!(
-        "m={model};l={response_language};p={is_mlx};f={fast};h={prompt_hash:x};k={kw_hash:x};q={}",
+        "m={model};l={response_language};p={is_mlx};h={prompt_hash:x};k={kw_hash:x};q={}",
         normalized_full.chars().take(200).collect::<String>(),
     );
-    // Current web facts must not reuse a ten-minute answer cached without a lookup.
-    let cache_hit: Option<String> = if is_local && ai::tools::web_enabled() {
-        None
-    } else {
+    let cache_hit: Option<String> = {
         let mut s = lock(&rt);
         let now = Instant::now();
         let ttl = Duration::from_secs(QA_CACHE_TTL_SECS);
@@ -1367,7 +1074,10 @@ async fn maybe_spawn_auto_tile(
     if let Some(cached_answer) = cache_hit {
         // No transcript text in the log (shareable via "Collect logs").
         log_info("qa_cache HIT (avoided AI call)");
-        let trigger_text_for_q = shown_question(&trigger, &text);
+        let trigger_text_for_q = match &trigger {
+            backend_runtime::Trigger::Question(q) => q.clone(),
+            backend_runtime::Trigger::Keyword(kw, _) => kw.clone(),
+        };
         // Phase E6 v12 — populate highlights with the trigger keyword
         // (or "❓" + question prefix) so the tile UI can show a badge
         // explaining why this tile spawned. User: "ключевые слова не
@@ -1432,27 +1142,17 @@ async fn maybe_spawn_auto_tile(
         backend_runtime::Trigger::Question(q) => q.clone(),
         backend_runtime::Trigger::Keyword(kw, _) => kw.clone(),
     };
-    // Phase 3b.4 — fold the user's APPROVED memory into the background block.
-    // Audit (prompt-context): reuse the SAME effective context hashed for the
-    // cache key above (computed once; off the audio thread).
-    let (system_prompt, prompt) = if fast {
-        backend_runtime::build_fast_auto_tile_prompts(
-            &trigger,
-            &recent_transcript,
-            &effective_context,
-            &response_language,
-            live_coaching,
-        )
-    } else {
-        backend_runtime::build_auto_tile_prompts(
-            &trigger,
-            &recent_transcript,
-            &effective_context,
-            &response_language,
-            live_coaching,
-            is_mlx,
-        )
-    };
+    let (system_prompt, prompt) = backend_runtime::build_auto_tile_prompts(
+        &trigger,
+        &recent_transcript,
+        // Phase 3b.4 — fold the user's APPROVED memory into the background block.
+        // Audit (prompt-context): reuse the SAME effective context hashed for the
+        // cache key above (computed once; off the audio thread).
+        &effective_context,
+        &response_language,
+        live_coaching,
+        is_mlx,
+    );
     let sys_full = system_prompt.clone();
     let usr_full = prompt.clone();
     let input_tokens_est = ((sys_full.chars().count() + usr_full.chars().count()) as u64) / 4;
@@ -1483,113 +1183,21 @@ async fn maybe_spawn_auto_tile(
         bearer,
         model: model.clone(),
         reasoning_effort,
+        service_tier,
         is_local,
     };
-    let max_tokens = if fast {
-        AUTO_TILE_MAX_TOKENS_FAST
-    } else {
-        auto_tile_max_tokens(is_mlx)
-    };
-    // Keep the fast prompt in the local server's cache between questions;
-    // a stopped session or a switch away from fast answers stops that.
-    // A question whose session already ended leaves the hot prompt alone.
-    let session_live = lock(&rt).session_gen == session_gen;
-    if session_live && fast {
-        ai::local_server::set_hot_prompt(
-            endpoint.clone(),
-            sys_full.clone(),
-            backend_runtime::FAST_USER_HEAD,
-        );
-    } else if session_live {
-        ai::local_server::clear_hot_prompt();
-    }
-    let question_label = shown_question(&trigger, &text);
-    let monitor_hint = match preferred_monitor.as_deref() {
-        Some(name) if !name.is_empty() => MonitorHint::Named(name.to_string()),
-        _ => MonitorHint::Auto,
-    };
-    // Phase E6 v12 — pass trigger info so the tile shows a badge
-    // explaining which keyword/question spawned it.
-    let highlights_for_spec = trigger_highlights(&trigger);
-    // Open the tile now and stream the answer into it: on a call the first
-    // words must show in a second or two, not after the whole answer is
-    // written (about 10 s for 500 tokens on a local model).
-    let stream_label = match events.spawn_tile_full(
-        TileSpec {
-            question: question_label.clone(),
-            answer: String::new(),
-            source: AUTO_TILE_STREAM_SOURCE.into(),
-            is_translation: false,
-            highlights: highlights_for_spec.clone(),
-            summary_session: None,
-        },
-        monitor_hint.clone(),
-        stealth,
-        TileKind::Auto,
-    ) {
-        Ok(label) => Some(label),
-        Err(e) => {
-            log_warn(&format!("auto-tile placeholder spawn failed: {e}"));
-            None
-        }
-    };
-    let drop_placeholder = |events: &Arc<dyn RuntimeEvents>| {
-        if let Some(label) = &stream_label {
-            events.emit(
-                AUTO_TILE_DROP_CHANNEL,
-                serde_json::json!({ "label": label }),
-            );
-        }
-    };
-    let ask = AutoTileAsk {
-        messages,
-        max_tokens,
-        no_think: fast,
-    };
-    // Background work in the AI queue: a wanted question goes first, and a
-    // newer auto-tile question replaces this one while it waits.
-    let streamed = ai::with_priority(
-        ai::AiPriority::AutoTile,
-        stream_auto_tile_answer(
-            &endpoint,
-            &ask,
-            &events,
-            stream_label.as_deref(),
-            &rt,
-            session_gen,
-        ),
-    )
-    .await;
-    let (answer, finish_reason) = match streamed {
-        Ok((_, reason))
-            if reason == "cancelled"
-                || stream_label
-                    .as_deref()
-                    .is_some_and(|label| !events.tile_request_open(label)) =>
-        {
-            drop_placeholder(&events);
-            return;
-        }
-        Ok((t, reason)) => {
+    let max_tokens = auto_tile_max_tokens(is_mlx);
+    let (answer, usage) = match ai::complete_with_usage_endpoint(&endpoint, messages, max_tokens)
+        .await
+    {
+        Ok((t, u)) => {
             lock(&rt)
                 .health
                 .last_ai_ok_ms
                 .store(now_unix_ms() as u64, Ordering::Relaxed);
-            let t = t.trim();
-            // The fast prompt answers "—" when the line needs no hint.
-            let t = if fast && t == "—" { "" } else { t };
-            (t.to_string(), reason)
+            (t.trim().to_string(), u)
         }
         Err(e) => {
-            // Read the owner first: dropping our placeholder also retires it,
-            // which must not look like a user cancel.
-            let cancelled = stream_label
-                .as_deref()
-                .is_some_and(|label| !events.tile_request_open(label));
-            drop_placeholder(&events);
-            if cancelled {
-                return;
-            }
             // V0.8.0 (Поток A) — the auto-tile AI call failed. Previously
             // this returned SILENTLY (log + journal only), so the user saw
             // auto-tiles simply stop with no explanation ("почему тайлы
@@ -1642,7 +1250,7 @@ async fn maybe_spawn_auto_tile(
                     let _ = events.spawn_tile_full(
                         TileSpec {
                             question: if ui_is_ru {
-                                "Локальный AI заблокирован".into()
+                                "Локальный ИИ заблокирован".into()
                             } else {
                                 "Local AI is locked".into()
                             },
@@ -1658,22 +1266,13 @@ async fn maybe_spawn_auto_tile(
                     );
                     return;
                 }
-                let reason = crate::app_state::ai_error_text(
-                    crate::app_state::classify_ai_error(&chain),
-                    ui_is_ru,
-                );
+                let reason = crate::app_state::classify_ai_error(&chain);
                 let _ = events.spawn_tile_full(
                         TileSpec {
-                            question: if ui_is_ru { "AI недоступен" } else { "AI unavailable" }.into(),
-                            answer: if ui_is_ru {
-                                format!(
-                                    "**Не получаю ответ от AI:** {reason}\n\nАвто-подсказки приостановлены, пока AI не ответит. Проверьте локальный AI-сервер или AI-мост (Настройки -> AI-провайдеры). Можно перезапустить приложение значком «Аварийный перезапуск» на панели."
-                                )
-                            } else {
-                                format!(
-                                    "**No answer from the AI:** {reason}\n\nAuto hints are paused until the AI answers. Check the local AI server or the AI bridge (Settings -> AI providers). You can restart the app using the 'Emergency restart' icon on the bar."
-                                )
-                            },
+                            question: "AI недоступен".into(),
+                            answer: format!(
+                                "**Не получаю ответ от AI:** {reason}\n\nАвто-подсказки приостановлены, пока AI не ответит. Проверьте локальный AI-сервер или AI-мост (Настройки -> AI). Можно перезапустить приложение кнопкой restart на панели."
+                            ),
                             source: "ai_error".into(),
                             is_translation: false,
                             highlights: vec!["AI error".into()],
@@ -1694,13 +1293,11 @@ async fn maybe_spawn_auto_tile(
     // bill, or spawn a tile into a session that no longer exists.
     if lock(&rt).session_gen != session_gen {
         log_info("auto-tile: session changed during AI call — discarding result");
-        drop_placeholder(&events);
         return;
     }
 
     // ===== Cache the answer =====
-    // An empty answer or one cut off by a closed connection is not reused.
-    if !answer.is_empty() && finish_reason != "eof" {
+    {
         let mut s = lock(&rt);
         if s.qa_cache.len() >= QA_CACHE_MAX_ENTRIES {
             let now = Instant::now();
@@ -1719,14 +1316,11 @@ async fn maybe_spawn_auto_tile(
     }
 
     // ===== Cost accumulate + emit =====
-    // The stream reports no usage, so output is estimated as chars/4, the
-    // same estimate the F9 stream uses.
-    let output_tokens_est = (answer.chars().count() as u64) / 4;
     // Local inference is free — don't bill it.
     let micro = if is_local {
         0
     } else {
-        ai::cost_microcents(&model, input_tokens_est, output_tokens_est)
+        ai::cost_microcents(&model, usage.input, usage.output)
     };
     let total_usd = {
         let mut s = lock(&rt);
@@ -1743,59 +1337,52 @@ async fn maybe_spawn_auto_tile(
         purpose: "auto_tile",
         model: &model,
         latency_ms,
-        // The provider's real reason ("stop", "length" = truncated, …) from
-        // the stream's Done event (audit D4; previously hardcoded).
-        finish_reason: &finish_reason,
+        // The provider's real reason ("stop", "length" = truncated, …) —
+        // surfaced by `complete_once` (audit D4; previously hardcoded).
+        finish_reason: &usage.finish_reason,
         text: &answer,
-        output_tokens_est,
+        output_tokens_est: usage.output,
         cost_microcents: micro,
     });
 
     if answer.is_empty() {
-        drop_placeholder(&events);
         return;
     }
 
-    // ===== Finish the auto-tile =====
+    // ===== Spawn auto-tile =====
+    let question_label = match &trigger {
+        backend_runtime::Trigger::Question(q) => q.clone(),
+        // De-emojified to match the rest of the UI (Codex icon pass): the
+        // keyword itself is the tile title / stored last_question, no glyph.
+        backend_runtime::Trigger::Keyword(kw, _) => kw.clone(),
+    };
     {
         let mut s = lock(&rt);
         s.last_question = Some(question_label.clone());
         s.last_answer = Some(answer.clone());
     }
+    let monitor_hint = match preferred_monitor.as_deref() {
+        Some(name) if !name.is_empty() => MonitorHint::Named(name.to_string()),
+        _ => MonitorHint::Auto,
+    };
     let label_for_log = question_label.clone();
     let answer_for_journal = answer.clone();
-    // The streamed tile gets the complete answer in place, with the same
-    // dialog wiring a finished auto tile gets; without one (its spawn
-    // failed) the tile opens now, as before.
-    let finished = match &stream_label {
-        Some(label) => {
-            events.emit(
-                AUTO_TILE_FILL_CHANNEL,
-                serde_json::json!({
-                    "label": label,
-                    "question": question_label,
-                    "answer": answer,
-                    "highlights": highlights_for_spec,
-                    "stealth": stealth,
-                }),
-            );
-            Ok(label.clone())
-        }
-        None => events.spawn_tile_full(
-            TileSpec {
-                question: question_label.clone(),
-                answer,
-                source: "auto_tile".into(),
-                is_translation: false,
-                highlights: highlights_for_spec,
-                summary_session: None,
-            },
-            monitor_hint,
-            stealth,
-            TileKind::Auto,
-        ),
-    };
-    match finished {
+    // Phase E6 v12 — pass trigger info so the tile shows a badge
+    // explaining which keyword/question spawned it.
+    let highlights_for_spec = trigger_highlights(&trigger);
+    match events.spawn_tile_full(
+        TileSpec {
+            question: question_label.clone(),
+            answer,
+            source: "auto_tile".into(),
+            is_translation: false,
+            highlights: highlights_for_spec,
+            summary_session: None,
+        },
+        monitor_hint,
+        stealth,
+        TileKind::Auto,
+    ) {
         Ok(label) => {
             journal.write(&JournalEvent::TileSpawn {
                 unix_ms: now_unix_ms(),
@@ -1818,7 +1405,6 @@ async fn maybe_spawn_auto_tile(
 /// (cfg opt-in + ≥30s session + ≥5 mic lines + AI configured local-or-cloud)
 /// and fires `overlay_backend::runtime::run_post_meeting_debrief`.
 pub fn stop_session(rt: SharedSlintRuntime, cfg: &SharedConfig) -> Vec<TranscriptLine> {
-    ai::local_server::clear_hot_prompt();
     let mut s = lock(&rt);
     let capture = s.capture.take();
     #[cfg(target_os = "macos")]
@@ -1833,8 +1419,6 @@ pub fn stop_session(rt: SharedSlintRuntime, cfg: &SharedConfig) -> Vec<Transcrip
         SYSTEM_AUDIO_SESSION_STUCK.store(true, Ordering::Release);
     }
     s.system_audio_collector = None;
-    // Independent manual asks must stop before their journal is closed.
-    s.cancel_session_requests();
     // Bump generation so an in-flight auto-tile call from this session
     // discards its result instead of spawning a tile after the stop.
     s.session_gen = s.session_gen.wrapping_add(1);
@@ -1968,8 +1552,7 @@ const DEBRIEF_MIN_MIC_LINES: usize = 5;
 /// (producer) and `maybe_run_debrief` (the notice mapping) cannot drift apart if
 /// the wording changes. The other reasons (disabled / too-short / no-speech) stay
 /// silent and need no constant.
-const SKIP_AI_NOT_CONFIGURED: &str =
-    "AI not configured — enable a provider in Settings → AI providers";
+const SKIP_AI_NOT_CONFIGURED: &str = "AI not configured — enable a provider in Settings → AI";
 const SKIP_NOT_ENOUGH_MIC: &str = "not enough mic lines for meaningful debrief";
 
 /// Phase E5 — gate the debrief call. `Ok(())` means the debrief
@@ -2044,10 +1627,9 @@ pub fn maybe_run_debrief(
                 .count();
             let notice: Option<String> = if reason == SKIP_AI_NOT_CONFIGURED {
                 Some(if is_ru {
-                    "Коучинг включён, но AI не настроен — откройте Настройки → AI-провайдеры."
-                        .to_string()
+                    "Коучинг включён, но ИИ не настроен — откройте Настройки → AI.".to_string()
                 } else {
-                    "Coaching is on, but no AI provider is configured — open Settings → AI providers."
+                    "Coaching is on, but no AI provider is configured — open Settings → AI."
                         .to_string()
                 })
             } else if reason == SKIP_NOT_ENOUGH_MIC && mic_lines >= 1 {
@@ -2132,55 +1714,6 @@ fn log_info(msg: &str) {
 )]
 mod tests {
     use super::*;
-
-    static SYSTEM_AUDIO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn rejected_session_start_preserves_previous_transcript_and_bookkeeping() {
-        let _guard = SYSTEM_AUDIO_TEST_LOCK.lock().unwrap();
-        SYSTEM_AUDIO_SESSION_STUCK.store(false, Ordering::Release);
-        SYSTEM_AUDIO_OWNER.store(SYSTEM_AUDIO_OWNER_NONE, Ordering::Release);
-        let rt = crate::runtime_state::shared_runtime();
-        {
-            let mut state = lock(&rt);
-            let line = TranscriptLine {
-                source: AudioSource::System,
-                text: "Previous session transcript".into(),
-                timestamp_ms: 123,
-            };
-            state.transcript.push_back(line.clone());
-            state.full_transcript.push_back(line);
-            state.full_transcript_truncated = true;
-            state.session_name = Some("Previous session".into());
-            state.session_cost_microcents = 42;
-            state.session_gen = 7;
-            state.paused = true;
-        }
-        let aux = try_acquire_system_audio_aux().unwrap();
-        assert!(prepare_session_start(&rt).is_err());
-        {
-            let state = lock(&rt);
-            assert_eq!(state.transcript.len(), 1);
-            assert_eq!(state.full_transcript.len(), 1);
-            assert_eq!(state.full_transcript[0].text, "Previous session transcript");
-            assert!(state.full_transcript_truncated);
-            assert_eq!(state.session_name.as_deref(), Some("Previous session"));
-            assert_eq!(state.session_cost_microcents, 42);
-            assert_eq!(state.session_gen, 7);
-            assert!(state.paused);
-        }
-        drop(aux);
-        let owner = prepare_session_start(&rt).unwrap();
-        let state = lock(&rt);
-        assert!(state.transcript.is_empty());
-        assert!(state.full_transcript.is_empty());
-        assert!(!state.full_transcript_truncated);
-        assert_eq!(state.session_cost_microcents, 0);
-        assert_eq!(state.session_gen, 8);
-        assert!(!state.paused);
-        drop(state);
-        drop(owner);
-    }
 
     #[test]
     fn auto_tile_permit_is_single_flight_per_session() {
@@ -2272,7 +1805,6 @@ mod tests {
 
     #[test]
     fn system_audio_owner_is_atomic_between_session_and_auxiliary_capture() {
-        let _guard = SYSTEM_AUDIO_TEST_LOCK.lock().unwrap();
         SYSTEM_AUDIO_SESSION_STUCK.store(false, Ordering::Release);
         SYSTEM_AUDIO_OWNER.store(SYSTEM_AUDIO_OWNER_NONE, Ordering::Release);
 
@@ -2292,7 +1824,6 @@ mod tests {
 
     #[test]
     fn session_restart_releases_prior_owner_and_reacquires() {
-        let _guard = SYSTEM_AUDIO_TEST_LOCK.lock().unwrap();
         SYSTEM_AUDIO_SESSION_STUCK.store(false, Ordering::Release);
         SYSTEM_AUDIO_OWNER.store(SYSTEM_AUDIO_OWNER_NONE, Ordering::Release);
 
@@ -2488,14 +2019,8 @@ mod tests {
     fn mic_down_notice_follows_ui_language() {
         assert_eq!(mic_down_notice(false).0, "Microphone unavailable");
         assert!(mic_down_notice(false).1.starts_with("The microphone"));
-        assert!(mic_down_notice(false)
-            .1
-            .contains("Settings → Audio → Microphone device"));
         assert_eq!(mic_down_notice(true).0, "Микрофон не слышен");
         assert!(mic_down_notice(true).1.starts_with("Микрофон"));
-        assert!(mic_down_notice(true)
-            .1
-            .contains("Настройки → Аудио → Устройство микрофона"));
     }
 
     #[test]
@@ -2569,23 +2094,6 @@ mod tests {
         assert!(snap.is_empty());
     }
 
-    #[tokio::test]
-    async fn stop_session_cancels_a_pending_manual_request_without_late_writeback() {
-        let rt = crate::runtime_state::shared_runtime();
-        let scope = lock(&rt).session_request_scope();
-        let cfg = overlay_backend::config::shared_from(Default::default());
-        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<String>();
-        let pending = tokio::spawn(crate::runtime_state::until_session_changes(scope, async {
-            answer_rx.await.unwrap()
-        }));
-        stop_session(rt.clone(), &cfg);
-        let _ = answer_tx.send("late answer".into());
-        assert_eq!(pending.await.unwrap(), None);
-        let state = lock(&rt);
-        assert!(state.last_answer.is_none());
-        assert_eq!(state.session_cost_microcents, 0);
-    }
-
     /// v0.12.0 — stop_session clears the rolling window (debrief snapshot
     /// semantics unchanged) but KEEPS the full transcript so the Summary
     /// button still works between Стоп and the next Старт.
@@ -2616,219 +2124,5 @@ mod tests {
             3,
             "summary source must survive stop"
         );
-    }
-
-    /// Serves `responses` in order on a loopback port, one per request.
-    fn serve_sse(responses: Vec<(u16, &'static str)>) -> String {
-        use std::io::{BufRead, BufReader, Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            for (status, body) in responses {
-                let Ok((stream, _)) = listener.accept() else {
-                    return;
-                };
-                let mut reader = BufReader::new(stream);
-                let mut len = 0usize;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        len = v.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut sent = vec![0u8; len];
-                let _ = reader.read_exact(&mut sent);
-                let mut stream = reader.into_inner();
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        url
-    }
-
-    #[derive(Default)]
-    struct RecordingEvents(std::sync::Mutex<Vec<(String, serde_json::Value)>>);
-
-    impl RuntimeEvents for RecordingEvents {
-        fn emit(&self, channel: &str, payload: serde_json::Value) {
-            self.0.lock().unwrap().push((channel.to_string(), payload));
-        }
-        fn spawn_tile_full(
-            &self,
-            _spec: TileSpec,
-            _monitor: MonitorHint,
-            _stealth: bool,
-            _kind: TileKind,
-        ) -> Result<String, String> {
-            Ok("tile".into())
-        }
-    }
-
-    struct ClosableEvents(Arc<AtomicBool>);
-
-    impl RuntimeEvents for ClosableEvents {
-        fn emit(&self, _channel: &str, _payload: serde_json::Value) {}
-        fn tile_request_open(&self, _label: &str) -> bool {
-            self.0.load(Ordering::SeqCst)
-        }
-        fn spawn_tile_full(
-            &self,
-            _: TileSpec,
-            _: MonitorHint,
-            _: bool,
-            _: TileKind,
-        ) -> Result<String, String> {
-            Ok("tile".into())
-        }
-    }
-
-    #[tokio::test]
-    async fn closing_an_auto_tile_retires_a_silent_request_without_retry_or_answer() {
-        use std::io::Read;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = sse_endpoint(format!("http://{}", listener.local_addr().unwrap()));
-        let (accepted, ready) = tokio::sync::oneshot::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(4)))
-                .unwrap();
-            let mut bytes = [0; 16384];
-            assert!(stream.read(&mut bytes).unwrap() > 0);
-            accepted.send(()).unwrap();
-            loop {
-                match stream.read(&mut bytes) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
-                    Err(e) => panic!("closed auto tile retained its HTTP request: {e}"),
-                }
-            }
-        });
-        let open = Arc::new(AtomicBool::new(true));
-        let events: Arc<dyn RuntimeEvents> = Arc::new(ClosableEvents(open.clone()));
-        let rt: SharedSlintRuntime = Arc::default();
-        let task = tokio::spawn(async move {
-            stream_auto_tile_answer(&endpoint, &test_ask(), &events, Some("tile"), &rt, 0).await
-        });
-        tokio::time::timeout(Duration::from_secs(5), ready)
-            .await
-            .unwrap()
-            .unwrap();
-        open.store(false, Ordering::SeqCst);
-        let (answer, reason) = tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(answer.is_empty());
-        assert_eq!(reason, "cancelled");
-        server.join().unwrap();
-    }
-
-    const SSE_ANSWER: &str =
-        "data: {\"id\":\"a\",\"choices\":[{\"delta\":{\"content\":\"first \"}}]}\n\n\
-data: {\"id\":\"a\",\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n\
-data: {\"id\":\"a\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
-data: [DONE]\n\n";
-
-    fn sse_endpoint(base_url: String) -> ai::AiEndpoint {
-        ai::AiEndpoint {
-            protocol: ai::AiProtocol::OpenAiCompatible,
-            base_url,
-            bearer: String::new(),
-            model: "local-model".into(),
-            reasoning_effort: None,
-            is_local: true,
-        }
-    }
-
-    #[test]
-    fn an_auto_tile_shows_the_whole_line_and_keeps_the_end_of_a_long_one() {
-        let line = "Так, хорошо.   Давай про сеть.\nЧем отличается 502 от 503?";
-        let q = backend_runtime::Trigger::Question("Чем отличается 502 от 503?".into());
-        assert_eq!(
-            shown_question(&q, line),
-            "Так, хорошо. Давай про сеть. Чем отличается 502 от 503?"
-        );
-        let long = format!(
-            "{} А чем StatefulSet отличается от Deployment?",
-            "слово ".repeat(80)
-        );
-        let shown = shown_question(&q, &long);
-        assert!(shown.starts_with('…'));
-        assert!(shown.ends_with("отличается от Deployment?"));
-        assert_eq!(shown.chars().count(), SHOWN_QUESTION_MAX_CHARS + 1);
-        let kw = backend_runtime::Trigger::Keyword("etcd".into(), "у нас etcd".into());
-        assert_eq!(shown_question(&kw, "у нас etcd"), "etcd");
-    }
-
-    fn test_ask() -> AutoTileAsk {
-        AutoTileAsk {
-            messages: Vec::new(),
-            max_tokens: 64,
-            no_think: false,
-        }
-    }
-
-    /// The auto tile shows the answer while it is written, not after it.
-    #[tokio::test]
-    async fn auto_tile_answer_streams_into_its_tile() {
-        let url = serve_sse(vec![(200, SSE_ANSWER)]);
-        let recorder = Arc::new(RecordingEvents::default());
-        let events: Arc<dyn RuntimeEvents> = recorder.clone();
-        let rt: SharedSlintRuntime = Arc::default();
-        let (answer, reason) = stream_auto_tile_answer(
-            &sse_endpoint(url),
-            &test_ask(),
-            &events,
-            Some("tile-7"),
-            &rt,
-            0,
-        )
-        .await
-        .unwrap();
-        assert_eq!(answer, "first answer");
-        assert_eq!(reason, "stop");
-        let pushed = recorder.0.lock().unwrap().clone();
-        let first = pushed
-            .iter()
-            .find(|(c, _)| c == AUTO_TILE_STREAM_CHANNEL)
-            .expect("the first words are pushed to the tile");
-        assert_eq!(first.1["label"], "tile-7");
-        assert_eq!(first.1["text"], "first ");
-    }
-
-    /// A stream that closes before any text counts as a failure and is retried.
-    #[tokio::test]
-    async fn auto_tile_answer_retries_a_stream_closed_before_any_text() {
-        let url = serve_sse(vec![(200, ""), (200, SSE_ANSWER)]);
-        let events: Arc<dyn RuntimeEvents> = Arc::new(RecordingEvents::default());
-        let rt: SharedSlintRuntime = Arc::default();
-        let (answer, reason) =
-            stream_auto_tile_answer(&sse_endpoint(url), &test_ask(), &events, None, &rt, 0)
-                .await
-                .unwrap();
-        assert_eq!(answer, "first answer");
-        assert_eq!(reason, "stop");
-    }
-
-    /// A failure before any text is retried, as the one-shot call was.
-    #[tokio::test]
-    async fn auto_tile_answer_retries_a_failure_before_any_text() {
-        let url = serve_sse(vec![(503, "busy"), (200, SSE_ANSWER)]);
-        let events: Arc<dyn RuntimeEvents> = Arc::new(RecordingEvents::default());
-        let rt: SharedSlintRuntime = Arc::default();
-        let (answer, _) =
-            stream_auto_tile_answer(&sse_endpoint(url), &test_ask(), &events, None, &rt, 0)
-                .await
-                .unwrap();
-        assert_eq!(answer, "first answer");
     }
 }

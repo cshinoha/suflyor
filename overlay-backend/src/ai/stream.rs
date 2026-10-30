@@ -1,6 +1,6 @@
 use super::control::{
-    apply_local_no_think, apply_managed_gemma_sampler, apply_prompt_cache, apply_reasoning_effort,
-    http_client, resolve_managed_mlx_endpoint, transport_failure_kind, PROMPT_CACHE,
+    apply_local_no_think, apply_managed_gemma_sampler, apply_prompt_cache, http_client,
+    resolve_managed_mlx_endpoint, transport_failure_kind, AI_SEMAPHORE, PROMPT_CACHE,
 };
 use super::provider;
 use super::tps::{begin_request, record_stream_tps};
@@ -23,6 +23,7 @@ pub fn stream_chat(
             bearer,
             model,
             reasoning_effort: None,
+            service_tier: None,
             is_local: false,
         },
         messages,
@@ -35,56 +36,11 @@ pub fn stream_chat_endpoint(
     messages: Vec<ChatMessage>,
     max_tokens: u32,
 ) -> mpsc::Receiver<AiEvent> {
-    stream_chat_endpoint_with(endpoint, messages, max_tokens, true, false)
-}
-
-/// Fast live answers skip tools unless the user enabled web lookup.
-/// Web-enabled fast answers keep the short format and use the bounded agent path.
-pub fn stream_live_chat_endpoint(
-    endpoint: AiEndpoint,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-    fast: bool,
-) -> mpsc::Receiver<AiEvent> {
-    stream_chat_endpoint_with(
-        endpoint,
-        messages,
-        if fast {
-            max_tokens.min(super::prompt::FAST_ANSWER_MAX_TOKENS)
-        } else {
-            max_tokens
-        },
-        !fast || super::tools::web_enabled(),
-        fast,
-    )
-}
-
-/// Same stream without the local model's tools: one request, answer only.
-/// Auto-tiles use it while web lookup is off; definitions always stay on this path.
-/// `no_think` turns a local model's reasoning off for this request whatever
-/// the reasoning setting says (fast answers on a call).
-pub fn stream_chat_endpoint_plain(
-    endpoint: AiEndpoint,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-    no_think: bool,
-) -> mpsc::Receiver<AiEvent> {
-    stream_chat_endpoint_with(endpoint, messages, max_tokens, false, no_think)
-}
-
-fn stream_chat_endpoint_with(
-    endpoint: AiEndpoint,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-    allow_tools: bool,
-    no_think: bool,
-) -> mpsc::Receiver<AiEvent> {
     let request_started_at = std::time::Instant::now();
     let request_id = begin_request();
     let (tx, rx) = mpsc::channel::<AiEvent>(64);
-    let priority = super::queue::current_priority();
 
-    tokio::spawn(super::queue::with_priority(priority, async move {
+    tokio::spawn(async move {
         let (endpoint, _mlx_lease) = match resolve_managed_mlx_endpoint(endpoint).await {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -96,6 +52,16 @@ fn stream_chat_endpoint_with(
                 return;
             }
         };
+        if endpoint.protocol == AiProtocol::CodexDirect {
+            if let Err(error) = crate::codex_direct::stream_turn(&endpoint, &messages, &tx).await {
+                let _ = tx
+                    .send(AiEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+            }
+            return;
+        }
         if endpoint.protocol == AiProtocol::CodexSubscription {
             let model = endpoint.model.clone();
             let worker_tx = tx.clone();
@@ -103,6 +69,7 @@ fn stream_chat_endpoint_with(
                 crate::codex_subscription::run_turn(
                     &model,
                     endpoint.reasoning_effort.as_deref(),
+                    endpoint.service_tier.as_deref(),
                     &messages,
                     |event| {
                         let mapped = match event {
@@ -154,43 +121,28 @@ fn stream_chat_endpoint_with(
         let _permit = tokio::select! {
             biased;
             () = tx.closed() => return,
-            permit = super::queue::acquire() => match permit {
-                Ok(permit) => permit,
-                Err(_) => {
-                    let _ = tx
-                        .send(AiEvent::Done {
-                            reason: super::queue::SUPERSEDED_REASON.into(),
-                        })
-                        .await;
-                    return;
-                }
-            },
+            permit = AI_SEMAPHORE.acquire() => permit.ok(),
         };
         if tx.is_closed() {
             return;
         }
-        let result = tokio::select! {
-            biased;
-            () = tx.closed() => return,
-            result = stream_inner(
-                endpoint,
-                messages,
-                max_tokens,
-                allow_tools,
-                no_think,
-                tx.clone(),
-                request_id,
-                request_started_at,
-            ) => result,
-        };
-        if let Err(e) = result {
+        if let Err(e) = stream_inner(
+            endpoint,
+            messages,
+            max_tokens,
+            tx.clone(),
+            request_id,
+            request_started_at,
+        )
+        .await
+        {
             let _ = tx
                 .send(AiEvent::Error {
                     message: format!("{e:#}"),
                 })
                 .await;
         }
-    }));
+    });
 
     rx
 }
@@ -213,13 +165,10 @@ pub(crate) fn codex_failure_message(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_inner(
     endpoint: AiEndpoint,
     messages: Vec<ChatMessage>,
     max_tokens: u32,
-    allow_tools: bool,
-    no_think: bool,
     tx: mpsc::Sender<AiEvent>,
     request_id: u64,
     request_started_at: std::time::Instant,
@@ -228,40 +177,6 @@ pub(crate) async fn stream_inner(
     {
         return Err(anyhow!(crate::deep_lock::BLOCKED_ERROR));
     }
-    if allow_tools && super::agent::applies(&endpoint) {
-        return super::agent::stream_agent(
-            endpoint,
-            messages,
-            max_tokens,
-            no_think,
-            tx,
-            request_id,
-            request_started_at,
-        )
-        .await;
-    }
-    stream_plain(
-        endpoint,
-        messages,
-        max_tokens,
-        no_think,
-        tx,
-        request_id,
-        request_started_at,
-    )
-    .await
-}
-
-/// One streamed request without tools.
-pub(crate) async fn stream_plain(
-    endpoint: AiEndpoint,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-    no_think: bool,
-    tx: mpsc::Sender<AiEvent>,
-    request_id: u64,
-    request_started_at: std::time::Instant,
-) -> Result<()> {
     let client = http_client();
 
     let url = format!(
@@ -279,14 +194,11 @@ pub(crate) async fn stream_plain(
         true,
         prompt_cache,
     )?;
-    apply_reasoning_effort(&mut body, endpoint.protocol, &endpoint.base_url);
     if endpoint.protocol == AiProtocol::OpenAiCompatible {
         apply_prompt_cache(&mut body);
-        apply_local_no_think(&mut body, no_think && endpoint.is_local);
+        apply_local_no_think(&mut body, false);
         apply_managed_gemma_sampler(&mut body, &endpoint.base_url, &endpoint.model);
-        super::local_server::apply_server_hints(&mut body, &endpoint);
     }
-    let _done = super::local_server::request_started(&endpoint.base_url, &messages);
 
     log::info!(
         "AI stream → provider (protocol={}, model={}, msgs={})",
@@ -298,18 +210,16 @@ pub(crate) async fn stream_plain(
     let request = client
         .post(&url)
         .timeout(std::time::Duration::from_secs(120));
-    let mut resp = match provider::authorize(request, endpoint.protocol, &endpoint.bearer)
-        .json(&body)
-        .send()
+    let mut resp = match crate::network::send(provider::authorize(request, endpoint.protocol, &endpoint.bearer).json(&body))
         .await
     {
         Ok(r) => r,
-        Err(error) => {
-            // The kind (timeout, connect, ...) carries no address, so the tile
-            // can tell "did not answer in time" from "could not connect".
-            let kind = transport_failure_kind(&error);
-            log::warn!("AI stream transport error ({kind})");
-            return Err(anyhow!("AI connection error ({kind})"));
+        Err(_error) => {
+            log::warn!(
+                "AI stream transport error ({})",
+                "network route failure"
+            );
+            return Err(anyhow!("AI connection error"));
         }
     };
 
@@ -369,22 +279,9 @@ pub(crate) async fn stream_plain(
                     Err(_) => continue,
                 };
 
-                let mut parsed = provider::parse_stream(endpoint.protocol, &v);
+                let parsed = provider::parse_stream(endpoint.protocol, &v);
                 if parsed.failed {
                     return Err(anyhow!("AI provider stream error"));
-                }
-                // Some Responses bridges buffer text until the terminal snapshot.
-                // Reuse completion decoding only when no text was streamed; a
-                // normal stream repeats its entire answer in that snapshot.
-                if endpoint.protocol == AiProtocol::OpenAiResponses
-                    && parsed.done.is_some()
-                    && delta_count == 0
-                {
-                    let response = v.get("response").unwrap_or(&v);
-                    let (text, _) = provider::parse_completion(endpoint.protocol, response, 0.0);
-                    if !text.is_empty() {
-                        parsed.delta = Some(text);
-                    }
                 }
                 if parsed.server_tps.is_some() {
                     server_tps = parsed.server_tps;

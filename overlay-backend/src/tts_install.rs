@@ -92,7 +92,7 @@ pub enum VoiceProgress {
 /// `%APPDATA%\suflyor\tts` — where voices install. Same dir the sidecar scans.
 #[must_use]
 pub fn tts_dir() -> Option<PathBuf> {
-    crate::paths::speech_model_dir("tts")
+    crate::paths::data_root().map(|d| d.join("tts"))
 }
 
 /// True when a given pack is already installed (its dir has a model + tokens).

@@ -42,9 +42,9 @@ component IconSlot inherits Rectangle {
 
 component BrandStateMark inherits Rectangle {
     in property <bool> assistant-active: false;
-    in property <length> mark-size: Metrics.space-lg;
+    in property <length> mark-size: 22px;
     width: mark-size;
-    height: max(Metrics.control-md, root.mark-size);
+    height: mark-size;
     horizontal-stretch: 0;
 
     Image {
@@ -76,18 +76,14 @@ component Chip inherits Rectangle {
     // Render the label in the mono font (Cascadia) — for the session timer so
     // the ticking digits don't shift width frame to frame.
     in property <bool> mono: false;
-
-    // Toggle chips set this so assistive technology and the MCP audit can read
-    // the state (`active`) instead of guessing it from the colour.
-    in property <bool> checkable: false;
+    // Real configured shortcut, rendered next to the action (not a tooltip).
+    // Leave empty when the action has no dedicated hotkey.
+    in property <string> shortcut: "";
 
     callback clicked();
 
     accessible-role: button;
     accessible-label: a11y != "" ? a11y : label;
-    accessible-checkable: checkable;
-    accessible-checked: checkable && active;
-    accessible-action-default => { root.clicked(); }
 
     // Hover + press feedback so a click is visibly registered. Action chips
     // (Stop / Expand / X …) had NO feedback at all — only the persistent
@@ -123,6 +119,13 @@ component Chip inherits Rectangle {
             font-family: root.mono ? Theme.font-mono : "";
             font-size: Metrics.font-label;
             color: active ? accent : Theme.text-secondary;
+            vertical-alignment: center;
+        }
+        if root.shortcut != "" : Text {
+            text: root.shortcut;
+            font-family: Theme.font-mono;
+            font-size: 9px;
+            color: Theme.text-muted;
             vertical-alignment: center;
         }
     }
@@ -175,13 +178,11 @@ export component LockModeMenuRow inherits Rectangle {
             vertical-alignment: center;
         }
         Rectangle { horizontal-stretch: 1; }
-        // A check mark, not the word: the word did not fit the narrow menu.
-        if root.current : Image {
-            source: @image-url("../assets/icons/check.svg");
-            colorize: root.mode-color;
-            width: 12px;
-            height: 12px;
-            y: (parent.height - self.height) / 2;
+        if root.current : Text {
+            text: @tr("Current");
+            color: root.mode-color;
+            font-size: Metrics.font-label;
+            vertical-alignment: center;
         }
     }
     row-touch := TouchArea {
@@ -360,13 +361,15 @@ component RecordBtn inherits Rectangle {
     accessible-role: button;
     accessible-label: label;
 
-    background: recording ? Theme.danger.with-alpha(0.2) : transparent;
-    border-color: recording ? Theme.danger : Theme.border-strong;
+    background: recording ? Theme.danger.with-alpha(0.2)
+        : press-area.pressed ? root.accent.with-alpha(0.17) : transparent;
+    border-color: recording ? Theme.danger
+        : press-area.pressed ? root.accent : Theme.border-strong;
     border-width: Metrics.border-thin;
     border-radius: Metrics.radius-control;
     height: Metrics.control-md;
     horizontal-stretch: 0;
-    animate background, border-color { duration: Metrics.motion-fast; }
+    animate background, border-color { duration: 120ms; }
 
     // Reset the lock whenever recording ends from any cause (release, stop-click,
     // watchdog timeout) so the chip never gets stuck in the locked/stop look.
@@ -414,7 +417,7 @@ component RecordBtn inherits Rectangle {
             slot-height: 22px;
         }
     }
-    TouchArea {
+    press-area := TouchArea {
         mouse-cursor: OverlayCursorPolicy.force-arrow ? default : pointer;
         pointer-event(ev) => {
             if (ev.button == PointerEventButton.left) {
@@ -463,10 +466,6 @@ component VDivider inherits Rectangle {
 }
 
 // ===== Main overlay bar =====
-
-// What the status pill is saying, named by the host. The bar turns it into a
-// theme colour (see `status-color`).
-export enum StatusTone { neutral, ok, warning, danger, info }
 
 export component OverlayBarWindow inherits Window {
     // Phase 4 — keep std-widgets (Button etc.) dark with the active scheme
@@ -517,16 +516,7 @@ export component OverlayBarWindow inherits Window {
 
     // Status pill text (idle / recording / etc).
     in-out property <string> status-text: "idle";
-    // The host names the tone; the colour comes from the theme, so the pill
-    // stays readable in every scheme.
-    in-out property <StatusTone> status-tone: StatusTone.neutral;
-    property <color> status-color: root.status-tone == StatusTone.ok ? Theme.success
-        : root.status-tone == StatusTone.warning ? Theme.warning
-        : root.status-tone == StatusTone.danger ? Theme.danger
-        : root.status-tone == StatusTone.info ? Theme.accent
-        : Theme.text-muted;
-    // A verified stealth failure overrides the tone with the warning colour.
-    property <color> pill-color: root.stealth-fault ? Theme.warning : root.status-color;
+    in-out property <color> status-color: Theme.text-muted;
 
     // Live capture flags.
     in-out property <bool> mic-active: false;
@@ -577,9 +567,6 @@ export component OverlayBarWindow inherits Window {
     // Question/Keyword triggers). Backend already supports it via
     // cfg.auto_tile_every_line; this just surfaces the switch.
     in-out property <bool> aggressive-active: false;
-    // The Omarchy shell owns its event-driven inactivity timer.
-    in-out property <int> tile-idle-seconds: 30;
-    callback tile-idle-seconds-changed(int);
     // E10.2 — stealth on/off, so the 🎯 chip lights up + reflects restored state.
     in-out property <bool> stealth-active: false;
     changed stealth-active => {
@@ -594,24 +581,7 @@ export component OverlayBarWindow inherits Window {
     in-out property <bool> stealth-fault: false;
     property <string> presented-status: root.stealth-fault
         ? @tr("[!] stealth unavailable")
-        : root.localized-status(root.status-text);
-    // Rust sets these state words in English and compares against them, so
-    // they are translated here, at the point of display. Any other text
-    // (already localized by Rust) passes through unchanged.
-    pure function localized-status(s: string) -> string {
-        return s == "idle" ? @tr("idle") :
-               s == "recording" ? @tr("recording") :
-               s == "mic only" ? @tr("mic only") :
-               s == "mic muted" ? @tr("mic muted") :
-               s == "paused" ? @tr("paused") :
-               s == "wrapping up" ? @tr("wrapping up") :
-               s == "start failed" ? @tr("start failed") :
-               s == "sys ok" ? @tr("sys ok") :
-               s == "sys quiet" ? @tr("sys quiet") :
-               s == "sys silent" ? @tr("sys silent") :
-               s == "sys test failed" ? @tr("sys test failed") :
-               s == "AI unavailable" ? @tr("AI unavailable") : s;
-    }
+        : root.status-text;
 
     // Phase E6 v11 — live status indicators. `last-transcript-line`
     // shows the most recent STT output (truncated by Rust to ~120
@@ -620,6 +590,9 @@ export component OverlayBarWindow inherits Window {
     // user sees "AI работает" while a tile is mid-stream.
     in-out property <string> last-transcript-line: "";
     in-out property <bool> ai-streaming: false;
+    // Modal answer mode. The SAME ask actions use Normal or Smart according
+    // to this switch; it is not a second ask button/hotkey.
+    in-out property <bool> smart-mode-active: false;
     // Source tag for the transcript line — "mic" / "sys" / "" to
     // colour-code which side of the conversation it came from.
     in-out property <string> last-transcript-source: "";
@@ -692,6 +665,14 @@ export component OverlayBarWindow inherits Window {
     in property <string> lock-a11y: "";
     in property <bool> lock-menu-managed: false;
 
+    // Visible actual bindings, provided from Config.hotkeys at startup.
+    // Binding changes already require restart to re-register global hotkeys.
+    in property <string> shortcut-archive: "F7";
+    in property <string> shortcut-vision: "F8";
+    in property <string> shortcut-new-tile: "F6";
+    in property <string> shortcut-close-all: "Shift+F6";
+    in property <string> shortcut-help: "F1";
+
     // ===== Callbacks =====
     callback mic-toggle-clicked();
     callback lock-menu-opened(length, length);
@@ -707,6 +688,7 @@ export component OverlayBarWindow inherits Window {
     callback spawn-tile-clicked();
     // V0.8.3 — "Написать": open the typed-question input window.
     callback text-ask-clicked();
+    callback ai-mode-toggle-clicked();
     callback close-all-tiles-clicked();
     callback restore-tile-clicked();
     callback capture-clicked(); // 📷 screenshot -> vision (same as F8)
@@ -737,7 +719,7 @@ export component OverlayBarWindow inherits Window {
 
     Rectangle {
         background: Theme.bg-surface.with-alpha(0.92);
-        border-radius: Metrics.radius-panel;
+        border-radius: 12px;
         border-width: 1px;
         border-color: Theme.border;
 
@@ -752,12 +734,10 @@ export component OverlayBarWindow inherits Window {
 
         if !root.compact-bar && !root.bootstrap-mode : VerticalLayout {
             padding: 6px;
-            spacing: Metrics.space-xs;
+            spacing: 4px;
 
         HorizontalLayout {
-            height: Metrics.icon-button-size + Metrics.space-xs;
-            vertical-stretch: 0;
-            padding: Metrics.border-focus;
+            padding: 2px;
             spacing: 6px;
             alignment: start;
 
@@ -766,8 +746,8 @@ export component OverlayBarWindow inherits Window {
             // TouchArea here is safe: its bbox is only the pill, so
             // it can't shadow the sibling chips' TouchAreas.
             Rectangle {
-                background: Theme.tint(root.pill-color);
-                border-color: Theme.on-tint(root.pill-color);
+                background: (root.stealth-fault ? Theme.warning : root.status-color).with-alpha(0.18);
+                border-color: root.stealth-fault ? Theme.warning : root.status-color;
                 border-width: 1px;
                 border-radius: Metrics.radius-control;
                 height: 22px;
@@ -790,12 +770,12 @@ export component OverlayBarWindow inherits Window {
                     }
                 }
                 HorizontalLayout {
-                    padding-left: Metrics.space-xs;
-                    padding-right: Metrics.space-sm;
-                    spacing: Metrics.space-xs;
+                    padding-left: 4px;
+                    padding-right: 8px;
+                    spacing: 4px;
                     BrandStateMark {
                         assistant-active: root.ai-streaming;
-                        mark-size: Metrics.space-lg;
+                        mark-size: 22px;
                     }
                     // Grip — drag affordance (accent). Design-system 6-dot
                     // grip icon (skia-safe) in place of the "::" text.
@@ -810,12 +790,22 @@ export component OverlayBarWindow inherits Window {
                         // I1/I4 — a verified stealth failure overrides the
                         // mic/sys status with the translated generic banner.
                         text: root.presented-status;
-                        font-size: Metrics.font-label;
+                        font-size: 11px;
                         font-weight: 600;
-                        color: Theme.on-tint(root.pill-color);
+                        color: root.stealth-fault ? Theme.warning : root.status-color;
                         vertical-alignment: center;
                     }
                 }
+            }
+
+            // Modal AI mode sits at the far left: one click changes which
+            // configured model the ordinary ask actions invoke.
+            Chip {
+                label: root.smart-mode-active ? @tr("AI: УМНЫЙ") : @tr("AI: ОБЫЧНЫЙ");
+                a11y: root.smart-mode-active ? @tr("Активен умный режим ИИ, нажмите для обычного") : @tr("Активен обычный режим ИИ, нажмите для умного");
+                active: true;
+                accent: root.smart-mode-active ? #38bdf8 : #a78bfa;
+                clicked => { root.ai-mode-toggle-clicked(); }
             }
 
             // Phase E6 v44 — grouped, scannable layout (user: "слишком
@@ -833,7 +823,7 @@ export component OverlayBarWindow inherits Window {
                     ? @image-url("../assets/icons/micslash.svg")
                     : @image-url("../assets/icons/mic.svg");
                 has-icon: true;
-                a11y: root.mic-muted ? @tr("Mic muted (click to unmute)") : @tr("Mic live (click to mute)");
+                a11y: root.mic-muted ? "Mic muted (click to unmute)" : "Mic live (click to mute)";
                 active: !root.mic-muted;
                 accent: root.mic-muted ? Theme.text-muted : Theme.success;
                 clicked => { root.mic-toggle-clicked(); }
@@ -841,7 +831,7 @@ export component OverlayBarWindow inherits Window {
             LiveChip {
                 icon: @image-url("../assets/icons/system-audio.svg");
                 has-icon: true;
-                a11y: @tr("System audio capture");
+                a11y: "System audio capture";
                 active: root.sys-active;
                 accent: Theme.accent;
                 clicked => { root.sys-toggle-clicked(); }
@@ -879,9 +869,7 @@ export component OverlayBarWindow inherits Window {
                     : @image-url("../assets/icons/session-start.svg");
                 has-icon: true;
                 label: root.timer-active ? root.timer-label : @tr("start");
-                a11y: root.timer-active ? @tr("Stop session") + " · " + root.timer-label : @tr("start");
                 active: root.timer-active;
-                checkable: true;
                 accent: #fbbf24;
                 mono: true;
                 clicked => { root.timer-toggle-clicked(); }
@@ -895,9 +883,8 @@ export component OverlayBarWindow inherits Window {
                     ? @image-url("../assets/icons/play.svg")
                     : @image-url("../assets/icons/pause.svg");
                 has-icon: true;
-                a11y: root.session-paused ? @tr("Resume the session") : @tr("Pause the session");
+                a11y: root.session-paused ? "Resume the session" : "Pause the session";
                 active: root.session-paused;
-                checkable: true;
                 accent: #fbbf24;
                 clicked => { root.pause-toggle-clicked(); }
             }
@@ -908,18 +895,16 @@ export component OverlayBarWindow inherits Window {
             Chip {
                 icon: @image-url("../assets/icons/stealth.svg");
                 has-icon: true;
-                a11y: @tr("Stealth (hide from capture)");
+                a11y: "Stealth (hide from capture)";
                 active: root.stealth-active;
-                checkable: true;
                 accent: #ec4899;
                 clicked => { root.stealth-toggle-clicked(); }
             }
             Chip {
                 icon: @image-url("../assets/icons/flame.svg");
                 has-icon: true;
-                a11y: @tr("Aggressive auto-tile");
+                a11y: "Aggressive auto-tile";
                 active: root.aggressive-active;
-                checkable: true;
                 accent: #fb923c;
                 clicked => { root.aggressive-toggle-clicked(); }
             }
@@ -944,9 +929,9 @@ export component OverlayBarWindow inherits Window {
             Chip {
                 icon: @image-url("../assets/icons/archive.svg");
                 has-icon: true;
-                a11y: @tr("Session archive");
+                a11y: "Session archive";
+                shortcut: root.shortcut-archive;
                 active: root.archive-open;
-                checkable: true;
                 accent: #a78bfa;
                 clicked => { root.archive-clicked(); }
             }
@@ -957,7 +942,7 @@ export component OverlayBarWindow inherits Window {
             Chip {
                 icon: @image-url("../assets/icons/summary.svg");
                 has-icon: true;
-                a11y: @tr("Meeting summary");
+                a11y: "Meeting summary";
                 active: root.summary-busy;
                 accent: #38bdf8;
                 clicked => { root.summary-clicked(); }
@@ -973,6 +958,7 @@ export component OverlayBarWindow inherits Window {
             if root.open-tiles > 0 && !root.confirming : Chip {
                 label: @tr("close all");
                 a11y: @tr("close all");
+                shortcut: root.shortcut-close-all;
                 accent: #fb7185;
                 clicked => { root.close-all-tiles-clicked(); }
             }
@@ -988,29 +974,30 @@ export component OverlayBarWindow inherits Window {
             if !root.confirming : Chip {
                 icon: @image-url("../assets/icons/pencil.svg");
                 has-icon: true;
-                a11y: @tr("Write a question");
+                a11y: "Write a question";
                 accent: #34d399;
                 clicked => { root.text-ask-clicked(); }
             }
             if !root.confirming : Chip {
                 label: @tr("+ tile ({})", root.open-tiles);
                 a11y: @tr("+ tile ({})", root.open-tiles);
+                shortcut: root.shortcut-new-tile;
                 accent: #f472b6;
                 clicked => { root.spawn-tile-clicked(); }
             }
             if !root.confirming : Chip {
                 icon: @image-url("../assets/icons/camera.svg");
                 has-icon: true;
-                a11y: @tr("Screenshot to vision");
+                a11y: "Screenshot to vision";
+                shortcut: root.shortcut-vision;
                 accent: #22d3ee;
                 clicked => { root.capture-clicked(); }
             }
             if !root.confirming : Chip {
                 icon: @image-url("../assets/icons/gear.svg");
                 has-icon: true;
-                a11y: @tr("Settings");
+                a11y: "Settings";
                 active: root.settings-open;
-                checkable: true;
                 accent: Theme.text-muted;
                 clicked => { root.open-settings-clicked(); }
             }
@@ -1019,9 +1006,9 @@ export component OverlayBarWindow inherits Window {
             if !root.confirming : Chip {
                 icon: @image-url("../assets/icons/sos.svg");
                 has-icon: true;
-                a11y: @tr("Help");
+                a11y: "Help";
+                shortcut: root.shortcut-help;
                 active: root.help-open;
-                checkable: true;
                 accent: #60a5fa;
                 clicked => { root.help-clicked(); }
             }
@@ -1034,15 +1021,15 @@ export component OverlayBarWindow inherits Window {
             if !root.restart-armed : Chip {
                 icon: @image-url("../assets/icons/restart.svg");
                 has-icon: true;
-                a11y: @tr("Emergency restart");
+                a11y: "Emergency restart";
                 accent: #38bdf8;
                 clicked => { root.restart-clicked(); }
             }
             if root.restart-armed : HorizontalLayout {
-                spacing: Metrics.space-xs;
+                spacing: 4px;
                 Text {
                     text: @tr("Restart?");
-                    font-size: Metrics.font-label;
+                    font-size: 11px;
                     font-weight: 600;
                     color: Theme.text-primary;
                     vertical-alignment: center;
@@ -1066,9 +1053,8 @@ export component OverlayBarWindow inherits Window {
             if !root.confirming : Chip {
                 icon: @image-url("../assets/icons/minimize.svg");
                 has-icon: true;
-                a11y: @tr("Compact reader mode");
+                a11y: "Compact reader mode";
                 active: root.compact-bar;
-                checkable: true;
                 accent: #38bdf8;
                 clicked => { root.compact-toggle-clicked(); }
             }
@@ -1089,15 +1075,15 @@ export component OverlayBarWindow inherits Window {
             if !root.quit-armed : Chip {
                 icon: @image-url("../assets/icons/x.svg");
                 has-icon: true;
-                a11y: @tr("Quit");
+                a11y: "Quit";
                 accent: Theme.danger;
                 clicked => { root.quit-clicked(); }
             }
             if root.quit-armed : HorizontalLayout {
-                spacing: Metrics.space-xs;
+                spacing: 4px;
                 Text {
                     text: @tr("Quit?");
-                    font-size: Metrics.font-label;
+                    font-size: 11px;
                     font-weight: 600;
                     color: Theme.text-primary;
                     vertical-alignment: center;
@@ -1122,15 +1108,15 @@ export component OverlayBarWindow inherits Window {
         // that STT and AI are working without opening a separate
         // window or watching a log file.
         HorizontalLayout {
-            padding-left: Metrics.space-xs;
-            padding-right: Metrics.space-xs;
+            padding-left: 4px;
+            padding-right: 4px;
             spacing: 6px;
             // Session name (v0.22.0) — relocated here from the top chip row so it
             // no longer pushes the action chips; a small 10px left anchor with a
             // muted dot before the model-stack readout.
             if root.timer-active && root.session-name != "" : Text {
                 text: root.session-name;
-                font-size: Metrics.font-caption;
+                font-size: 10px;
                 font-weight: 600;
                 color: Theme.success;
                 vertical-alignment: center;
@@ -1138,36 +1124,35 @@ export component OverlayBarWindow inherits Window {
             }
             if root.timer-active && root.session-name != "" : Text {
                 text: "·";
-                font-size: Metrics.font-caption;
+                font-size: 10px;
                 color: Theme.text-muted;
                 vertical-alignment: center;
                 horizontal-stretch: 0;
             }
-            // Keep telemetry on one line inside the fixed 64px bar.
-            HorizontalLayout {
-                spacing: Metrics.space-xs;
+            // Active-stack and compact memory readout (read-only).
+            VerticalLayout {
                 horizontal-stretch: 0;
                 alignment: center;
 
                 Text {
                     text: root.active-stack + root.tok-per-sec;
-                    font-size: Metrics.font-caption;
+                    font-size: 10px;
                     font-weight: 600;
                     color: Theme.accent;
                     vertical-alignment: center;
                 }
                 if root.app-memory != "" || root.mlx-memory != "" : HorizontalLayout {
-                    spacing: Metrics.space-xs;
+                    spacing: 4px;
 
                     if root.app-memory != "" : Text {
                         text: @tr("App RAM") + " " + root.app-memory;
-                        font-size: Metrics.font-caption;
+                        font-size: 10px;
                         color: Theme.text-muted;
                         vertical-alignment: center;
                     }
                     if root.mlx-memory != "" : Text {
                         text: "MLX" + " " + root.mlx-memory;
-                        font-size: Metrics.font-caption;
+                        font-size: 10px;
                         color: Theme.text-muted;
                         vertical-alignment: center;
                     }
@@ -1190,9 +1175,9 @@ export component OverlayBarWindow inherits Window {
             // The live transcript text — elide when too long.
             Text {
                 text: root.last-transcript-line == ""
-                    ? @tr("Waiting for speech…")
+                    ? @tr("waiting for transcript... (mic/sys → STT)")
                     : root.last-transcript-line;
-                font-size: Metrics.font-label;
+                font-size: 11px;
                 color: root.last-transcript-line == "" ? Theme.text-muted : Theme.text-secondary;
                 overflow: elide;
                 vertical-alignment: center;
@@ -1203,19 +1188,19 @@ export component OverlayBarWindow inherits Window {
                 width: root.ai-streaming ? 80px : 0px;
                 height: 18px;
                 y: (parent.height - self.height) / 2;
-                background: root.ai-streaming ? Theme.tint(Theme.cat-indigo) : transparent;
-                border-color: Theme.on-tint(Theme.cat-indigo);
+                background: root.ai-streaming ? #818cf8.with-alpha(0.22) : transparent;
+                border-color: #818cf8;
                 border-width: root.ai-streaming ? 1px : 0px;
                 border-radius: 9px;
                 horizontal-stretch: 0;
                 if root.ai-streaming : HorizontalLayout {
                     alignment: center;
-                    spacing: Metrics.space-xs;
+                    spacing: 4px;
                     padding-left: 6px;
                     padding-right: 6px;
                     Image {
                         source: @image-url("../assets/icons/brain.svg");
-                        colorize: Theme.on-tint(Theme.cat-indigo);
+                        colorize: #818cf8;
                         width: 12px;
                         height: 12px;
                         image-fit: contain;
@@ -1223,8 +1208,8 @@ export component OverlayBarWindow inherits Window {
                     }
                     Text {
                         text: @tr("AI streaming");
-                        font-size: Metrics.font-caption;
-                        color: Theme.on-tint(Theme.cat-indigo);
+                        font-size: 10px;
+                        color: #818cf8;
                         vertical-alignment: center;
                     }
                 }
@@ -1243,21 +1228,20 @@ export component OverlayBarWindow inherits Window {
         // layout (there is no on-bar Stop here, by design).
         if root.compact-bar && !root.bootstrap-mode : VerticalLayout {
             padding: 6px;
-            spacing: Metrics.space-xs;
+            spacing: 4px;
 
             // ── Action row: status (drag) · спросить · захватить · таймер · развернуть ──
             HorizontalLayout {
-                height: Metrics.icon-button-size + Metrics.space-xs;
-                vertical-stretch: 0;
-                padding: Metrics.border-focus;
+                padding-left: 2px;
+                padding-right: 2px;
                 spacing: 6px;
 
                 // Status pill — DOUBLES AS DRAG HANDLE (same pattern as the full
                 // bar: only the pill is the drag zone, so it can't shadow the
                 // sibling buttons' TouchAreas). Tinted by the live session state.
                 Rectangle {
-                    background: Theme.tint(root.pill-color);
-                    border-color: Theme.on-tint(root.pill-color);
+                    background: (root.stealth-fault ? Theme.warning : root.status-color).with-alpha(0.18);
+                    border-color: root.stealth-fault ? Theme.warning : root.status-color;
                     border-width: 1px;
                     border-radius: Metrics.radius-control;
                     height: 22px;
@@ -1292,15 +1276,15 @@ export component OverlayBarWindow inherits Window {
                         // brand mark, grip, order and padding/spacing — so the
                         // left brand+grip block doesn't change at all on the
                         // compact toggle (no icon difference between modes).
-                        padding-left: Metrics.space-xs;
-                        padding-right: Metrics.space-sm;
-                        spacing: Metrics.space-xs;
+                        padding-left: 4px;
+                        padding-right: 8px;
+                        spacing: 4px;
                         // Brand state mark — the SAME element the full bar uses
                         // (was a separate дуо icon; unified for zero visual diff;
                         // pulses on ai-streaming exactly like the full bar).
                         BrandStateMark {
                             assistant-active: root.ai-streaming;
-                            mark-size: Metrics.space-lg;
+                            mark-size: 22px;
                         }
                         // Grip — AFTER the brand mark, mirroring the full bar's
                         // [brand · grip · status] order (constraint #2: keep it).
@@ -1315,9 +1299,9 @@ export component OverlayBarWindow inherits Window {
                             // I1/I4 — same translated stealth-failure override
                             // as the full bar's pill.
                             text: root.presented-status;
-                            font-size: Metrics.font-label;
+                            font-size: 11px;
                             font-weight: 600;
-                            color: Theme.on-tint(root.pill-color);
+                            color: root.stealth-fault ? Theme.warning : root.status-color;
                             vertical-alignment: center;
                             // Elide a long status within the capped pill so it can
                             // never overflow the narrow compact window. Short
@@ -1326,6 +1310,14 @@ export component OverlayBarWindow inherits Window {
                             horizontal-stretch: 1;
                         }
                     }
+                }
+
+                Chip {
+                    label: root.smart-mode-active ? @tr("AI: УМНЫЙ") : @tr("AI: ОБЫЧНЫЙ");
+                    a11y: root.smart-mode-active ? @tr("Активен умный режим ИИ, нажмите для обычного") : @tr("Активен обычный режим ИИ, нажмите для умного");
+                    active: true;
+                    accent: root.smart-mode-active ? #38bdf8 : #a78bfa;
+                    clicked => { root.ai-mode-toggle-clicked(); }
                 }
 
                 // спросить — hold to record YOUR voice (mic) → STT → AI. Same
@@ -1356,9 +1348,7 @@ export component OverlayBarWindow inherits Window {
                         : @image-url("../assets/icons/session-start.svg");
                     has-icon: true;
                     label: root.timer-active ? root.timer-label : @tr("start");
-                    a11y: root.timer-active ? @tr("Stop session") + " · " + root.timer-label : @tr("start");
                     active: root.timer-active;
-                    checkable: true;
                     accent: #fbbf24;
                     mono: true;
                     clicked => { root.timer-toggle-clicked(); }
@@ -1369,9 +1359,8 @@ export component OverlayBarWindow inherits Window {
                         ? @image-url("../assets/icons/play.svg")
                         : @image-url("../assets/icons/pause.svg");
                     has-icon: true;
-                    a11y: root.session-paused ? @tr("Resume the session") : @tr("Pause the session");
+                    a11y: root.session-paused ? "Resume the session" : "Pause the session";
                     active: root.session-paused;
-                    checkable: true;
                     accent: #fbbf24;
                     clicked => { root.pause-toggle-clicked(); }
                 }
@@ -1405,7 +1394,7 @@ export component OverlayBarWindow inherits Window {
                 Chip {
                     icon: @image-url("../assets/icons/maximize.svg");
                     has-icon: true;
-                    a11y: @tr("Expand the bar");
+                    a11y: "Expand the bar";
                     accent: #38bdf8;
                     clicked => { root.compact-toggle-clicked(); }
                 }
@@ -1413,17 +1402,17 @@ export component OverlayBarWindow inherits Window {
 
             // ── Live-status footer — same readout as the full bar's bottom row. ──
             HorizontalLayout {
-                padding-left: Metrics.space-xs;
-                padding-right: Metrics.space-xs;
+                padding-left: 4px;
+                padding-right: 4px;
                 spacing: 6px;
                 Text {
                     text: root.active-stack + root.tok-per-sec;
-                    font-size: Metrics.font-caption;
+                    font-size: 10px;
                     font-weight: 600;
                     color: Theme.accent;
                     overflow: elide;
                     vertical-alignment: center;
-                    horizontal-stretch: 0;
+                    horizontal-stretch: 1;
                 }
                 Rectangle {
                     width: 8px;
@@ -1436,9 +1425,9 @@ export component OverlayBarWindow inherits Window {
                 }
                 Text {
                     text: root.last-transcript-line == ""
-                        ? @tr("Waiting for speech…")
+                        ? @tr("waiting for transcript... (mic/sys → STT)")
                         : root.last-transcript-line;
-                    font-size: Metrics.font-label;
+                    font-size: 11px;
                     color: root.last-transcript-line == "" ? Theme.text-muted : Theme.text-secondary;
                     overflow: elide;
                     vertical-alignment: center;
@@ -1451,7 +1440,7 @@ export component OverlayBarWindow inherits Window {
         // hidden in this mode until its callbacks have real platform adapters.
         if root.bootstrap-mode : VerticalLayout {
             padding: Metrics.space-sm;
-            spacing: Metrics.space-xs;
+            spacing: 4px;
 
             HorizontalLayout {
                 spacing: Metrics.space-md;
@@ -1534,8 +1523,8 @@ export component OverlayBarWindow inherits Window {
             // readout the normal bars show (dot = source tag, text = the
             // newest STT line; the placeholder stays until the first line).
             HorizontalLayout {
-                padding-left: Metrics.space-xs;
-                padding-right: Metrics.space-xs;
+                padding-left: 4px;
+                padding-right: 4px;
                 spacing: 6px;
                 Rectangle {
                     width: 8px;
@@ -1548,9 +1537,9 @@ export component OverlayBarWindow inherits Window {
                 }
                 Text {
                     text: root.last-transcript-line == ""
-                        ? @tr("Waiting for speech…")
+                        ? @tr("waiting for transcript... (mic/sys → STT)")
                         : root.last-transcript-line;
-                    font-size: Metrics.font-label;
+                    font-size: 11px;
                     color: root.last-transcript-line == "" ? Theme.text-muted : Theme.text-secondary;
                     overflow: elide;
                     vertical-alignment: center;

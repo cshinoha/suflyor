@@ -11,6 +11,51 @@
 //! SIBLING module — can still call `route.endpoint()` / `.max_tokens()`.
 use super::{vision, Rc, AI_STREAM_MAX_TOKENS};
 
+/// Runtime AI answer mode, mirroring a modal editor: the user selects Normal
+/// or Smart once on the overlay bar, then the SAME ask actions use that mode
+/// until it is changed again. This is deliberately process-local (starts in
+/// Normal on every launch) and does not create a second "smart ask" action.
+static SMART_ASK_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn smart_ask_mode() -> bool {
+    SMART_ASK_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_smart_ask_mode(enabled: bool) {
+    SMART_ASK_MODE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn route_for_smart_mode(enabled: bool) -> AskRoute {
+    if enabled {
+        AskRoute::Cloud
+    } else {
+        AskRoute::Text
+    }
+}
+
+/// Route used by every primary ask surface (F9, typed ask, PTT).
+/// Smart keeps the project's existing smart-model semantics: direct providers
+/// use their configured smart model; Local/MLX escalates through the configured
+/// cloud bridge.
+pub(crate) fn active_ask_route() -> AskRoute {
+    route_for_smart_mode(smart_ask_mode())
+}
+
+/// Vision follows the same modal Normal/Smart switch as text asks. F8 remains
+/// one action; only the configured vision profile changes.
+fn vision_route_for_smart_mode(enabled: bool) -> AskRoute {
+    if enabled {
+        AskRoute::VisionSmart
+    } else {
+        AskRoute::Vision
+    }
+}
+
+pub(crate) fn active_vision_route() -> AskRoute {
+    vision_route_for_smart_mode(smart_ask_mode())
+}
+
 /// V0.8.0 (Поток D) — which AI endpoint an ask/follow-up/regenerate routes to.
 /// Replaces the old `use_vision: bool` so the three routes are explicit and the
 /// compiler enforces exhaustive handling (no silent bool transposition across
@@ -19,11 +64,13 @@ use super::{vision, Rc, AI_STREAM_MAX_TOKENS};
 pub(crate) enum AskRoute {
     /// Default text model (local or cloud per `ai_provider`).
     Text,
-    /// Vision endpoint — the stored conversation carries the screenshot (F8).
+    /// Normal Vision endpoint — the stored conversation carries the screenshot (F8).
     Vision,
-    /// One-shot CLOUD escalation: the smart `prep_model` on the cloud bridge,
-    /// IGNORING `ai_provider`. For a single hard question without flipping the
-    /// persistent provider. Stronger reasoning, NOT live web.
+    /// Smart Vision endpoint selected by the same modal NORMAL/SMART switch.
+    VisionSmart,
+    /// Smart answer route. Direct cloud providers use their configured smart
+    /// model; Local/MLX use the smart `prep_model` on the cloud bridge. The
+    /// persistent provider itself is not changed.
     Cloud,
 }
 
@@ -36,6 +83,7 @@ impl AskRoute {
             && (!matches!(
                 endpoint.protocol,
                 overlay_backend::ai::AiProtocol::CodexSubscription
+                    | overlay_backend::ai::AiProtocol::CodexDirect
             ) || !endpoint.model.trim().is_empty())
     }
 
@@ -46,44 +94,42 @@ impl AskRoute {
     ) -> overlay_backend::config::AiEndpoint {
         match self {
             AskRoute::Text => c.ai_endpoint(false),
-            AskRoute::Vision => c.vision_endpoint().unwrap_or_else(|| {
-                // A Vision tile must never drift onto a text-only model when
-                // its configured route becomes unavailable between turns.
-                overlay_backend::config::AiEndpoint {
-                    protocol: overlay_backend::ai::AiProtocol::OpenAiCompatible,
-                    base_url: String::new(),
-                    bearer: String::new(),
-                    model: String::new(),
-                    reasoning_effort: None,
-                    is_local: false,
-                }
-            }),
+            AskRoute::Vision | AskRoute::VisionSmart => c
+                .vision_endpoint_for(matches!(self, AskRoute::VisionSmart))
+                .unwrap_or_else(|| {
+                    // A Vision tile must never drift onto a text-only model when
+                    // its configured route becomes unavailable between turns.
+                    overlay_backend::config::AiEndpoint {
+                        protocol: overlay_backend::ai::AiProtocol::OpenAiCompatible,
+                        base_url: String::new(),
+                        bearer: String::new(),
+                        model: String::new(),
+                        reasoning_effort: None,
+                        service_tier: None,
+                        is_local: false,
+                    }
+                }),
             AskRoute::Cloud => c.ai_endpoint_cloud(),
         }
     }
-    /// Escalation and vision keep their own detailed-answer behavior.
-    pub(crate) fn fast_answers(self, c: &overlay_backend::config::Config) -> bool {
-        self == Self::Text && c.ai_fast_answers && c.ai_provider != "mlx"
-    }
-
     /// Max output tokens for this route (vision is capped tighter).
     pub(crate) fn max_tokens(self) -> u32 {
         match self {
-            AskRoute::Vision => vision::VISION_MAX_TOKENS,
+            AskRoute::Vision | AskRoute::VisionSmart => vision::VISION_MAX_TOKENS,
             AskRoute::Text | AskRoute::Cloud => AI_STREAM_MAX_TOKENS,
         }
     }
     /// True when the request carries a screenshot (journal flag).
     pub(crate) fn attaches_screenshot(self) -> bool {
-        matches!(self, AskRoute::Vision)
+        matches!(self, AskRoute::Vision | AskRoute::VisionSmart)
     }
 }
 
 /// V0.8.1 — a per-tile MUTABLE route, shared by a tile's continuation surfaces
 /// (text follow-up, 🔄 regenerate, 🎤 voice). They read it at CLICK time (not at
 /// wire time), so when the 🧠 escalate button flips it to Cloud the rest of that
-/// tile's conversation stays in the cloud — matching the sticky-cloud behaviour
-/// Shift+F9 already has. UI-thread-only, so a Cell (no lock) is sufficient.
+/// tile's conversation stays in the cloud. The explicit per-tile escalation
+/// remains sticky even if the global mode changes.
 pub(crate) type LiveRoute = Rc<std::cell::Cell<AskRoute>>;
 
 pub(crate) fn live_route(initial: AskRoute) -> LiveRoute {
@@ -94,7 +140,15 @@ pub(crate) fn live_route(initial: AskRoute) -> LiveRoute {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::AskRoute;
+    use super::{route_for_smart_mode, vision_route_for_smart_mode, AskRoute};
+
+    #[test]
+    fn modal_answer_mode_selects_route_without_a_second_ask_action() {
+        assert_eq!(route_for_smart_mode(false), AskRoute::Text);
+        assert_eq!(route_for_smart_mode(true), AskRoute::Cloud);
+        assert_eq!(vision_route_for_smart_mode(false), AskRoute::Vision);
+        assert_eq!(vision_route_for_smart_mode(true), AskRoute::VisionSmart);
+    }
 
     #[test]
     fn remote_routes_require_bearer_and_local_does_not() {
@@ -119,32 +173,19 @@ mod tests {
         assert!(!AskRoute::Text.has_required_auth(&config));
         assert!(!AskRoute::Cloud.has_required_auth(&config));
         config.codex_model = "gpt-safe".into();
-        assert_eq!(
-            AskRoute::Text.has_required_auth(&config),
-            cfg!(any(windows, target_os = "linux"))
-        );
-        assert_eq!(
-            AskRoute::Cloud.has_required_auth(&config),
-            cfg!(any(windows, target_os = "linux"))
-        );
+        assert_eq!(AskRoute::Text.has_required_auth(&config), cfg!(windows));
+        assert_eq!(AskRoute::Cloud.has_required_auth(&config), cfg!(windows));
         for route in [AskRoute::Text, AskRoute::Cloud] {
             let endpoint = route.endpoint(&config);
             assert_eq!(
                 endpoint.protocol,
-                if cfg!(any(windows, target_os = "linux")) {
+                if cfg!(windows) {
                     overlay_backend::ai::AiProtocol::CodexSubscription
                 } else {
                     overlay_backend::ai::AiProtocol::OpenAiCompatible
                 }
             );
-            assert_eq!(
-                endpoint.model,
-                if cfg!(any(windows, target_os = "linux")) {
-                    "gpt-safe"
-                } else {
-                    ""
-                }
-            );
+            assert_eq!(endpoint.model, if cfg!(windows) { "gpt-safe" } else { "" });
             assert!(endpoint.base_url.is_empty());
             assert!(endpoint.bearer.is_empty());
         }
